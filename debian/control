@@ -12,7 +12,7 @@ Build-Depends: debhelper (>= 10),
                golang-go,
                help2man,
                libacl1-dev,
-               lxc-dev (>= 1.1.0~),
+               lxc-dev (>= 1:1.1.0~),
                pkg-config,
                python3-lxc,
                tcl8.6-dev
@@ -23,8 +23,8 @@ Architecture: amd64 arm64 armhf i386 ppc64el s390x
 Depends: ${misc:Depends}, ${shlibs:Depends}
 Built-Using: ${misc:Built-Using}
 Suggests: lxd
-Breaks: lxc1 (<= 2.0.0~rc13-0ubuntu2~)
-Replaces: lxc1 (<= 2.0.0~rc13-0ubuntu2~)
+Breaks: lxc1 (<= 1:2.0.0)
+Replaces: lxc1 (<= 1:2.0.0)
 Description: Container hypervisor based on LXC - client
  LXD offers a REST API to remotely manage containers over the network,
  using an image based workflow and with support for live migration.

@@ -1,2 +1,2 @@
-rm_conffile /etc/cron.hourly/lxd 2.0.0~rc2-0ubuntu3~
-rm_conffile /etc/init/lxd.conf 2.17-0ubuntu2~
+rm_conffile /etc/cron.hourly/lxd 1:2.0.0
+rm_conffile /etc/init/lxd.conf 1:2.1

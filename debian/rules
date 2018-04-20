@@ -134,16 +134,9 @@ override_dh_install:
 	dh_install
 
 override_dh_installinit:
-ifeq (,$(findstring $(DEB_DISTRIBUTION), trusty xenial zesty))
 	# Disable upstart integration on artful+
 	rm -f debian/lxd.upstart
 	cp debian/lxd.maintscript.in debian/lxd.maintscript
-else
-	# Enable upstart integration for backports
-	cp debian/lxd.upstart.in debian/lxd.upstart
-	sed -i "s#@LIBEXECDIR@#/usr/lib/${DEB_HOST_MULTIARCH}#g" debian/lxd.upstart
-	grep -v /etc/init debian/lxd.maintscript.in > debian/lxd.maintscript
-endif
 	# We handle starting and restarting things ourselves
 	dh_systemd_enable -plxd --name=lxd-containers lxd-containers.service
 	dh_installinit -plxd --no-start
