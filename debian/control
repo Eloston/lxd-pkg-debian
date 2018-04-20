@@ -9,7 +9,7 @@ Vcs-Browser: https://github.com/lxc/lxd-pkg-ubuntu
 Build-Depends: debhelper (>= 10),
                dh-apparmor,
                dh-golang,
-               golang-go,
+               golang-go (>= 1:1.9),
                help2man,
                libacl1-dev,
                lxc-dev (>= 1:1.1.0~),
