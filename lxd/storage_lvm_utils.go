@@ -136,7 +136,7 @@ func (s *storageLvm) getLvmThinpoolName() string {
 		return s.pool.Config["lvm.thinpool_name"]
 	}
 
-	return "LXDThinpool"
+	return "LXDThinPool"
 }
 
 func (s *storageLvm) usesThinpool() bool {
@@ -264,7 +264,7 @@ func (s *storageLvm) createSnapshotContainer(snapshotContainer container, source
 	if targetIsSnapshot {
 		targetContainerMntPoint = getSnapshotMountPoint(s.pool.Name, targetContainerName)
 		sourceName, _, _ := containerGetParentAndSnapshotName(sourceContainerName)
-		snapshotMntPointSymlinkTarget := shared.VarPath("storage-pools", poolName, "snapshots", sourceName)
+		snapshotMntPointSymlinkTarget := shared.VarPath("storage-pools", s.pool.Name, "snapshots", sourceName)
 		snapshotMntPointSymlink := shared.VarPath("snapshots", sourceName)
 		err = createSnapshotMountpoint(targetContainerMntPoint, snapshotMntPointSymlinkTarget, snapshotMntPointSymlink)
 	} else {
@@ -365,14 +365,13 @@ func (s *storageLvm) copyContainerLv(target container, source container, readonl
 		defer source.StorageStop()
 	}
 
-	poolName := s.getOnDiskPoolName()
-	sourceContainerMntPoint := getContainerMountPoint(poolName, sourceName)
+	sourceContainerMntPoint := getContainerMountPoint(s.pool.Name, sourceName)
 	if source.IsSnapshot() {
-		sourceContainerMntPoint = getSnapshotMountPoint(poolName, sourceName)
+		sourceContainerMntPoint = getSnapshotMountPoint(s.pool.Name, sourceName)
 	}
-	targetContainerMntPoint := getContainerMountPoint(poolName, targetName)
+	targetContainerMntPoint := getContainerMountPoint(s.pool.Name, targetName)
 	if target.IsSnapshot() {
-		targetContainerMntPoint = getSnapshotMountPoint(poolName, targetName)
+		targetContainerMntPoint = getSnapshotMountPoint(s.pool.Name, targetName)
 	}
 
 	if source.IsRunning() {
@@ -391,6 +390,7 @@ func (s *storageLvm) copyContainerLv(target container, source container, readonl
 
 	if readonly {
 		targetLvmName := containerNameToLVName(targetName)
+		poolName := s.getOnDiskPoolName()
 		output, err := shared.TryRunCommand("lvchange", "-pr", fmt.Sprintf("%s/%s_%s", poolName, storagePoolVolumeAPIEndpointContainers, targetLvmName))
 		if err != nil {
 			logger.Errorf("Failed to make LVM snapshot \"%s\" read-write: %s.", targetName, output)

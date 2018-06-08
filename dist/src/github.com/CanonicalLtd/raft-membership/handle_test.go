@@ -15,7 +15,6 @@
 package raftmembership_test
 
 import (
-	"strconv"
 	"testing"
 	"time"
 
@@ -29,7 +28,7 @@ func TestHandleChangeRequests_ErrUnknownLeader(t *testing.T) {
 	defer control.Close()
 
 	request := raftmembership.NewJoinRequest("1", "1.2.3.4")
-	handleOneChangeRequest(rafts[0], request)
+	handleOneChangeRequest(rafts["0"], request)
 
 	err := request.Error(time.Second)
 
@@ -44,11 +43,12 @@ func TestHandleChangeRequests_ErrUnknownLeader(t *testing.T) {
 }
 
 func TestHandleChangeRequests_ErrDifferentLeader(t *testing.T) {
-	_, control := rafttest.Cluster(t, rafttest.FSMs(2))
+	rafts, control := rafttest.Cluster(t, rafttest.FSMs(2))
 	defer control.Close()
 
-	raft1 := control.LeadershipAcquired(time.Second)
-	raft2 := control.Other(raft1)
+	control.Elect("0")
+	raft1 := rafts["0"]
+	raft2 := rafts["1"]
 
 	request := raftmembership.NewLeaveRequest("1.2.3.4")
 	handleOneChangeRequest(raft2, request)
@@ -72,7 +72,7 @@ func TestHandleChangeRequests_ErrDifferentLeader(t *testing.T) {
 }
 
 func TestHandleChangeRequests_KnownPeer(t *testing.T) {
-	raft, cleanup := rafttest.Node(t, rafttest.FSM())
+	raft, cleanup := rafttest.Server(t, rafttest.FSM())
 	defer cleanup()
 
 	request := raftmembership.NewJoinRequest("0", "1.2.3.4")
@@ -86,15 +86,15 @@ func TestHandleChangeRequests_KnownPeer(t *testing.T) {
 
 func TestHandleChangeRequests_LeaveRequest(t *testing.T) {
 	fsms := rafttest.FSMs(3)
-	_, control := rafttest.Cluster(t, fsms)
+	rafts, control := rafttest.Cluster(t, fsms)
 	defer control.Close()
 
-	raft1 := control.LeadershipAcquired(time.Second)
-	raft2 := control.Other(raft1)
+	control.Elect("0")
+	r := rafts["0"]
 
-	id := raft.ServerID(strconv.Itoa(control.Index(raft2)))
+	id := raft.ServerID("2")
 	request := raftmembership.NewLeaveRequest(id)
-	handleOneChangeRequest(raft1, request)
+	handleOneChangeRequest(r, request)
 
 	// The request succeeds.
 	if err := request.Error(time.Second); err != nil {

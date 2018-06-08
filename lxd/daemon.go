@@ -11,14 +11,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/CanonicalLtd/candidclient"
 	"github.com/gorilla/mux"
-	"github.com/juju/idmclient"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	"gopkg.in/macaroon-bakery.v2/bakery"
@@ -237,7 +236,13 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c Command) {
 
 		// Block public API requests until we're done with basic
 		// initialization tasks, such setting up the cluster database.
-		<-d.setupChan
+		select {
+		case <-d.setupChan:
+		default:
+			response := Unavailable(fmt.Errorf("LXD daemon setup in progress"))
+			response.Render(w)
+			return
+		}
 
 		untrustedOk := (r.Method == "GET" && c.untrustedGet) || (r.Method == "POST" && c.untrustedPost)
 		err := d.checkTrustedClient(r)
@@ -307,18 +312,6 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c Command) {
 				logger.Errorf("Failed writing error for error, giving up")
 			}
 		}
-
-		/*
-		 * When we create a new lxc.Container, it adds a finalizer (via
-		 * SetFinalizer) that frees the struct. However, it sometimes
-		 * takes the go GC a while to actually free the struct,
-		 * presumably since it is a small amount of memory.
-		 * Unfortunately, the struct also keeps the log fd open, so if
-		 * we leave too many of these around, we end up running out of
-		 * fds. So, let's explicitly do a GC to collect these at the
-		 * end of each request.
-		 */
-		runtime.GC()
 	})
 }
 
@@ -463,7 +456,9 @@ func (d *Daemon) init() error {
 
 	/* Open the cluster database */
 	for {
-		d.cluster, err = db.OpenCluster("db.bin", d.gateway.Dialer(), address)
+		logger.Info("Initializing global database")
+		dir := filepath.Join(d.os.VarDir, "database")
+		d.cluster, err = db.OpenCluster("db.bin", d.gateway.Dialer(), address, dir)
 		if err == nil {
 			break
 		}
@@ -497,24 +492,24 @@ func (d *Daemon) init() error {
 
 	/* Migrate the node local data to the cluster database, if needed */
 	if dump != nil {
-		logger.Infof("Migrating data from lxd.db to db.bin")
+		logger.Infof("Migrating data from local to global database")
 		err = d.cluster.ImportPreClusteringData(dump)
 		if err != nil {
 			// Restore the local sqlite3 backup and wipe the raft
 			// directory, so users can fix problems and retry.
-			path := filepath.Join(d.os.VarDir, "lxd.db")
+			path := d.os.LocalDatabasePath()
 			copyErr := shared.FileCopy(path+".bak", path)
 			if copyErr != nil {
 				// Ignore errors here, there's not much we can do
-				logger.Errorf("Failed to restore lxd.db: %v", copyErr)
+				logger.Errorf("Failed to restore local database: %v", copyErr)
 			}
-			rmErr := os.RemoveAll(filepath.Join(d.os.VarDir, "raft"))
+			rmErr := os.RemoveAll(d.os.GlobalDatabaseDir())
 			if rmErr != nil {
 				// Ignore errors here, there's not much we can do
-				logger.Errorf("Failed to cleanup raft db: %v", rmErr)
+				logger.Errorf("Failed to cleanup global database: %v", rmErr)
 			}
 
-			return fmt.Errorf("Failed to migrate data to db.bin: %v", err)
+			return fmt.Errorf("Failed to migrate data to global database: %v", err)
 		}
 	}
 
@@ -529,6 +524,7 @@ func (d *Daemon) init() error {
 	}
 
 	/* Read the storage pools */
+	logger.Infof("Initializing storage pools")
 	err = SetupStorageDriver(d.State(), false)
 	if err != nil {
 		return err
@@ -541,6 +537,7 @@ func (d *Daemon) init() error {
 	}
 
 	/* Setup the networks */
+	logger.Infof("Initializing networks")
 	err = networkStartup(d.State())
 	if err != nil {
 		return err
@@ -574,6 +571,7 @@ func (d *Daemon) init() error {
 		return err
 	}
 
+	logger.Infof("Loading configuration")
 	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
 		config, err := cluster.ConfigLoad(tx)
 		if err != nil {
@@ -795,7 +793,7 @@ func (d *Daemon) setupExternalAuthentication(authEndpoint string) error {
 		return nil
 	}
 
-	idmClient, err := idmclient.New(idmclient.NewParams{
+	idmClient, err := candidclient.New(candidclient.NewParams{
 		BaseURL: authEndpoint,
 	})
 	if err != nil {
@@ -859,6 +857,19 @@ func (d *Daemon) setupMAASController(server string, key string, machine string) 
 
 // Create a database connection and perform any updates needed.
 func initializeDbObject(d *Daemon) (*db.Dump, error) {
+	logger.Info("Initializing local database")
+	// Rename the old database name if needed.
+	if shared.PathExists(d.os.LegacyLocalDatabasePath()) {
+		if shared.PathExists(d.os.LocalDatabasePath()) {
+			return nil, fmt.Errorf("Both legacy and new local database files exists")
+		}
+		logger.Info("Renaming local database file from lxd.db to database/local.db")
+		err := os.Rename(d.os.LegacyLocalDatabasePath(), d.os.LocalDatabasePath())
+		if err != nil {
+			return nil, errors.Wrap(err, "Failed to rename legacy local database file")
+		}
+	}
+
 	// NOTE: we use the legacyPatches parameter to run a few
 	// legacy non-db updates that were in place before the
 	// patches mechanism was introduced in lxd/patches.go. The
@@ -898,7 +909,7 @@ func initializeDbObject(d *Daemon) (*db.Dump, error) {
 	}
 	var err error
 	var dump *db.Dump
-	d.db, dump, err = db.OpenNode(d.os.VarDir, freshHook, legacy)
+	d.db, dump, err = db.OpenNode(filepath.Join(d.os.VarDir, "database"), freshHook, legacy)
 	if err != nil {
 		return nil, fmt.Errorf("Error creating database: %s", err)
 	}

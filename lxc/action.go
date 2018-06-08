@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/lxc/lxd/lxc/config"
+	"github.com/lxc/lxd/lxc/utils"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	cli "github.com/lxc/lxd/shared/cmd"
@@ -126,6 +127,11 @@ func (c *cmdAction) Command(action string) *cobra.Command {
 func (c *cmdAction) doAction(action string, conf *config.Config, nameArg string) error {
 	state := false
 
+	// Pause is called freeze
+	if action == "pause" {
+		action = "freeze"
+	}
+
 	// Only store state if asked to
 	if action == "stop" && c.flagStateful {
 		state = true
@@ -174,7 +180,15 @@ func (c *cmdAction) doAction(action string, conf *config.Config, nameArg string)
 		return err
 	}
 
+	progress := utils.ProgressRenderer{}
+	_, err = op.AddHandler(progress.UpdateOp)
+	if err != nil {
+		progress.Done("")
+		return err
+	}
+
 	err = op.Wait()
+	progress.Done("")
 	if err != nil {
 		return fmt.Errorf("%s\n"+i18n.G("Try `lxc info --show-log %s` for more info"), err, nameArg)
 	}

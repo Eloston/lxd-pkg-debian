@@ -1,6 +1,7 @@
 package sqlite3
 
 import (
+	"database/sql/driver"
 	"os"
 	"testing"
 )
@@ -95,5 +96,24 @@ func TestWalCheckpoint(t *testing.T) {
 func pragmaWAL(t *testing.T, conn *SQLiteConn) {
 	if _, err := conn.Exec("PRAGMA journal_mode=WAL;", nil); err != nil {
 		t.Fatal("Failed to Exec PRAGMA journal_mode:", err)
+	}
+
+	rows, err := conn.Query("PRAGMA journal_mode", nil)
+	if err != nil {
+		t.Fatal("Failed to Query PRAGMA journal_mode", err)
+	}
+	values := make([]driver.Value, 1)
+	if err := rows.Next(values); err != nil {
+		t.Fatal("Failed to fetch PRAGMA journal_mode row", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal("Failed to close PRAGMA journal_mode rows", err)
+	}
+	mode, ok := values[0].([]byte)
+	if !ok {
+		t.Fatal("expected bytes row value")
+	}
+	if string(mode) != "wal" {
+		t.Fatalf("expected wal journal mode, got %s", mode)
 	}
 }

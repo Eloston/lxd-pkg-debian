@@ -3,6 +3,7 @@ package cluster
 import (
 	"bytes"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math"
 	"net"
@@ -12,8 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"golang.org/x/net/context"
 
 	"github.com/CanonicalLtd/dqlite"
 	"github.com/CanonicalLtd/raft-http"
@@ -95,11 +94,11 @@ func raftInstanceInit(
 	// FIXME: should be a parameter
 	timeout := 5 * time.Second
 
-	logger := raftLogger()
+	raftLogger := raftLogger()
 
 	// Raft config.
 	config := raftConfig(latency)
-	config.Logger = logger
+	config.Logger = raftLogger
 	config.LocalID = raft.ServerID(strconv.Itoa(int(node.ID)))
 
 	// Raft transport
@@ -122,7 +121,7 @@ func raftInstanceInit(
 			return nil, err
 		}
 
-		transport, handler, layer, err = raftNetworkTransport(db, addr, logger, timeout, dial)
+		transport, handler, layer, err = raftNetworkTransport(db, addr, raftLogger, timeout, dial)
 		if err != nil {
 			return nil, err
 		}
@@ -136,8 +135,21 @@ func raftInstanceInit(
 		return nil, errors.Wrap(err, "invalid raft configuration")
 	}
 
+	// Rename legacy data directory if needed.
+	dir := filepath.Join(db.Dir(), "global")
+	legacyDir := filepath.Join(db.Dir(), "..", "raft")
+	if shared.PathExists(legacyDir) {
+		if shared.PathExists(dir) {
+			return nil, fmt.Errorf("both legacy and new global database directories exist")
+		}
+		logger.Info("Renaming global database directory from raft/ to database/global/")
+		err := os.Rename(legacyDir, dir)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to rename legacy global database directory")
+		}
+	}
+
 	// Data directory
-	dir := filepath.Join(db.Dir(), "raft")
 	if !shared.PathExists(dir) {
 		err := os.Mkdir(dir, 0750)
 		if err != nil {
@@ -154,8 +166,8 @@ func raftInstanceInit(
 		return nil, errors.Wrap(err, "failed to create bolt store for raft logs")
 	}
 
-	// Raft snapshot store
-	snaps, err := raft.NewFileSnapshotStoreWithLogger(dir, 2, logger)
+	// Raft snapshot store (don't log snapshots since we take them frequently)
+	snaps, err := raft.NewFileSnapshotStoreWithLogger(dir, 2, log.New(ioutil.Discard, "", 0))
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create file snapshot store")
 	}
@@ -257,11 +269,32 @@ func (i *raftInstance) MembershipChanger() raftmembership.Changer {
 func (i *raftInstance) Shutdown() error {
 	logger.Info("Stop raft instance")
 
-	// Stop raft asynchronously to allow for a timeout.
-	errCh := make(chan error)
+	// Invoke raft APIs asynchronously to allow for a timeout.
 	timeout := 10 * time.Second
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+
+	// FIXME/TODO: We take a snapshot before when shutting down the daemon
+	//             so there will be no uncompacted raft logs at the next
+	//             startup. This is a workaround for slow log replay when
+	//             the LXD daemon starts (see #4485). A more proper fix
+	//             should be probably implemented in dqlite.
+	errCh := make(chan error)
+	timer := time.After(timeout)
+	go func() {
+		errCh <- i.raft.Snapshot().Error()
+	}()
+	// In case of error we just log a warning, since this is not really
+	// fatal.
+	select {
+	case err := <-errCh:
+		if err != nil && err != raft.ErrNothingNewToSnapshot {
+			logger.Warnf("Failed to take raft snapshot: %v", err)
+		}
+	case <-timer:
+		logger.Warnf("Timeout waiting for raft to take a snapshot")
+	}
+
+	errCh = make(chan error)
+	timer = time.After(timeout)
 	go func() {
 		errCh <- i.raft.Shutdown().Error()
 	}()
@@ -270,7 +303,7 @@ func (i *raftInstance) Shutdown() error {
 		if err != nil {
 			return errors.Wrap(err, "failed to shutdown raft")
 		}
-	case <-ctx.Done():
+	case <-timer:
 		logger.Debug("Timeout waiting for raft to shutdown")
 		return fmt.Errorf("raft did not shutdown within %s", timeout)
 
@@ -368,6 +401,14 @@ func raftConfig(latency float64) *raft.Config {
 	for _, duration := range durations {
 		scale(duration)
 	}
+
+	// FIXME/TODO: We increase the frequency of snapshots here to keep the
+	//             number of uncompacted raft logs low, and workaround slow
+	//             log replay when the LXD daemon starts (see #4485). A more
+	//             proper fix should be probably implemented in dqlite.
+	config.SnapshotThreshold = 64
+	config.TrailingLogs = 128
+
 	return config
 }
 

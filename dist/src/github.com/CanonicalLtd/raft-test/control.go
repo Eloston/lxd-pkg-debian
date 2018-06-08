@@ -16,346 +16,465 @@ package rafttest
 
 import (
 	"context"
+	"fmt"
+	"log"
+	"runtime"
 	"testing"
 	"time"
 
+	"github.com/CanonicalLtd/raft-test/internal/election"
+	"github.com/CanonicalLtd/raft-test/internal/event"
+	"github.com/CanonicalLtd/raft-test/internal/fsms"
+	"github.com/CanonicalLtd/raft-test/internal/network"
 	"github.com/hashicorp/raft"
 )
 
-// Control lets users watch and modify a cluster of test raft instances.
+// Control the events happening in a cluster of raft servers, such has leadership
+// changes, failures and shutdowns.
 type Control struct {
-	t             testing.TB
-	fsmsWatcher   *fsmsWatcher
-	logsWatcher   *logsWatcher
-	notifyWatcher *notifyWatcher
-	network       *network
-	rafts         []*raft.Raft
+	t        testing.TB
+	logger   *log.Logger
+	election *election.Tracker
+	network  *network.Network
+	watcher  *fsms.Watcher
+	confs    map[raft.ServerID]*raft.Config
+	servers  map[raft.ServerID]*raft.Raft
+	errored  bool
+	deposing chan struct{}
+
+	// Current Term after Elect() was called, if any.
+	term *Term
+
+	// Future of any pending snapshot that has been scheduled with an
+	// event.
+	snapshotFuture raft.SnapshotFuture
 }
 
-// Close the control for this raft cluster, stopping all monitoring goroutines.
+// Close the control for this raft cluster, shutting down all servers and
+// stopping all monitoring goroutines.
 //
 // It must be called by every test creating a test cluster with Cluster().
 func (c *Control) Close() {
-	c.t.Helper()
+	c.logger.Printf("[DEBUG] raft-test: close: start")
 
-	c.t.Logf("raft-test: shutdown cluster")
+	// First tell the election tracker that we don't care anymore about
+	// notifications. Any value received from the NotifyCh's will be dropped
+	// on the floor.
+	c.election.Ignore()
 
-	Shutdown(c.t, c.rafts)
+	// Now shutdown the servers.
+	c.shutdownServers()
 
-	c.notifyWatcher.Close()
+	// Finally shutdown the election tracker since nothing will be
+	// sending to NotifyCh's.
+	c.election.Close()
+
+	c.logger.Printf("[DEBUG] raft-test: close: done")
 }
 
-// Index returns the index of the given raft instance.
-func (c *Control) Index(raft *raft.Raft) int {
+// Elect a server as leader.
+//
+// When calling this method there must be no leader in the cluster and server
+// transports must all be disconnected from eacher.
+func (c *Control) Elect(id raft.ServerID) *Term {
 	c.t.Helper()
 
-	for i := range c.rafts {
-		if c.rafts[i] == raft {
-			return i
+	c.logger.Printf("[DEBUG] raft-test: elect: start (server %s)", id)
+
+	// Wait for the current leader (if any) to be fully deposed.
+	if c.deposing != nil {
+		<-c.deposing
+	}
+
+	// Sanity check that no server is the leader.
+	for id, r := range c.servers {
+		if r.State() == raft.Leader {
+			c.t.Fatalf("raft-test: error: cluster has already a leader (server %s)", id)
 		}
 	}
-	c.t.Fatalf("raft-test: unknown raft instance at %p", raft)
-	return -1
-}
 
-// Other returns a raft instance of the cluster which is different from the
-// given one.
-func (c *Control) Other(rafts ...*raft.Raft) *raft.Raft {
-	for _, this := range c.rafts {
-		different := true
-		for _, other := range rafts {
-			if this == other {
-				different = false
-				break
+	// We might need to repeat the logic below a few times in case a
+	// follower hits its heartbeat timeout before the leader has chance to
+	// append entries to it and refresh the last contact timestamp (hence
+	// transitioning to candidate and starting a new election).
+	for n := 0; n < maxElectionRounds; n++ {
+		leadership := c.waitLeadershipAcquired(id)
+
+		// We did not acquire leadership, let's retry.
+		if leadership == nil {
+			if n < maxElectionRounds {
+				c.logger.Printf("[DEBUG] raft-test: elect: server %s: retry %d ", id, n+1)
+				continue
 			}
 		}
-		if different {
-			return this
+
+		// The given node became the leader, let's make sure
+		// that leadership is stable and that other nodes
+		// become followers.
+		if !c.waitLeadershipPropagated(id, leadership) {
+			if n < maxElectionRounds {
+				c.logger.Printf("[DEBUG] raft-test: elect: server %s: retry %d ", id, n+1)
+				continue
+			}
 		}
+		// Now establish all remaining connections. E.g. for three nodes:
+		//
+		// L  <--- F1
+		// L  <--- F2
+		//
+		// and:
+		//
+		// F1 <--- F2
+		// F1 ---> F2
+		//
+		// This way the cluster is fully connected. foo
+		c.logger.Printf("[DEBUG] raft-test: elect: done")
+		term := &Term{
+			control:    c,
+			id:         id,
+			leadership: leadership,
+		}
+		c.term = term
+
+		return term
 	}
+	c.t.Fatalf("raft-test: server %s: did not acquire stable leadership", id)
+
 	return nil
 }
 
-// LeadershipAcquired blocks until one of the nodes in the cluster changes its state
-// to raft.Leader.
+// Barrier is used to wait for the cluster to settle to a stable state, where
+// all in progress Apply() commands are committed across all FSM associated
+// with servers that are not disconnected and all in progress snapshots and
+// restores have been performed.
 //
-// It returns the raft instance that became leader.
-//
-// It fails the test if no node has acquired leadership within the timeout.
-//
-// In case GO_RAFT_TEST_LATENCY is set, the timeout will be transparently
-// scaled by that factor.
-func (c *Control) LeadershipAcquired(timeout time.Duration) *raft.Raft {
-	c.t.Helper()
-
-	timeout = Duration(timeout)
-	c.t.Logf("raft-test: wait for a non-leader node to acquire leadership within %s", timeout)
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	info := c.notifyWatcher.Next(ctx)
-	if info == nil {
-		c.t.Fatalf("raft-test: no node changed leadership state")
-	}
-
-	c.t.Logf("raft-test: node %d: leadership %s", info.On, info.Verb())
-
-	if !info.Acquired {
-		c.t.Fatalf("raft-test: node %d: lost leadership instead of acquiring it", info.On)
-	}
-
-	// Sanity check that the state is actually the right one. This should
-	// always be true with the current raft code.
-	r := c.rafts[info.On]
-
-	if state := r.State(); state != raft.Leader {
-		c.t.Fatalf("raft-test: node %d: unexpected state %s", info.On, state)
-	}
-
-	return r
-}
-
-// LeadershipLost blocks until the given raft instance notifies that it has
-// lost leadership.
-//
-// It fails the test if the raft instance doesn't lose leadership within the timeout.
-//
-// In case GO_RAFT_TEST_LATENCY is set, the timeout will be transparently
-// scaled by that factor.
-func (c *Control) LeadershipLost(r *raft.Raft, timeout time.Duration) {
-	c.t.Helper()
-
-	timeout = Duration(timeout)
-
-	i := c.Index(r)
-	c.t.Logf("raft-test: node %d: wait to lose leadership within %s", i, timeout)
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	info := c.notifyWatcher.Next(ctx)
-	if info == nil {
-		c.t.Fatalf("raft-test: no node changed leadership state")
-	}
-
-	c.t.Logf("raft-test: node %d: leadership %s", info.On, info.Verb())
-
-	if info.Acquired {
-		c.t.Fatalf("raft-test: node %d: leadership acquired by %d instead", i, info.On)
-	}
-
-	if state := r.State(); state == raft.Leader {
-		c.t.Fatalf("raft-test: node %d: unexpected state %s", info.On, state)
-	}
-}
-
-// Disconnect the given raft instance from the others.
-//
-// Requires that the transports to implement LoopbackTransports.
-func (c *Control) Disconnect(r *raft.Raft) {
-	c.t.Helper()
-
-	i := c.Index(r)
-	c.t.Logf("raft-test: node %d: disconnect", i)
-
-	err := c.network.Disconnect(i)
-	if err != nil {
-		c.t.Fatalf("raft-test: node %d: disconnect error: %v", i, err)
-	}
-}
-
-// Reconnect the given raft instance to all the others.
-//
-// Requires that the transports to implement LoopbackTransports.
-func (c *Control) Reconnect(r *raft.Raft) {
-	c.t.Helper()
-
-	i := c.Index(r)
-	c.t.Logf("raft-test: node %d: reconnect", i)
-
-	err := c.network.Reconnect(i)
-	if err != nil {
-		c.t.Fatalf("raft-test: node %d: reconnect error: %v", i, err)
-	}
-}
-
-// BeforeStoreLog sets a hook triggering when the log store of the given raft
-// instance is about to store the the log with the given index.
-func (c *Control) BeforeStoreLog(r *raft.Raft, index uint64, hook func()) {
-	i := c.Index(r)
-	c.logsWatcher.BeforeStoreLog(i, index, hook)
-}
-
-// BeforeApply sets a hook triggering when the FSM of the given raft instance
-// is about to apply the log command with given index.
-func (c *Control) BeforeApply(r *raft.Raft, index uint64, hook func()) {
-	i := c.Index(r)
-	c.fsmsWatcher.BeforeApply(i, index, hook)
-}
-
-// AfterApply sets a hook triggering when the FSM of the given raft
-// instance has applied the log command with the given index.
-func (c *Control) AfterApply(r *raft.Raft, index uint64, hook func()) {
-	i := c.Index(r)
-	c.fsmsWatcher.AfterApply(i, index, hook)
-}
-
-// AppliedIndex returns the index of the last log applied by the FSM of the
-// given raft instance.
-func (c *Control) AppliedIndex(r *raft.Raft) uint64 {
-	i := c.Index(r)
-	return c.fsmsWatcher.AppliedIndex(i)
-}
-
-// WaitIndex waits until the FSM of the given raft instance reaches at least
-// the given index.
-//
-// It fails the test if this does not happen withing the given timeout.
-//
-// In case GO_RAFT_TEST_LATENCY is set, the timeout will be transparently
-// scaled by that factor.
-func (c *Control) WaitIndex(r *raft.Raft, index uint64, timeout time.Duration) {
-	c.t.Helper()
-
-	i := c.Index(r)
-	c.t.Logf("raft-test: node %d: wait for FSM to apply index %d", i, index)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// First set up a hook for intercepting the log.
-	c.fsmsWatcher.AfterApply(i, index, func() {
-		cancel()
-	})
-
-	// Secondly poll the wrapper to check if the FSM has reached the
-	// desired apply count (this can happen if it started before we
-	// could set up the hook).
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			if current := c.fsmsWatcher.AppliedIndex(i); current >= index {
-				cancel()
-			}
-			time.Sleep(50 * time.Millisecond)
+// Usually you don't wan't to concurrently keep invoking Apply() on the cluster
+// raft instances while Barrier() is running.
+func (c *Control) Barrier() {
+	// Wait for snapshots to complete.
+	if c.snapshotFuture != nil {
+		if err := c.snapshotFuture.Error(); err != nil {
+			c.t.Fatalf("raft-test: snapshot failed: %v", err)
 		}
-	}()
+	}
 
-	// Wait for either the hook or the poller to cancel the context.
-	select {
-	case <-ctx.Done():
-		c.t.Logf("raft-test: node %d: FSM applied index %d", i, index)
-	case <-time.After(timeout):
-		current := c.fsmsWatcher.AppliedIndex(i)
-		c.t.Fatalf("raft-test: node %d: FSM did not apply index %d within %s (current %d)",
-			i, index, timeout, current)
+	// Wait for inflight commands to be applied to the leader's FSM.
+	if c.term.id != "" {
+		// Set a relatively high timeout.
+		//
+		// TODO: let users specify the maximum amount of time a single
+		// Apply() to their FSM should take, and calculate this value
+		// accordingly.
+		timeout := Duration(time.Second)
+
+		if err := c.servers[c.term.id].Barrier(timeout).Error(); err != nil {
+			c.t.Fatalf("raft-test: leader barrier: %v", err)
+		}
+
+		// Wait for follower FSMs to catch up.
+		n := c.Commands(c.term.id)
+		events := make([]*event.Event, 0)
+		for id := range c.servers {
+			if id == c.term.id {
+				continue
+			}
+			// Skip disconnected followers.
+			if !c.network.PeerConnected(c.term.id, id) {
+				continue
+			}
+			event := c.watcher.WhenApplied(id, n)
+			events = append(events, event)
+		}
+		for _, event := range events {
+			<-event.Watch()
+			event.Ack()
+		}
 	}
 }
 
-// WaitSnapshot waits until the FSM of the given raft instance has performed at
-// least the given number of snapshots
+// Depose the current leader.
 //
-// It fails the test if this does not happen withing the given timeout.
+// When calling this method a leader must have been previously elected with
+// Elect().
 //
-// In case GO_RAFT_TEST_LATENCY is set, the timeout will be transparently
-// scaled by that factor.
-func (c *Control) WaitSnapshot(r *raft.Raft, n int, timeout time.Duration) {
-	c.t.Helper()
+// It must not be called if the current term has scheduled a depose action with
+// Action.Depose().
+func (c *Control) Depose() {
+	event := event.New()
+	go c.deposeUponEvent(event, c.term.id, c.term.leadership)
+	event.Fire()
+	event.Block()
+}
 
-	timeout = Duration(timeout)
+// Commands returns the total number of command logs applied by the FSM of the
+// server with the given ID.
+func (c *Control) Commands(id raft.ServerID) uint64 {
+	return c.watcher.Commands(id)
+}
 
-	i := c.Index(r)
-	c.t.Logf("raft-test: node %d: wait for FSM to perform snapshot %d", i, n)
+// Snapshots returns the total number of snapshots performed by the FSM of the
+// server with the given ID.
+func (c *Control) Snapshots(id raft.ServerID) uint64 {
+	return c.watcher.Snapshots(id)
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// Restores returns the total number of restores performed by the FSM of the
+// server with the given ID.
+func (c *Control) Restores(id raft.ServerID) uint64 {
+	return c.watcher.Restores(id)
+}
 
-	// First set up a hook for intercepting the snapshot.
-	c.fsmsWatcher.AfterSnapshot(i, n, func() {
-		cancel()
-	})
+// Shutdown all raft nodes and fail the test if any of them errors out while
+// doing so.
+func (c *Control) shutdownServers() {
+	// Find the leader if there is one, and shut it down first. This should
+	// prevent it from getting stuck on shutdown while trying to send RPCs
+	// to the followers.
+	//
+	// TODO: this is arguably a workaround for a bug in the transport
+	// wrapper.
+	ids := make([]raft.ServerID, 0)
+	for id, r := range c.servers {
+		if r.State() == raft.Leader {
+			c.shutdownServer(id)
+			ids = append(ids, id)
+		}
+	}
 
-	// Secondly poll the wrapper to check if the FSM has reached the
-	// desired snapshot count (this can happen if it startedt before we
-	// could set up the hook).
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			if current := c.fsmsWatcher.SnapshotCount(i); current >= n {
-				cancel()
+	// Shutdown the rest.
+	for id := range c.servers {
+		hasShutdown := false
+		for i := range ids {
+			if ids[i] == id {
+				hasShutdown = true
 				break
 			}
-			time.Sleep(50 * time.Millisecond)
 		}
-	}()
-
-	// Wait for the hook to fire the channel
-	select {
-	case <-ctx.Done():
-		c.t.Logf("raft-test: node %d: FSM performed %d snapshots", i, n)
-	case <-time.After(timeout):
-		c.t.Fatalf("raft-test: node %d: FSM did not perform snapshot %d within %s", i, n, timeout)
+		if hasShutdown {
+			c.shutdownServer(id)
+			ids = append(ids, id)
+		}
 	}
 }
 
-// WaitRestore waits until the FSM of the given raft instance has restored at least
-// the given number of snapshots.
-//
-// It fails the test if this does not happen withing the given timeout.
-//
-// In case GO_RAFT_TEST_LATENCY is set, the timeout will be transparently
-// scaled by that factor.
-func (c *Control) WaitRestore(r *raft.Raft, n int, timeout time.Duration) {
-	c.t.Helper()
+// Shutdown a single server.
+func (c *Control) shutdownServer(id raft.ServerID) {
+	r := c.servers[id]
+	future := r.Shutdown()
 
-	timeout = Duration(timeout)
+	// Expect the shutdown to happen within two seconds by default.
+	timeout := Duration(2 * time.Second)
 
-	i := c.Index(r)
-	c.t.Logf("raft-test: node %d: wait for FSM to perform restore %d", i, n)
+	// Watch for errors.
+	ch := make(chan error, 1)
+	go func(future raft.Future) {
+		ch <- future.Error()
+	}(future)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	var err error
+	select {
+	case err = <-ch:
+		c.logger.Printf("[DEBUG] raft-test: close: server %s: shutdown done", id)
+	case <-time.After(timeout):
+		err = fmt.Errorf("timeout (%s)", timeout)
+	}
+	if err == nil {
+		return
+	}
 
-	// First set up a hook for intercepting the restore.
-	c.fsmsWatcher.AfterRestore(i, n, func() {
-		cancel()
-	})
+	c.logger.Printf("[DEBUG] raft-test: close: server %s: shutdown failed: %s", id, err)
 
-	// Secondly poll the wrapper to check if the FSM has reached the
-	// desired restore count (this can happen if it startedt before we
-	// could set up the hook).
-	go func() {
+	buf := make([]byte, 1<<16)
+	n := runtime.Stack(buf, true)
+
+	c.t.Errorf("\n\t%s", buf[:n])
+	c.t.Fatalf("raft-test: close: error: server %s: shutdown error: %v", id, err)
+}
+
+// Wait for the given server to acquire leadership. Returns true on success,
+// false otherwise (i.e. if the timeout expires).
+func (c *Control) waitLeadershipAcquired(id raft.ServerID) *election.Leadership {
+	timeout := maximumElectionTimeout(c.confs) * maxElectionRounds
+	future := c.election.Expect(id, timeout)
+
+	c.watcher.Electing(id)
+
+	// Reset any leader-related state on the transport of the given server
+	// and connect it to all other servers, letting it send them RPCs
+	// messages but not viceversa. E.g. for three nodes:
+	//
+	// L ---> F1
+	// L ---> F2
+	//
+	// This way we are sure we are the only server that can possibly acquire
+	// leadership.
+	c.network.Electing(id)
+
+	// First wait for the given node to become leader.
+	c.logger.Printf("[DEBUG] raft-test: elect: server %s: wait to become leader within %s", id, timeout)
+
+	leadership, err := future.Done()
+	if err != nil {
+		c.logger.Printf("[DEBUG] raft-test: elect: server %s: did not become leader", id)
+	}
+	return leadership
+
+}
+
+// Wait that the leadership just acquired by server with the given id is
+// acknowledged by all other servers and they all permanently transition to the
+// follower state.
+func (c *Control) waitLeadershipPropagated(id raft.ServerID, leadership *election.Leadership) bool {
+	// The leadership propagation needs to happen within the leader lease
+	// timeout, otherwise the newly elected leader will step down.
+	timeout := maximumLeaderLeaseTimeout(c.confs)
+	c.logger.Printf("[DEBUG] raft-test: elect: server %s: wait for other servers to become followers within %s", id, timeout)
+
+	// Get the current configuration, so we wait only for servers that are
+	// actually currently part of the cluster (some of them might have been
+	// excluded with the Servers option).
+	r := c.servers[id]
+	future := r.GetConfiguration()
+	if err := future.Error(); err != nil {
+		c.t.Fatalf("raft-test: control: server %s: failed to get configuration: %v", id, err)
+	}
+	servers := future.Configuration().Servers
+
+	timer := time.After(timeout)
+	address := c.network.Address(id)
+	for _, server := range servers {
+		other := server.ID
+		if other == id {
+			continue
+		}
+		r := c.servers[server.ID]
 		for {
+			// Check that we didn't lose leadership in the meantime.
 			select {
-			case <-ctx.Done():
-				return
+			case <-leadership.Lost():
+				c.network.Deposing(id)
+				c.logger.Printf("[DEBUG] raft-test: elect: server %s: lost leadership", id)
+				return false
+			case <-timer:
+				c.t.Fatalf("raft-test: elect: server %s: followers did not settle", id)
 			default:
 			}
-			if current := c.fsmsWatcher.RestoreCount(i); current >= n {
-				cancel()
+
+			// Check that this server is in follower mode, that it
+			// has set the elected sever as leader and that we were
+			// able to append at least one log entry to it (when a
+			// server becomes leader, it always sends a LogNoop).
+			if r.State() == raft.Follower && r.Leader() == address && c.network.HasAppendedLogsFromTo(id, other) {
+				c.logger.Printf("[DEBUG] raft-test: elect: server %s: became follower", other)
 				break
 			}
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(time.Millisecond)
 		}
-	}()
-
-	// Wait for the hook to fire the channel
-	select {
-	case <-ctx.Done():
-		c.t.Logf("raft-test: node %d: FSM restored %d snapshots", i, n)
-	case <-time.After(timeout):
-		c.t.Fatalf("raft-test: node %d: FSM did not perform restore %d within %s", i, n, timeout)
 	}
+
+	return true
 }
+
+// Return an event that gets fired when the n'th log command gets enqueued by
+// the given leader server.
+func (c *Control) whenCommandEnqueued(id raft.ServerID, n uint64) *event.Event {
+	return c.network.ScheduleEnqueueFailure(id, n)
+}
+
+// Return an event that gets fired when the n'th log command gets appended by
+// server with the given ID (which is supposed to be the leader) to all other
+// servers.
+func (c *Control) whenCommandAppended(id raft.ServerID, n uint64) *event.Event {
+	return c.network.ScheduleAppendFailure(id, n)
+}
+
+// Return an event that gets fired when the n'th log command gets committed on
+// server with the given ID (which is supposed to be the leader).
+func (c *Control) whenCommandCommitted(id raft.ServerID, n uint64) *event.Event {
+	return c.watcher.WhenApplied(id, n)
+}
+
+// Depose the server with the given ID when the given event fires.
+func (c *Control) deposeUponEvent(event *event.Event, id raft.ServerID, leadership *election.Leadership) {
+	// Sanity checks.
+	r := c.servers[id]
+	if r.State() != raft.Leader {
+		panic(fmt.Errorf("raft-test: server %s: is not leader", id))
+	}
+
+	<-event.Watch()
+
+	c.network.Deposing(id)
+
+	timeout := maximumLeaderLeaseTimeout(c.confs)
+
+	c.logger.Printf("[DEBUG] raft-test: node %s: state: wait leadership lost (timeout=%s)", id, timeout)
+
+	select {
+	case <-leadership.Lost():
+	case <-time.After(timeout):
+		c.t.Errorf("raft-test: server %s: error: timeout: leadership not lost", id)
+		c.errored = true
+	}
+	event.Ack()
+
+	if !c.errored {
+		c.logger.Printf("[DEBUG] raft-test: server %s: leadership lost", id)
+	}
+
+	c.deposing <- struct{}{}
+	c.deposing = nil
+	c.term = nil
+}
+
+// Take a snapshot on the server with the given ID when the given event fires.
+func (c *Control) snapshotUponEvent(event *event.Event, id raft.ServerID) {
+	<-event.Watch()
+
+	c.logger.Printf("[DEBUG] raft-test: server %s: control: take snapshot", id)
+
+	r := c.servers[id]
+	c.snapshotFuture = r.Snapshot()
+
+	event.Ack()
+}
+
+// Compute the maximum time a leader election should take, according to the
+// given nodes configs.
+func maximumElectionTimeout(confs map[raft.ServerID]*raft.Config) time.Duration {
+	timeout := time.Duration(0)
+
+	for _, conf := range confs {
+		if conf.ElectionTimeout > timeout {
+			timeout = conf.ElectionTimeout
+		}
+	}
+
+	return timeout * timeoutRandomizationFactor
+}
+
+// Return the maximum leader lease timeout among the given nodes configs.
+func maximumLeaderLeaseTimeout(confs map[raft.ServerID]*raft.Config) time.Duration {
+	timeout := time.Duration(0)
+
+	for _, conf := range confs {
+		if conf.LeaderLeaseTimeout > timeout {
+			timeout = conf.LeaderLeaseTimeout
+		}
+	}
+
+	// Multiply the timeout by three to account for randomization.
+	return timeout * timeoutRandomizationFactor
+}
+
+const (
+	// Assume that a leader is elected within 25 rounds. Should be safe enough.
+	maxElectionRounds = 25
+
+	// Hashicorp's raft implementation randomizes timeouts between 1x and
+	// 2x. Multiplying by 4x makes it sure to expire the timeout.
+	timeoutRandomizationFactor = 4
+)
 
 // WaitLeader blocks until the given raft instance sets a leader (which
 // could possibly be the instance itself).

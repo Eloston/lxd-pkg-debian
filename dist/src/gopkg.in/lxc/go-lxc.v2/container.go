@@ -527,6 +527,11 @@ func (c *Container) Execute(args ...string) ([]byte, error) {
 	// go-nuts thread: https://groups.google.com/forum/#!msg/golang-nuts/h9GbvfYv83w/5Ly_jvOr86wJ
 	output, err := exec.Command(cargs[0], cargs[1:]...).CombinedOutput()
 	if err != nil {
+		// Do not suppress stderr if the exit code != 0. Return with err.
+		if len(output) > 1 {
+			return output, ErrExecuteFailed
+		}
+
 		return nil, ErrExecuteFailed
 	}
 
@@ -1282,7 +1287,12 @@ func (c *Container) runCommandStatus(args []string, options AttachOptions) (int,
 		cargs,
 	))
 
-	return ret, nil
+	if ret < 0 {
+		return ret, nil
+	}
+
+	// Mirror the behavior of WEXITSTATUS().
+	return int((ret & 0xFF00) >> 8), nil
 }
 
 // RunCommandStatus attachs a shell and runs the command within the container.

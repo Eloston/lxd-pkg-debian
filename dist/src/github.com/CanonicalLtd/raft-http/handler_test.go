@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -21,22 +22,45 @@ func TestHandler_NoUpgradeHeader(t *testing.T) {
 	// Make a request with no Upgrade header
 	r := &http.Request{Method: "GET"}
 
-	handler := rafthttp.NewTestingHandler(t)
+	handler := newHandler(t)
 	handler.ServeHTTP(w, r)
 
 	responseCheck(t, w, http.StatusBadRequest, "missing or invalid upgrade header\n")
 }
 
 func TestHandler_Closed(t *testing.T) {
-	w := httptest.NewRecorder()
-	r := &http.Request{Method: "GET"}
-	handler := rafthttp.NewHandler()
+	// Hijack the HTTP connection to a net.Pipe instance.
+	server, client := net.Pipe()
+	w := newResponseHijacker()
+	w.HijackConn = server
 
-	// Handle the request after the handler is closed
+	clientClosed := make(chan struct{})
+	go func() {
+		buffer := make([]byte, 1000)
+		for {
+			if _, err := client.Read(buffer); err != nil {
+				close(clientClosed)
+				return
+			}
+		}
+	}()
+
+	r := &http.Request{Method: "GET", Header: make(http.Header), Host: "foo.bar"}
+	r.Header.Set("Upgrade", "raft")
+
+	handler := newHandler(t)
+
+	// Handle the request after the handler is closed.
 	handler.Close()
 	handler.ServeHTTP(w, r)
 
-	responseCheck(t, w, http.StatusForbidden, "raft transport closed\n")
+	// The WebSocket connection still gets established but gets closed
+	// because we have shutdown.
+	select {
+	case <-clientClosed:
+	case <-time.After(time.Second):
+		t.Fatal("client connection was not closed")
+	}
 }
 
 func TestHandler_HijackerNotImplemented(t *testing.T) {
@@ -45,7 +69,7 @@ func TestHandler_HijackerNotImplemented(t *testing.T) {
 
 	r := &http.Request{Method: "GET", Header: make(http.Header)}
 	r.Header.Set("Upgrade", "raft")
-	handler := rafthttp.NewHandler()
+	handler := newHandler(t)
 	handler.ServeHTTP(w, r)
 
 	responseCheck(t, w, http.StatusInternalServerError, "webserver doesn't support hijacking\n")
@@ -59,7 +83,7 @@ func TestHandler_HijackError(t *testing.T) {
 
 	r := &http.Request{Method: "GET", Header: make(http.Header)}
 	r.Header.Set("Upgrade", "raft")
-	handler := rafthttp.NewHandler()
+	handler := newHandler(t)
 	handler.ServeHTTP(w, r)
 
 	responseCheck(t, &w.ResponseRecorder, http.StatusInternalServerError, "failed to hijack connection: boom\n")
@@ -74,7 +98,7 @@ func TestHandler_HijackConnWriteError(t *testing.T) {
 
 	r := &http.Request{Method: "GET", Header: make(http.Header)}
 	r.Header.Set("Upgrade", "raft")
-	handler := rafthttp.NewHandler()
+	handler := newHandler(t)
 	handler.ServeHTTP(w, r)
 
 	// The response has code 200 instead of 101 and the body is
@@ -90,7 +114,7 @@ func TestHandler_ConnectionsTimeout(t *testing.T) {
 	r := &http.Request{Method: "GET", Header: make(http.Header), Host: "foo.bar"}
 	r.Header.Set("Upgrade", "raft")
 
-	handler := rafthttp.NewHandler()
+	handler := newHandler(t)
 	handler.Timeout(time.Microsecond)
 
 	reader := bufio.NewReader(client)
@@ -119,7 +143,7 @@ func TestHandler_Connections(t *testing.T) {
 	r := &http.Request{Method: "GET", Header: make(http.Header), Host: "foo.bar"}
 	r.Header.Set("Upgrade", "raft")
 
-	handler := rafthttp.NewHandler()
+	handler := newHandler(t)
 	go handler.ServeHTTP(w, r)
 
 	reader := bufio.NewReader(client)
@@ -153,7 +177,7 @@ func TestHandler_Connections(t *testing.T) {
 func TestHandler_NoServerIDProvided(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := &http.Request{Method: "POST", URL: &url.URL{}}
-	handler := rafthttp.NewHandler()
+	handler := newHandler(t)
 	handler.ServeHTTP(w, r)
 	body := w.Body.String()
 	if body != "no server ID provided\n" {
@@ -167,7 +191,7 @@ func TestHandler_NoServerIDProvided(t *testing.T) {
 func TestHandler_MembershipDeleteFailure(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := &http.Request{Method: "DELETE", URL: &url.URL{RawQuery: "id=999"}}
-	handler := rafthttp.NewHandler()
+	handler := newHandler(t)
 
 	// Spawn a memberships request handler that fails when trying
 	// to leave the cluster.
@@ -194,7 +218,7 @@ func TestHandler_MembershipDeleteFailure(t *testing.T) {
 func TestHandler_MembershipDeleteAfterShutdown(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := &http.Request{Method: "DELETE", URL: &url.URL{RawQuery: "id=999"}}
-	handler := rafthttp.NewHandler()
+	handler := newHandler(t)
 	handler.Close()
 
 	handler.ServeHTTP(w, r)
@@ -205,7 +229,7 @@ func TestHandler_MembershipDeleteAfterShutdown(t *testing.T) {
 func TestHandler_MembershipDeleteTimeout(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := &http.Request{Method: "DELETE", URL: &url.URL{RawQuery: "id=666"}}
-	handler := rafthttp.NewHandler()
+	handler := newHandler(t)
 	handler.Timeout(time.Microsecond)
 	go func() {
 		<-handler.Requests()
@@ -218,7 +242,7 @@ func TestHandler_MembershipDeleteTimeout(t *testing.T) {
 func TestHandler_MembershipPostSuccess(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := &http.Request{Method: "POST", URL: &url.URL{RawQuery: "id=666&address=abc"}}
-	handler := rafthttp.NewHandler()
+	handler := newHandler(t)
 
 	// Spawn a memberships request handler that succeeds when trying
 	// to join the cluster.
@@ -248,7 +272,7 @@ func TestHandler_MembershipPostSuccess(t *testing.T) {
 func TestHandler_DifferentLeader(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := &http.Request{Method: "POST", URL: &url.URL{RawQuery: "id=666&address=abc"}}
-	handler := rafthttp.NewHandler()
+	handler := newHandler(t)
 
 	// Spawn a memberships request handler that fails because the
 	// node is not the leader and points to the currently known
@@ -266,7 +290,7 @@ func TestHandler_DifferentLeader(t *testing.T) {
 func TestHandler_UnknownLeader(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := &http.Request{Method: "POST", URL: &url.URL{RawQuery: "id=666&address=abc"}}
-	handler := rafthttp.NewHandler()
+	handler := newHandler(t)
 
 	// Spawn a memberships request handler that fails because the
 	// node is not the leader and also does not know who the current
@@ -287,10 +311,33 @@ func TestHandler_UnsupportedMethod(t *testing.T) {
 	// Use an unsupported HTTP method.
 	r := &http.Request{Method: "PATCH"}
 
-	handler := rafthttp.NewHandler()
+	handler := newHandler(t)
 	handler.ServeHTTP(w, r)
 
 	responseCheck(t, w, http.StatusMethodNotAllowed, "unknown action\n")
+}
+
+// Create a Handler for testing purposes. It logs to the testing logger.
+func newHandler(t *testing.T) *rafthttp.Handler {
+	return rafthttp.NewHandlerWithLogger(newLogger(t))
+}
+
+// Create a new logger writing to the testing logger.
+func newLogger(t *testing.T) *log.Logger {
+	return log.New(&testingWriter{t}, "", 0)
+}
+
+// Implement io.Writer and forward what it receives to a
+// testing logger.
+type testingWriter struct {
+	t testing.TB
+}
+
+// Write a single log entry. It's assumed that p is always a \n-terminated UTF
+// string.
+func (w *testingWriter) Write(p []byte) (n int, err error) {
+	w.t.Logf(string(p))
+	return len(p), nil
 }
 
 // A test response implementing the http.Hijacker interface.

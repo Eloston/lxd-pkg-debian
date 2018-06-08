@@ -47,6 +47,7 @@ func TestRegistry_SyncHook_Leader(t *testing.T) {
 
 	// Mimick an FSM instance applying the log command.
 	registry.Lock()
+	assert.True(t, registry.HookSyncPresent())
 	assert.True(t, registry.HookSyncMatches(data1))
 	registry.Unlock()
 
@@ -58,6 +59,7 @@ func TestRegistry_SyncHook_Leader(t *testing.T) {
 
 	// Mimick an FSM instance applying the second log command.
 	registry.Lock()
+	assert.True(t, registry.HookSyncPresent())
 	assert.True(t, registry.HookSyncMatches(data2))
 	registry.Unlock()
 
@@ -65,10 +67,15 @@ func TestRegistry_SyncHook_Leader(t *testing.T) {
 	registry.Lock()
 	registry.HookSyncReset()
 	registry.Unlock()
+
+	// Mimick an FSM instance applying a third command log sent by another
+	// server. The HookSyncPresent() check now returns false and the FSM
+	// can proceed.
+	assert.False(t, registry.HookSyncPresent())
 }
 
-// Test the synchronization protocol flow in the normal folloer case, mimicking
-// an FSM instance associated with leader raft.Raft instance applying log
+// Test the synchronization protocol flow in the normal follower case, mimicking
+// an FSM instance associated with a follower raft.Raft server applying log
 // commands coming from the leader.
 func TestRegistry_SyncHook_Follower(t *testing.T) {
 	registry, cleanup := newRegistry(t)
@@ -76,9 +83,8 @@ func TestRegistry_SyncHook_Follower(t *testing.T) {
 
 	// Mimick an FSM instance applying the log command.
 	registry.Lock()
-	assert.True(t, registry.HookSyncMatches([]byte("hello")))
+	assert.False(t, registry.HookSyncPresent())
 	registry.Unlock()
-
 }
 
 // Test the synchronization protocol flow in the case that leadership is lost
@@ -99,6 +105,7 @@ func TestRegistry_SyncHook_LeadershipLost(t *testing.T) {
 
 	// Mimick an FSM instance applying the log command.
 	registry.Lock()
+	assert.True(t, registry.HookSyncPresent())
 	assert.True(t, registry.HookSyncMatches(data1))
 	registry.Unlock()
 
@@ -109,11 +116,17 @@ func TestRegistry_SyncHook_LeadershipLost(t *testing.T) {
 	registry.Unlock()
 
 	// Mimick an FSM instance applying the same log command, but received
-	// over the wire, i.e. as follower FSM.
+	// over the wire, i.e. as follower FSM. This happens if the log command
+	// above still managed to reach a quorum of followers, but the leader
+	// did not get notified about it (e.g. because of a network glitch),
+	// and lost leadership.
 	registry.Lock()
+	assert.True(t, registry.HookSyncPresent())
 	assert.False(t, registry.HookSyncMatches([]byte("wolrd")))
 	done := make(chan struct{})
 	go func() {
+		// The FSM blocks applying the log command until the method
+		// hook is done.
 		registry.HookSyncWait()
 		done <- struct{}{}
 	}()
@@ -152,7 +165,7 @@ func TestHookSync_RaftDataReference_Follower(t *testing.T) {
 	}
 
 	fsms := []*testHookSyncFSM{&testHookSyncFSM{}, &testHookSyncFSM{}}
-	_, control := rafttest.Cluster(
+	rafts, control := rafttest.Cluster(
 		t,
 		[]raft.FSM{fsms[0], fsms[1]},
 		rafttest.Servers(0, 1),
@@ -160,15 +173,17 @@ func TestHookSync_RaftDataReference_Follower(t *testing.T) {
 	)
 	defer control.Close()
 
-	r1 := control.LeadershipAcquired(time.Second)
+	r := rafts["0"]
+
+	control.Elect("0")
+
 	data := []byte("hello")
-	require.NoError(t, r1.Apply(data, time.Second).Error())
+	require.NoError(t, r.Apply(data, time.Second).Error())
 
-	r2 := control.Other(r1)
-	control.WaitIndex(r2, 3, time.Second)
+	control.Barrier()
 
-	fsm1 := fsms[control.Index(r1)]
-	fsm2 := fsms[control.Index(r2)]
+	fsm1 := fsms[0]
+	fsm2 := fsms[1]
 
 	assert.NotNil(t, fsm1.Data)
 	assert.NotNil(t, fsm2.Data)
@@ -201,28 +216,28 @@ func TestHookSync_RaftDataReference_Leader(t *testing.T) {
 	}
 
 	fsms := []*testHookSyncFSM{&testHookSyncFSM{}, &testHookSyncFSM{}, &testHookSyncFSM{}}
-	_, control := rafttest.Cluster(
+	rafts, control := rafttest.Cluster(
 		t,
 		[]raft.FSM{fsms[0], fsms[1], fsms[1]},
 		rafttest.LogStore(func(i int) raft.LogStore { return stores[i] }),
 	)
 	defer control.Close()
 
-	data := []byte("hello")
-	stage1 := func(r *raft.Raft) {}
-	stage2 := func(r *raft.Raft) {
-		err := r.Apply(data, time.Second).Error()
-		require.Equal(t, raft.ErrLeadershipLost, err)
-	}
-	stage3 := func(r *raft.Raft) {
-		fsm := fsms[control.Index(r)]
-		assert.False(t, reflect.ValueOf(fsm.Data).Pointer() == reflect.ValueOf(data).Pointer())
-	}
-	stage4 := stage1
-	stage5 := stage1
+	control.Elect("0").When().Command(1).Appended().Depose()
 
-	scenario := rafttest.LeadershipLostQuorumSameLeaderScenario(3)
-	scenario(control, stage1, stage2, stage3, stage4, stage5)
+	// The current leader applies a log command but loses leadership while
+	// committing it. A quorum is still reached tho, so the new leader will
+	// send it back to the deposed leader (now a follower).
+	r := rafts["0"]
+	data := []byte("hello")
+	err := r.Apply(data, time.Second).Error()
+	require.Equal(t, raft.ErrLeadershipLost, err)
+
+	control.Elect("1")
+	control.Barrier()
+
+	fsm := fsms[0]
+	assert.False(t, reflect.ValueOf(fsm.Data).Pointer() == reflect.ValueOf(data).Pointer())
 	assert.Len(t, data, 5)
 }
 
@@ -232,7 +247,7 @@ type testHookSyncFSM struct {
 	Data []byte
 }
 
-// Apply always return a nil error without doing anything.
+// Apply always returns nil without doing anything.
 func (f *testHookSyncFSM) Apply(log *raft.Log) interface{} {
 	f.Data = log.Data
 	return nil

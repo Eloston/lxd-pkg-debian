@@ -7,17 +7,19 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 
 	"github.com/gorilla/websocket"
 	"github.com/pborman/uuid"
 
 	"github.com/lxc/lxd/lxd/migration"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/version"
 )
 
 // Send an rsync stream of a path over a websocket
-func rsyncSend(conn *websocket.Conn, path string) error {
-	cmd, dataSocket, stderr, err := rsyncSendSetup(path)
+func rsyncSend(conn *websocket.Conn, path string, rsyncArgs string) error {
+	cmd, dataSocket, stderr, err := rsyncSendSetup(path, rsyncArgs)
 	if err != nil {
 		return err
 	}
@@ -40,14 +42,14 @@ func rsyncSend(conn *websocket.Conn, path string) error {
 	<-writeDone
 
 	if err != nil {
-		return err
+		return fmt.Errorf("Failed to rsync: %v\n%s", err, output)
 	}
 
 	return nil
 }
 
 // Spawn the rsync process
-func rsyncSendSetup(path string) (*exec.Cmd, net.Conn, io.ReadCloser, error) {
+func rsyncSendSetup(path string, rsyncArgs string) (*exec.Cmd, net.Conn, io.ReadCloser, error) {
 	auds := fmt.Sprintf("@lxd-p2c/%s", uuid.NewRandom().String())
 	if len(auds) > shared.ABSTRACT_UNIX_SOCK_LEN-1 {
 		auds = auds[:shared.ABSTRACT_UNIX_SOCK_LEN-1]
@@ -65,16 +67,47 @@ func rsyncSendSetup(path string) (*exec.Cmd, net.Conn, io.ReadCloser, error) {
 
 	rsyncCmd := fmt.Sprintf("sh -c \"%s netcat %s\"", execPath, auds)
 
-	cmd := exec.Command("rsync",
+	args := []string{
 		"-arvP",
 		"--devices",
 		"--numeric-ids",
 		"--partial",
 		"--sparse",
-		path,
-		"localhost:/tmp/foo",
-		"-e",
-		rsyncCmd)
+	}
+
+	// Ignore deletions (requires 3.1 or higher)
+	rsyncCheckVersion := func(min string) bool {
+		out, err := shared.RunCommand("rsync", "--version")
+		if err != nil {
+			return false
+		}
+
+		fields := strings.Split(out, " ")
+		curVer, err := version.Parse(fields[3])
+		if err != nil {
+			return false
+		}
+
+		minVer, err := version.Parse(min)
+		if err != nil {
+			return false
+		}
+
+		return curVer.Compare(minVer) >= 0
+	}
+
+	if rsyncCheckVersion("3.1.0") {
+		args = append(args, "--ignore-missing-args")
+	}
+
+	if rsyncArgs != "" {
+		args = append(args, strings.Split(rsyncArgs, " ")...)
+	}
+
+	args = append(args, []string{path, "localhost:/tmp/foo"}...)
+	args = append(args, []string{"-e", rsyncCmd}...)
+
+	cmd := exec.Command("rsync", args...)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {

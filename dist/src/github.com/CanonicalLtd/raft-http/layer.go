@@ -45,11 +45,12 @@ type Layer struct {
 
 // Accept waits for the next connection.
 func (l *Layer) Accept() (net.Conn, error) {
-	conn, more := <-l.handler.connections
-	if !more {
+	select {
+	case conn := <-l.handler.connections:
+		return conn, nil
+	case <-l.handler.shutdown:
 		return nil, io.EOF
 	}
-	return conn, nil
 }
 
 // Close closes the layer.
@@ -75,7 +76,7 @@ func (l *Layer) Dial(addr raft.ServerAddress, timeout time.Duration) (net.Conn, 
 		ProtoMajor: 1,
 		ProtoMinor: 1,
 		Header:     make(http.Header),
-		Host:       url.Host,
+		Host:       l.Addr().String(),
 	}
 	request.Header.Set("Upgrade", "raft")
 

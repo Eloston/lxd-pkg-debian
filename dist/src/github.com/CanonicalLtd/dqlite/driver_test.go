@@ -121,7 +121,7 @@ func TestDriver_OpenError(t *testing.T) {
 
 	registry := dqlite.NewRegistry(dir)
 	fsm := dqlite.NewFSM(registry)
-	raft, cleanup := rafttest.Node(t, fsm)
+	raft, cleanup := rafttest.Server(t, fsm)
 	defer cleanup()
 	config := dqlite.DriverConfig{}
 
@@ -136,7 +136,8 @@ func TestDriver_OpenError(t *testing.T) {
 	assert.EqualError(t, err, expected)
 }
 
-func TestDriver_NotLeader(t *testing.T) {
+// If the driver is not the current leader, all APIs return an error.
+func TestDriver_NotLeader_Errors(t *testing.T) {
 	cases := []struct {
 		title string
 		f     func(*testing.T, *dqlite.Conn) error
@@ -178,7 +179,7 @@ func TestDriver_NotLeader(t *testing.T) {
 
 			config := dqlite.DriverConfig{}
 
-			driver, err := dqlite.NewDriver(registry1, rafts[0], config)
+			driver, err := dqlite.NewDriver(registry1, rafts["0"], config)
 			require.NoError(t, err)
 
 			conn, err := driver.Open("test.db")
@@ -191,6 +192,24 @@ func TestDriver_NotLeader(t *testing.T) {
 			assert.Equal(t, sqlite3.ErrIoErrNotLeader, erri.ExtendedCode)
 		})
 	}
+}
+
+// Return the address of the current raft leader.
+func TestDriver_Leader(t *testing.T) {
+	driver, cleanup := newDriver(t)
+	defer cleanup()
+
+	assert.Equal(t, "0", driver.Leader())
+}
+
+// Return the addresses of all current raft servers.
+func TestDriver_Servers(t *testing.T) {
+	driver, cleanup := newDriver(t)
+	defer cleanup()
+
+	servers, err := driver.Servers()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"0"}, servers)
 }
 
 func TestStmt_Exec(t *testing.T) {
@@ -234,7 +253,16 @@ func TestTx_Commit(t *testing.T) {
 
 	tx, err := conn.Begin()
 	require.NoError(t, err)
+
+	_, err = conn.(*dqlite.Conn).Exec("CREATE TABLE test (n INT)", nil)
+	require.NoError(t, err)
+
 	assert.NoError(t, tx.Commit())
+
+	// The transaction ID has been saved in the committed buffer.
+	token := tx.(*dqlite.Tx).Token()
+	assert.Equal(t, uint64(5), token)
+	assert.NoError(t, driver.Recover(token))
 }
 
 func TestTx_Rollback(t *testing.T) {
@@ -262,7 +290,7 @@ func newDriverWithConfig(t *testing.T, config dqlite.DriverConfig) (*dqlite.Driv
 
 	registry := dqlite.NewRegistry(dir)
 	fsm := dqlite.NewFSM(registry)
-	raft, raftCleanup := rafttest.Node(t, fsm)
+	raft, raftCleanup := rafttest.Server(t, fsm)
 
 	driver, err := dqlite.NewDriver(registry, raft, config)
 	require.NoError(t, err)
@@ -295,5 +323,18 @@ func newDir(t *testing.T) (string, func()) {
 
 // Return a logger forwarding its output to the test logger.
 func newTestingLogger(t *testing.T, n int) *log.Logger {
-	return log.New(rafttest.TestingWriter(t), fmt.Sprintf("%d: ", n), log.LstdFlags)
+	return log.New(&testingWriter{t}, fmt.Sprintf("%d: ", n), log.LstdFlags)
+}
+
+// Implement io.Writer and forward what it receives to a
+// testing logger.
+type testingWriter struct {
+	t testing.TB
+}
+
+// Write a single log entry. It's assumed that p is always a \n-terminated UTF
+// string.
+func (w *testingWriter) Write(p []byte) (n int, err error) {
+	w.t.Logf(string(p))
+	return len(p), nil
 }

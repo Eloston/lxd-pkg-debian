@@ -62,7 +62,7 @@ type patch struct {
 }
 
 func (p *patch) apply(d *Daemon) error {
-	logger.Debugf("Applying patch: %s", p.name)
+	logger.Infof("Applying patch: %s", p.name)
 
 	err := p.run(p.name, d)
 	if err != nil {
@@ -878,7 +878,7 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 	poolConfig["lvm.thinpool_name"] = daemonConfig["storage.lvm_thinpool_name"]
 	if poolConfig["lvm.thinpool_name"] == "" {
 		// If empty we need to set it to the old default.
-		poolConfig["lvm.thinpool_name"] = "LXDPool"
+		poolConfig["lvm.thinpool_name"] = "LXDThinPool"
 	}
 
 	poolConfig["lvm.vg_name"] = daemonConfig["storage.lvm_vg_name"]
@@ -1456,6 +1456,7 @@ func upgradeFromStorageTypeZfs(name string, d *Daemon, defaultPoolName string, d
 			// to refer to the on-disk name of the pool in the
 			// "source" propert and not the db name of the pool.
 			poolConfig["source"] = defaultPoolName
+			poolConfig["zfs.pool_name"] = defaultPoolName
 		}
 
 		// Querying the size of a storage pool only makes sense when it

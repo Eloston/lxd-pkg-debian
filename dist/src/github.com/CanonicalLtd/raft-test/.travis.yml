@@ -3,6 +3,7 @@ language: go
 before_install:
   - mkdir -p $GOPATH/src/github.com/hashicorp/
   - git clone -b assorted-fixes https://github.com/freeekanayaka/raft.git $GOPATH/src/github.com/hashicorp/raft
+  - go get github.com/go-playground/overalls
   - go get github.com/mattn/goveralls
   - go get github.com/golang/lint/golint
   - go get github.com/tsenart/deadcode
@@ -12,8 +13,11 @@ script:
   - go vet
   - golint
   - deadcode
-  - GO_RAFT_TEST_LATENCY=2.0 $HOME/gopath/bin/goveralls -service=travis-ci -flags -test.timeout -flags 15s
+  - project=github.com/CanonicalLtd/raft-test
+  - GO_RAFT_TEST_LATENCY=5.0 $GOPATH/bin/overalls -project $project -covermode=count -- -timeout 120s
+  - $GOPATH/bin/goveralls -coverprofile overalls.coverprofile -service=travis-ci
 
 go:
   - "1.9"
   - "1.10"
+  - "master"

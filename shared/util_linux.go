@@ -335,6 +335,23 @@ func GetFileStat(p string) (uid int, gid int, major int, minor int,
 	return
 }
 
+// FileCopy copies a file, overwriting the target if it exists.
+func GetPathMode(path string) (os.FileMode, error) {
+	s, err := os.Open(path)
+	if err != nil {
+		return os.FileMode(0000), err
+	}
+	defer s.Close()
+
+	fi, err := s.Stat()
+	if err != nil {
+		return os.FileMode(0000), err
+	}
+
+	mode, _, _ := GetOwnerMode(fi)
+	return mode, nil
+}
+
 func parseMountinfo(name string) int {
 	// In case someone uses symlinks we need to look for the actual
 	// mountpoint.
@@ -473,15 +490,16 @@ func GetAllXattr(path string) (xattrs map[string]string, err error) {
 		if err != nil || pre < 0 {
 			return nil, err
 		}
-		if pre == 0 {
-			return nil, fmt.Errorf("No valid extended attribute value found.")
-		}
 
 		dest = make([]byte, pre)
-		post, err = syscall.Getxattr(path, xattr, dest)
-		if err != nil || post < 0 {
-			return nil, err
+		post := 0
+		if pre > 0 {
+			post, err = syscall.Getxattr(path, xattr, dest)
+			if err != nil || post < 0 {
+				return nil, err
+			}
 		}
+
 		if post != pre {
 			return nil, e1
 		}

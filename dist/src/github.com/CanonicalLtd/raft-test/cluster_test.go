@@ -18,13 +18,20 @@ import (
 	"testing"
 
 	"github.com/CanonicalLtd/raft-test"
+	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
 )
 
-// Create and shutdown a cluster.
-func TestCluster_CreateAndShutdown(t *testing.T) {
-	rafts, control := rafttest.Cluster(t, rafttest.FSMs(1))
+// At the beginning, all nodes are disconnected and each one
+// starts as follower (and possibly enters the candidate state).
+func TestCluster_Default(t *testing.T) {
+	rafts, control := rafttest.Cluster(t, rafttest.FSMs(3))
 	defer control.Close()
 
-	assert.Len(t, rafts, 1)
+	assert.Len(t, rafts, 3)
+
+	for _, r := range rafts {
+		state := r.State()
+		assert.True(t, state == raft.Follower || state == raft.Candidate)
+	}
 }

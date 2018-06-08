@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/pem"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
@@ -274,7 +275,16 @@ func (c *cmdInit) askMAAS(config *initData, d lxd.ContainerServer) error {
 }
 
 func (c *cmdInit) askNetworking(config *initData, d lxd.ContainerServer) error {
-	if !cli.AskBool("Would you like to create a new network bridge? (yes/no) [default=yes]: ", "yes") {
+	if config.Cluster != nil || !cli.AskBool("Would you like to create a new local network bridge? (yes/no) [default=yes]: ", "yes") {
+		// At this time, only the Ubuntu kernel supports the Fan, detect it
+		fanKernel := false
+		if shared.PathExists("/proc/sys/kernel/version") {
+			content, _ := ioutil.ReadFile("/proc/sys/kernel/version")
+			if content != nil && strings.Contains(string(content), "Ubuntu") {
+				fanKernel = true
+			}
+		}
+
 		if cli.AskBool("Would you like to configure LXD to use an existing bridge or host interface? (yes/no) [default=no]: ", "no") {
 			for {
 				name := cli.AskString("Name of the existing bridge or host interface: ", "", nil)
@@ -296,7 +306,7 @@ func (c *cmdInit) askNetworking(config *initData, d lxd.ContainerServer) error {
 					config.Profiles[0].Devices["eth0"]["nictype"] = "bridged"
 				}
 
-				if config.Config["maas.api.url"] != "" && cli.AskBool("Is this interface connected to your MAAS server? (yes/no) [default=yes]: ", "yes") {
+				if config.Config["maas.api.url"] != nil && cli.AskBool("Is this interface connected to your MAAS server? (yes/no) [default=yes]: ", "yes") {
 					maasSubnetV4 := cli.AskString("MAAS IPv4 subnet name for this interface (empty for no subnet): ", "",
 						func(input string) error { return nil })
 
@@ -313,6 +323,24 @@ func (c *cmdInit) askNetworking(config *initData, d lxd.ContainerServer) error {
 				}
 
 				break
+			}
+		} else if config.Cluster != nil && fanKernel && cli.AskBool("Would you like to create a new Fan overlay network? (yes/no) [default=yes]", "yes") {
+			// Define the network
+			network := api.NetworksPost{}
+			network.Name = "lxdfan0"
+			network.Config = map[string]string{
+				"bridge.mode": "fan",
+			}
+
+			// Add the new network
+			config.Networks = append(config.Networks, network)
+
+			// Add to the default profile
+			config.Profiles[0].Devices["eth0"] = map[string]string{
+				"type":    "nic",
+				"nictype": "bridged",
+				"name":    "eth0",
+				"parent":  "lxdfan0",
 			}
 		}
 
@@ -599,6 +627,9 @@ they otherwise would.
 		netPort := cli.AskInt("Port to bind LXD to [default=8443]: ", 1, 65535, "8443")
 		config.Config["core.https_address"] = fmt.Sprintf("%s:%d", netAddr, netPort)
 		config.Config["core.trust_password"] = cli.AskPassword("Trust password for new clients: ")
+		if config.Config["core.trust_password"] == "" {
+			fmt.Printf("No password set, client certificates will have to be manually trusted.")
+		}
 	}
 
 	// Ask if the user wants images to be automatically refreshed

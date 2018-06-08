@@ -21,7 +21,7 @@ import (
 )
 
 func TestHandleChangeRequests_InvalidChangeRequestKind(t *testing.T) {
-	raft, cleanup := rafttest.Node(t, rafttest.FSM())
+	raft, cleanup := rafttest.Server(t, rafttest.FSM())
 	defer cleanup()
 
 	request := &ChangeRequest{

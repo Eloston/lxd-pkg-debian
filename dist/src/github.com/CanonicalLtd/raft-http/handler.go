@@ -2,11 +2,12 @@ package rafthttp
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/CanonicalLtd/raft-membership"
@@ -23,6 +24,7 @@ type Handler struct {
 	shutdown    chan struct{}                      // Used to stop processing membership requests.
 	timeout     time.Duration                      // Maximum time to wait for requests to be processed.
 	logger      *log.Logger                        // Logger to use.
+	mu          sync.RWMutex                       // Blocks closing until all membership requests are handled
 }
 
 // NewHandler returns a new Handler.
@@ -31,8 +33,7 @@ type Handler struct {
 // forwarded to the given channel, which is supposed to be processed using
 // raftmembership.HandleChangeRequests().
 func NewHandler() *Handler {
-	//logger := log.New(os.Stderr, "", log.LstdFlags)
-	logger := log.New(ioutil.Discard, "", 0)
+	logger := log.New(os.Stderr, "", log.LstdFlags)
 	return NewHandlerWithLogger(logger)
 }
 
@@ -40,7 +41,7 @@ func NewHandler() *Handler {
 func NewHandlerWithLogger(logger *log.Logger) *Handler {
 	return &Handler{
 		requests:    make(chan *raftmembership.ChangeRequest),
-		connections: make(chan net.Conn, 0),
+		connections: make(chan net.Conn),
 		shutdown:    make(chan struct{}),
 		timeout:     10 * time.Second,
 		logger:      logger,
@@ -63,7 +64,13 @@ func (h *Handler) Timeout(timeout time.Duration) {
 // Close stops handling incoming requests.
 func (h *Handler) Close() {
 	close(h.shutdown)
-	close(h.connections)
+
+	// Block until all pending requests are done. After that no new
+	// requests will be sent to the requests channel since the shutdown
+	// channel is closed.
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
 	close(h.requests)
 }
 
@@ -83,14 +90,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
-	// Fail immediately if we've been closed.
-	select {
-	case <-h.shutdown:
-		http.Error(w, "raft transport closed", http.StatusForbidden)
-		return
-	default:
-	}
-
 	if r.Header.Get("Upgrade") != "raft" {
 		http.Error(w, "missing or invalid upgrade header", http.StatusBadRequest)
 		return
@@ -117,8 +116,17 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// We don't need to watch for the shutdown channel here, because if the
+	// shutdown channel gets closed, Layer.Accept() will eventually return
+	// error causing the raft.NetworkTransport.listen() method to return
+	// (the assumption is that the raft instance is being shutdown). At
+	// that point, nobody will be calling Layer.Accept() anymore and we'll
+	// block sending to the h.connections channel until h.timeout expires.
 	h.logger.Printf("[INFO] raft-http: Establishing new connection with %s", r.Host)
 	select {
+	case <-h.shutdown:
+		h.logger.Printf("[ERR] raft-http: Connection from %s dropped since we have shutdowns", r.Host)
+		conn.Close()
 	case h.connections <- conn:
 	case <-time.After(h.timeout):
 		h.logger.Printf("[ERR] raft-http: Connection from %s not processed within %s", r.Host, h.timeout)
@@ -148,20 +156,27 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) changeMembership(w http.ResponseWriter, r *http.Request, request *raftmembership.ChangeRequest) {
-	// Sanity check before actually trying to process the request.
-	if request.ID() == "" {
-		http.Error(w, "no server ID provided", http.StatusBadRequest)
-		return
-	}
+	// Acquire a read lock, so Close() will block until all change
+	// membership requests are done.
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 
-	// Send the request to the channel for processing, unless we've been
-	// closed (and in that case we bail out).
+	// Fail immediately if we've been closed.
 	select {
 	case <-h.shutdown:
 		http.Error(w, "raft transport closed", http.StatusForbidden)
 		return
 	default:
 	}
+
+	// Sanity check before actually trying to process the request.
+	if request.ID() == "" {
+		http.Error(w, "no server ID provided", http.StatusBadRequest)
+		return
+	}
+
+	// It's safe to block here, since HandleChangeRequests has an internal
+	// timeout, which will abort a request if takes too long.
 	h.requests <- request
 
 	err := request.Error(h.timeout)

@@ -12,6 +12,5 @@ script:
   - $HOME/gopath/bin/goveralls -v -service=travis-ci
 
 go:
-  - 1.8
-  - 1.9
-  - master
+  - "1.9"
+  - "1.10"

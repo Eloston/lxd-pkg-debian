@@ -36,6 +36,11 @@ func (r *Registry) TxnLeaderAdd(conn *sqlite3.SQLiteConn, id uint64) *transactio
 			}
 		}
 	}
+
+	// Keep track of the ID of the last transaction executed on this
+	// connection.
+	r.lastTxnIDs[conn] = id
+
 	return r.txnAdd(conn, id, true)
 }
 
@@ -69,7 +74,7 @@ func (r *Registry) TxnFollowerAdd(conn *sqlite3.SQLiteConn, id uint64) *transact
 // TxnFollowerSurrogate creates a surrogate follower transaction.
 //
 // Surrogate follower transactions are used to replace leader transactions when
-// a node loses leadership.
+// a node loses leadership and are supposed to be undone by the next leader.
 func (r *Registry) TxnFollowerSurrogate(txn *transaction.Txn) *transaction.Txn {
 	if !txn.IsLeader() {
 		panic("expected leader transaction")
@@ -78,8 +83,23 @@ func (r *Registry) TxnFollowerSurrogate(txn *transaction.Txn) *transaction.Txn {
 	filename := r.ConnLeaderFilename(txn.Conn())
 	conn := r.ConnFollower(filename)
 	txn = r.TxnFollowerAdd(conn, txn.ID())
+	txn.DryRun()
 
 	return txn
+}
+
+// TxnFollowerResurrected registers a follower transaction created by
+// resurrecting a zombie leader transaction.
+func (r *Registry) TxnFollowerResurrected(txn *transaction.Txn) {
+	if txn.IsLeader() {
+		panic("expected follower transaction")
+	}
+
+	// Delete the zombie leader transaction, which has the same ID.
+	r.TxnDel(txn.ID())
+
+	// Register the new follower transaction.
+	r.txnAdd(txn.Conn(), txn.ID(), false)
 }
 
 // TxnDel deletes the transaction with the given ID.
@@ -141,10 +161,38 @@ func (r *Registry) TxnByFilename(filename string) *transaction.Txn {
 }
 
 // TxnDryRun makes transactions only transition between states, without
-// actually invoking the relevant SQLite APIs. This should only be
-// used by tests.
+// actually invoking the relevant SQLite APIs. This is used by tests and by
+// surrogate followers.
 func (r *Registry) TxnDryRun() {
 	r.txnDryRun = true
+}
+
+// TxnLastID returns the ID of the last transaction executed on the given
+// leader connection.
+func (r *Registry) TxnLastID(conn *sqlite3.SQLiteConn) uint64 {
+	return r.lastTxnIDs[conn]
+}
+
+// TxnCommittedAdd saves the ID of the given transaction in the committed buffer,
+// in case a client needs to check if it can be recovered.
+func (r *Registry) TxnCommittedAdd(txn *transaction.Txn) {
+	r.committed[r.committedCursor] = txn.ID()
+	r.committedCursor++
+	if r.committedCursor == len(r.committed) {
+		// Rollover
+		r.committedCursor = 0
+	}
+}
+
+// TxnCommittedFind scans the comitted buffer and returns true if the given ID
+// is present.
+func (r *Registry) TxnCommittedFind(id uint64) bool {
+	for i := range r.committed {
+		if r.committed[i] == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Registry) txnAdd(conn *sqlite3.SQLiteConn, id uint64, isLeader bool) *transaction.Txn {
@@ -156,7 +204,15 @@ func (r *Registry) txnAdd(conn *sqlite3.SQLiteConn, id uint64, isLeader bool) *t
 			"a transaction for this connection is already registered with ID %d", txn.ID()))
 	}
 
-	txn := transaction.New(conn, id, isLeader, r.txnDryRun)
+	txn := transaction.New(conn, id)
+
+	if isLeader {
+		txn.Leader()
+	} else if r.txnDryRun {
+		txn.DryRun()
+	}
+
 	r.txns[id] = txn
+
 	return txn
 }

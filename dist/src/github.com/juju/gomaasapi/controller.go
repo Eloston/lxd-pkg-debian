@@ -14,10 +14,10 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/juju/collections/set"
 	"github.com/juju/errors"
 	"github.com/juju/loggo"
 	"github.com/juju/schema"
-	"github.com/juju/utils/set"
 	"github.com/juju/version"
 )
 
@@ -217,6 +217,23 @@ func (c *controller) Zones() ([]Zone, error) {
 	var result []Zone
 	for _, z := range zones {
 		result = append(result, z)
+	}
+	return result, nil
+}
+
+// Domains implements Controller
+func (c *controller) Domains() ([]Domain, error) {
+	source, err := c.get("domains")
+	if err != nil {
+		return nil, NewUnexpectedError(err)
+	}
+	domains, err := readDomains(c.apiVersion, source)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	var result []Domain
+	for _, domain := range domains {
+		result = append(result, domain)
 	}
 	return result, nil
 }

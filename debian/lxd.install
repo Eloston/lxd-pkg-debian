@@ -1,6 +1,5 @@
+etc/dnsmasq.d-available/lxd
+etc/sysctl.d/10-lxd-inotify.conf
 usr/bin/lxd
 usr/lib/lxd
 usr/share/man/man1/lxd.1
-
-etc/dnsmasq.d-available/lxd
-etc/sysctl.d/10-lxd-inotify.conf
