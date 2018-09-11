@@ -259,6 +259,12 @@ test_basic_usage() {
     lxc init testimage autostart --force-local
     lxd activateifneeded --debug 2>&1 | grep -q -v "activating..."
     lxc config set autostart boot.autostart true --force-local
+
+    # Restart the daemon, this forces the global database to be dumped to disk.
+    shutdown_lxd "${LXD_DIR}"
+    respawn_lxd "${LXD_DIR}" true
+    lxc stop --force autostart
+
     lxd activateifneeded --debug 2>&1 | grep -q "Daemon has auto-started containers, activating..."
 
     lxc config unset autostart boot.autostart --force-local
@@ -376,7 +382,7 @@ test_basic_usage() {
       MINOR=$(awk -F. '{print $2}' < /sys/kernel/security/apparmor/features/domain/version)
     fi
 
-    if [ "${MAJOR}" -gt "1" ] || ([ "${MAJOR}" = "1" ] && [ "${MINOR}" -ge "2" ]); then
+    if [ "${MAJOR}" -gt "1" ] || { [ "${MAJOR}" = "1" ] && [ "${MINOR}" -ge "2" ]; }; then
       aa_namespace="lxd-lxd-apparmor-test_<$(echo "${LXD_DIR}" | sed -e 's/\//-/g' -e 's/^.//')>"
       aa-status | grep -q ":${aa_namespace}:unconfined" || aa-status | grep -q ":${aa_namespace}://unconfined"
       lxc stop lxd-apparmor-test --force
@@ -477,4 +483,8 @@ test_basic_usage() {
 
   lxc stop foo --force || true
   ! lxc list | grep -q foo || false
+
+  # Test renaming/deletion of the default profile
+  ! lxc profile rename default foobar
+  ! lxc profile delete default
 }

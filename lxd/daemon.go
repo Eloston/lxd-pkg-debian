@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/CanonicalLtd/candidclient"
+	"github.com/CanonicalLtd/go-dqlite"
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
@@ -76,9 +77,10 @@ type externalAuth struct {
 
 // DaemonConfig holds configuration values for Daemon.
 type DaemonConfig struct {
-	Group       string   // Group name the local unix socket should be chown'ed to
-	Trace       []string // List of sub-systems to trace
-	RaftLatency float64  // Coarse grain measure of the cluster latency
+	Group              string        // Group name the local unix socket should be chown'ed to
+	Trace              []string      // List of sub-systems to trace
+	RaftLatency        float64       // Coarse grain measure of the cluster latency
+	DqliteSetupTimeout time.Duration // How long to wait for the cluster database to be up
 }
 
 // NewDaemon returns a new Daemon object with the given configuration.
@@ -95,7 +97,8 @@ func NewDaemon(config *DaemonConfig, os *sys.OS) *Daemon {
 // DefaultDaemonConfig returns a DaemonConfig object with default values/
 func DefaultDaemonConfig() *DaemonConfig {
 	return &DaemonConfig{
-		RaftLatency: 3.0,
+		RaftLatency:        3.0,
+		DqliteSetupTimeout: 36 * time.Hour, // Account for snap refresh lag
 	}
 }
 
@@ -209,7 +212,7 @@ func isJSONRequest(r *http.Request) bool {
 
 // State creates a new State instance liked to our internal db and os.
 func (d *Daemon) State() *state.State {
-	return state.NewState(d.db, d.cluster, d.maas, d.os)
+	return state.NewState(d.db, d.cluster, d.maas, d.os, d.endpoints)
 }
 
 // UnixSocket returns the full path to the unix.socket file that this daemon is
@@ -261,7 +264,7 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c Command) {
 			logger.Warn(
 				"rejecting request from untrusted client",
 				log.Ctx{"ip": r.RemoteAddr})
-			Forbidden.Render(w)
+			Forbidden(nil).Render(w)
 			return
 		}
 
@@ -279,7 +282,7 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c Command) {
 		}
 
 		var resp Response
-		resp = NotImplemented
+		resp = NotImplemented(nil)
 
 		switch r.Method {
 		case "GET":
@@ -303,7 +306,7 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c Command) {
 				resp = c.patch(d, r)
 			}
 		default:
-			resp = NotFound
+			resp = NotFound(fmt.Errorf("Method '%s' not found", r.Method))
 		}
 
 		if err := resp.Render(w); err != nil {
@@ -458,7 +461,14 @@ func (d *Daemon) init() error {
 	for {
 		logger.Info("Initializing global database")
 		dir := filepath.Join(d.os.VarDir, "database")
-		d.cluster, err = db.OpenCluster("db.bin", d.gateway.Dialer(), address, dir)
+		store := d.gateway.ServerStore()
+		d.cluster, err = db.OpenCluster(
+			"db.bin", store, address, dir,
+			dqlite.WithDialFunc(d.gateway.DialFunc()),
+			dqlite.WithContext(d.gateway.Context()),
+			dqlite.WithConnectionTimeout(d.config.DqliteSetupTimeout),
+			dqlite.WithLogFunc(cluster.DqliteLog),
+		)
 		if err == nil {
 			break
 		}
@@ -552,8 +562,11 @@ func (d *Daemon) init() error {
 	/* Log expiry */
 	d.tasks.Add(expireLogsTask(d.State()))
 
+	// Cleanup leftover images
+	pruneLeftoverImages(d)
+
 	/* Setup the proxy handler, external authentication and MAAS */
-	macaroonEndpoint := ""
+	candidEndpoint := ""
 	maasAPIURL := ""
 	maasAPIKey := ""
 	maasMachine := ""
@@ -581,7 +594,7 @@ func (d *Daemon) init() error {
 		d.proxy = shared.ProxyFromConfig(
 			config.ProxyHTTPS(), config.ProxyHTTP(), config.ProxyIgnoreHosts(),
 		)
-		macaroonEndpoint = config.MacaroonEndpoint()
+		candidEndpoint = config.CandidEndpoint()
 		maasAPIURL, maasAPIKey = config.MAASController()
 		return nil
 	})
@@ -589,7 +602,7 @@ func (d *Daemon) init() error {
 		return err
 	}
 
-	err = d.setupExternalAuthentication(macaroonEndpoint)
+	err = d.setupExternalAuthentication(candidEndpoint)
 	if err != nil {
 		return err
 	}
@@ -609,12 +622,20 @@ func (d *Daemon) init() error {
 
 		// Read the trusted certificates
 		readSavedClientCAList(d)
-	}
 
-	// Connect to MAAS
-	err = d.setupMAASController(maasAPIURL, maasAPIKey, maasMachine)
-	if err != nil {
-		return err
+		// Connect to MAAS
+		go func() {
+			for {
+				err = d.setupMAASController(maasAPIURL, maasAPIKey, maasMachine)
+				if err == nil {
+					logger.Info("Connected to MAAS controller")
+					break
+				}
+
+				logger.Warn("Unable to connect to MAAS, trying again in a minute", log.Ctx{"err": err})
+				time.Sleep(time.Minute)
+			}
+		}()
 	}
 
 	close(d.setupChan)
@@ -667,18 +688,13 @@ func (d *Daemon) Ready() error {
 }
 
 func (d *Daemon) numRunningContainers() (int, error) {
-	results, err := d.cluster.ContainersList(db.CTypeRegular)
+	results, err := containerLoadNodeAll(d.State())
 	if err != nil {
 		return 0, err
 	}
 
 	count := 0
-	for _, r := range results {
-		container, err := containerLoadByName(d.State(), r)
-		if err != nil {
-			continue
-		}
-
+	for _, container := range results {
 		if container.IsRunning() {
 			count = count + 1
 		}

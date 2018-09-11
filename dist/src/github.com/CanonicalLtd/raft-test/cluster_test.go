@@ -15,6 +15,7 @@
 package rafttest_test
 
 import (
+	"runtime"
 	"testing"
 
 	"github.com/CanonicalLtd/raft-test"
@@ -25,8 +26,12 @@ import (
 // At the beginning, all nodes are disconnected and each one
 // starts as follower (and possibly enters the candidate state).
 func TestCluster_Default(t *testing.T) {
+	n := runtime.NumGoroutine()
 	rafts, control := rafttest.Cluster(t, rafttest.FSMs(3))
-	defer control.Close()
+	defer func() {
+		control.Close()
+		assert.Equal(t, n, runtime.NumGoroutine())
+	}()
 
 	assert.Len(t, rafts, 3)
 

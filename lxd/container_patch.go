@@ -31,7 +31,7 @@ func containerPatch(d *Daemon, r *http.Request) Response {
 
 	c, err := containerLoadByName(d.State(), name)
 	if err != nil {
-		return NotFound
+		return NotFound(err)
 	}
 
 	// Validate the ETag
@@ -60,7 +60,7 @@ func containerPatch(d *Daemon, r *http.Request) Response {
 	}
 
 	if req.Restore != "" {
-		return BadRequest(fmt.Errorf("Can't call PATCH in restore mode."))
+		return BadRequest(fmt.Errorf("Can't call PATCH in restore mode"))
 	}
 
 	// Check if architecture was passed
@@ -113,11 +113,12 @@ func containerPatch(d *Daemon, r *http.Request) Response {
 	// Update container configuration
 	args := db.ContainerArgs{
 		Architecture: architecture,
-		Description:  req.Description,
 		Config:       req.Config,
+		Description:  req.Description,
 		Devices:      req.Devices,
 		Ephemeral:    req.Ephemeral,
-		Profiles:     req.Profiles}
+		Profiles:     req.Profiles,
+	}
 
 	err = c.Update(args, false)
 	if err != nil {

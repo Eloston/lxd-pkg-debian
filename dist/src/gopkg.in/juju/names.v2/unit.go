@@ -17,7 +17,10 @@ const UnitTagKind = "unit"
 // on that value so change it carefully.
 const minShortenedLength = 21
 
-var validUnit = regexp.MustCompile("^(" + ApplicationSnippet + ")/" + NumberSnippet + "$")
+// UnitSnippet defines the regexp for a valid Unit Id.
+const UnitSnippet = "(" + ApplicationSnippet + ")/" + NumberSnippet
+
+var validUnit = regexp.MustCompile("^" + UnitSnippet + "$")
 
 type UnitTag struct {
 	name string

@@ -18,7 +18,6 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/lxd/sys"
 	"github.com/lxc/lxd/lxd/util"
@@ -69,13 +68,14 @@ type nvidiaGpuCards struct {
 
 // {/dev/nvidiactl, /dev/nvidia-uvm, ...}
 type nvidiaGpuDevices struct {
-	path  string
-	major int
-	minor int
+	isCard bool
+	path   string
+	major  int
+	minor  int
 }
 
 // /dev/dri/card0. If we detect that vendor == nvidia, then nvidia will contain
-// the corresponding nvidia car, e.g. {/dev/dri/card1 --> /dev/nvidia1}.
+// the corresponding nvidia car, e.g. {/dev/dri/card1 to /dev/nvidia1}.
 type gpuDevice struct {
 	vendorid  string
 	productid string
@@ -84,8 +84,9 @@ type gpuDevice struct {
 	// mount them all. Meaning if we detect /dev/dri/card0,
 	// /dev/dri/controlD64, and /dev/dri/renderD128 with the same PCI
 	// address, then they should all be made available in the container.
-	pci    string
-	nvidia nvidiaGpuCards
+	pci      string
+	isNvidia bool
+	nvidia   nvidiaGpuCards
 
 	path  string
 	major int
@@ -101,29 +102,108 @@ type cardIds struct {
 	pci string
 }
 
-func deviceLoadGpu() ([]gpuDevice, []nvidiaGpuDevices, error) {
-	const DRI_PATH = "/sys/bus/pci/devices"
+// Fallback for old drivers which don't provide "Device Minor:"
+func findNvidiaMinorOld() (string, error) {
+	var minor string
+
+	// For now, just handle most common case (single nvidia card)
+	ents, err := ioutil.ReadDir("/dev")
+	if err != nil {
+		return "", err
+	}
+
+	rp := regexp.MustCompile("^nvidia([0-9]+)$")
+	for _, ent := range ents {
+		matches := rp.FindStringSubmatch(ent.Name())
+		if matches == nil {
+			continue
+		}
+
+		if minor != "" {
+			return "", fmt.Errorf("No device minor index detected, and more than one NVIDIA card present")
+		}
+		minor = matches[1]
+	}
+
+	if minor == "" {
+		return "", fmt.Errorf("No device minor index detected, and no NVIDIA card present")
+	}
+
+	return minor, nil
+}
+
+// Return string for minor number of nvidia device corresponding to the given pci id
+func findNvidiaMinor(pci string) (string, error) {
+	nvidiaPath := fmt.Sprintf("/proc/driver/nvidia/gpus/%s/information", pci)
+	buf, err := ioutil.ReadFile(nvidiaPath)
+	if err != nil {
+		return "", err
+	}
+
+	strBuf := strings.TrimSpace(string(buf))
+	idx := strings.Index(strBuf, "Device Minor:")
+	if idx != -1 {
+		idx += len("Device Minor:")
+		strBuf = strBuf[idx:]
+		strBuf = strings.TrimSpace(strBuf)
+		parts := strings.SplitN(strBuf, "\n", 1)
+		_, err = strconv.Atoi(parts[0])
+		if err == nil {
+			return parts[0], nil
+		}
+	}
+
+	minor, err := findNvidiaMinorOld()
+	if err == nil {
+		return minor, nil
+	}
+
+	return "", err
+}
+
+func deviceWantsAllGPUs(m map[string]string) bool {
+	return m["vendorid"] == "" && m["productid"] == "" && m["id"] == "" && m["pci"] == ""
+}
+
+func deviceLoadGpu(all bool) ([]gpuDevice, []nvidiaGpuDevices, error) {
+	const DRM_PATH = "/sys/class/drm/"
 	var gpus []gpuDevice
 	var nvidiaDevices []nvidiaGpuDevices
 	var cards []cardIds
 
-	ents, err := ioutil.ReadDir(DRI_PATH)
+	// Get the list of DRM devices
+	ents, err := ioutil.ReadDir(DRM_PATH)
 	if err != nil {
+		// No GPUs
 		if os.IsNotExist(err) {
 			return nil, nil, nil
 		}
+
 		return nil, nil, err
 	}
 
-	isNvidia := false
+	// Get the list of cards
+	devices := []string{}
 	for _, ent := range ents {
+		dev, err := filepath.EvalSymlinks(fmt.Sprintf("%s/%s/device", DRM_PATH, ent.Name()))
+		if err != nil {
+			continue
+		}
+
+		if !shared.StringInSlice(dev, devices) {
+			devices = append(devices, dev)
+		}
+	}
+
+	isNvidia := false
+	for _, device := range devices {
 		// The pci address == the name of the directory. So let's use
 		// this cheap way of retrieving it.
-		pciAddr := ent.Name()
+		pciAddr := filepath.Base(device)
 
 		// Make sure that we are dealing with a GPU by looking whether
 		// the "drm" subfolder exists.
-		drm := filepath.Join(DRI_PATH, pciAddr, "drm")
+		drm := filepath.Join(device, "drm")
 		drmEnts, err := ioutil.ReadDir(drm)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -132,7 +212,7 @@ func deviceLoadGpu() ([]gpuDevice, []nvidiaGpuDevices, error) {
 		}
 
 		// Retrieve vendor ID.
-		vendorIdPath := filepath.Join(DRI_PATH, pciAddr, "vendor")
+		vendorIdPath := filepath.Join(device, "vendor")
 		vendorId, err := ioutil.ReadFile(vendorIdPath)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -141,7 +221,7 @@ func deviceLoadGpu() ([]gpuDevice, []nvidiaGpuDevices, error) {
 		}
 
 		// Retrieve device ID.
-		productIdPath := filepath.Join(DRI_PATH, pciAddr, "device")
+		productIdPath := filepath.Join(device, "device")
 		productId, err := ioutil.ReadFile(productIdPath)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -151,7 +231,7 @@ func deviceLoadGpu() ([]gpuDevice, []nvidiaGpuDevices, error) {
 
 		// Store all associated subdevices, e.g. controlD64, renderD128.
 		// The name of the directory == the last part of the
-		// /dev/dri/controlD64 path. So ent.Name() will give us
+		// /dev/dri/controlD64 path. So drmEnt.Name() will give us
 		// controlD64.
 		for _, drmEnt := range drmEnts {
 			vendorTmp := strings.TrimSpace(string(vendorId))
@@ -172,15 +252,18 @@ func deviceLoadGpu() ([]gpuDevice, []nvidiaGpuDevices, error) {
 					continue
 				}
 			}
+
 			majMin := strings.TrimSpace(string(majMinByte))
 			majMinSlice := strings.Split(string(majMin), ":")
 			if len(majMinSlice) != 2 {
 				continue
 			}
+
 			majorInt, err := strconv.Atoi(majMinSlice[0])
 			if err != nil {
 				continue
 			}
+
 			minorInt, err := strconv.Atoi(majMinSlice[1])
 			if err != nil {
 				continue
@@ -199,55 +282,28 @@ func deviceLoadGpu() ([]gpuDevice, []nvidiaGpuDevices, error) {
 				if !isNvidia {
 					isNvidia = true
 				}
+				tmpGpu.isNvidia = true
 
-				nvidiaPath := fmt.Sprintf("/proc/driver/nvidia/gpus/%s/information", tmpGpu.pci)
-				buf, err := ioutil.ReadFile(nvidiaPath)
-				if err != nil {
-					if os.IsNotExist(err) {
-						continue
+				if !all {
+					minor, err := findNvidiaMinor(tmpGpu.pci)
+					if err == nil {
+						nvidiaPath := "/dev/nvidia" + minor
+						stat := syscall.Stat_t{}
+						err = syscall.Stat(nvidiaPath, &stat)
+						if err != nil {
+							if os.IsNotExist(err) {
+								continue
+							}
+
+							return nil, nil, err
+						}
+
+						tmpGpu.nvidia.path = nvidiaPath
+						tmpGpu.nvidia.major = shared.Major(stat.Rdev)
+						tmpGpu.nvidia.minor = shared.Minor(stat.Rdev)
+						tmpGpu.nvidia.id = strconv.Itoa(tmpGpu.nvidia.minor)
 					}
-
-					return nil, nil, err
 				}
-				strBuf := strings.TrimSpace(string(buf))
-				idx := strings.Index(strBuf, "Device Minor:")
-				if idx == -1 {
-					return nil, nil, fmt.Errorf("No device minor index detected")
-				}
-				idx += len("Device Minor:")
-				strBuf = strBuf[idx:]
-				strBuf = strings.TrimSpace(strBuf)
-				idx = strings.Index(strBuf, " ")
-				if idx == -1 {
-					idx = strings.Index(strBuf, "\t")
-				}
-				if idx >= 1 {
-					strBuf = strBuf[:idx]
-				}
-
-				if strBuf == "" {
-					return nil, nil, fmt.Errorf("No device minor index detected")
-				}
-
-				_, err = strconv.Atoi(strBuf)
-				if err != nil {
-					return nil, nil, err
-				}
-
-				nvidiaPath = "/dev/nvidia" + strBuf
-				stat := syscall.Stat_t{}
-				err = syscall.Stat(nvidiaPath, &stat)
-				if err != nil {
-					if os.IsNotExist(err) {
-						continue
-					}
-
-					return nil, nil, err
-				}
-				tmpGpu.nvidia.path = nvidiaPath
-				tmpGpu.nvidia.major = shared.Major(stat.Rdev)
-				tmpGpu.nvidia.minor = shared.Minor(stat.Rdev)
-				tmpGpu.nvidia.id = strconv.Itoa(tmpGpu.nvidia.minor)
 			}
 
 			if isCard {
@@ -257,8 +313,10 @@ func deviceLoadGpu() ([]gpuDevice, []nvidiaGpuDevices, error) {
 					id:  tmpGpu.id,
 					pci: tmpGpu.pci,
 				}
+
 				cards = append(cards, tmp)
 			}
+
 			gpus = append(gpus, tmpGpu)
 		}
 	}
@@ -272,28 +330,39 @@ func deviceLoadGpu() ([]gpuDevice, []nvidiaGpuDevices, error) {
 				return nil, nil, err
 			}
 		}
+
 		validNvidia, err := regexp.Compile(`^nvidia[^0-9]+`)
 		if err != nil {
 			return nil, nil, err
 		}
+
 		for _, nvidiaEnt := range nvidiaEnts {
-			if !validNvidia.MatchString(nvidiaEnt.Name()) {
-				continue
+			if all {
+				if !strings.HasPrefix(nvidiaEnt.Name(), "nvidia") {
+					continue
+				}
+			} else {
+				if !validNvidia.MatchString(nvidiaEnt.Name()) {
+					continue
+				}
 			}
+
 			nvidiaPath := filepath.Join("/dev", nvidiaEnt.Name())
 			stat := syscall.Stat_t{}
 			err = syscall.Stat(nvidiaPath, &stat)
 			if err != nil {
 				continue
 			}
+
 			tmpNividiaGpu := nvidiaGpuDevices{
-				path:  nvidiaPath,
-				major: shared.Major(stat.Rdev),
-				minor: shared.Minor(stat.Rdev),
+				isCard: !validNvidia.MatchString(nvidiaEnt.Name()),
+				path:   nvidiaPath,
+				major:  shared.Major(stat.Rdev),
+				minor:  shared.Minor(stat.Rdev),
 			}
+
 			nvidiaDevices = append(nvidiaDevices, tmpNividiaGpu)
 		}
-
 	}
 
 	// Since we'll give users to ability to specify and id we need to group
@@ -487,7 +556,7 @@ func deviceNetlinkListener() (chan []string, chan []string, chan usbDevice, erro
 					devname,
 				)
 				if err != nil {
-					logger.Error("error reading usb device", log.Ctx{"err": err, "path": props["PHYSDEVPATH"]})
+					logger.Error("Error reading usb device", log.Ctx{"err": err, "path": props["PHYSDEVPATH"]})
 					continue
 				}
 
@@ -607,19 +676,15 @@ func deviceTaskBalance(s *state.State) {
 	}
 
 	// Iterate through the containers
-	containers, err := s.Cluster.ContainersList(db.CTypeRegular)
+	containers, err := containerLoadNodeAll(s)
 	if err != nil {
-		logger.Error("problem loading containers list", log.Ctx{"err": err})
+		logger.Error("Problem loading containers list", log.Ctx{"err": err})
 		return
 	}
+
 	fixedContainers := map[int][]container{}
 	balancedContainers := map[container]int{}
-	for _, name := range containers {
-		c, err := containerLoadByName(s, name)
-		if err != nil {
-			continue
-		}
-
+	for _, c := range containers {
 		conf := c.ExpandedConfig()
 		cpulimit, ok := conf["limits.cpu"]
 		if !ok || cpulimit == "" {
@@ -733,18 +798,12 @@ func deviceNetworkPriority(s *state.State, netif string) {
 		return
 	}
 
-	containers, err := s.Cluster.ContainersList(db.CTypeRegular)
+	containers, err := containerLoadNodeAll(s)
 	if err != nil {
 		return
 	}
 
-	for _, name := range containers {
-		// Get the container struct
-		c, err := containerLoadByName(s, name)
-		if err != nil {
-			continue
-		}
-
+	for _, c := range containers {
 		// Extract the current priority
 		networkPriority := c.ExpandedConfig()["limits.network.priority"]
 		if networkPriority == "" {
@@ -764,21 +823,16 @@ func deviceNetworkPriority(s *state.State, netif string) {
 }
 
 func deviceUSBEvent(s *state.State, usb usbDevice) {
-	containers, err := s.Cluster.ContainersList(db.CTypeRegular)
+	containers, err := containerLoadNodeAll(s)
 	if err != nil {
-		logger.Error("problem loading containers list", log.Ctx{"err": err})
+		logger.Error("Problem loading containers list", log.Ctx{"err": err})
 		return
 	}
 
-	for _, name := range containers {
-		containerIf, err := containerLoadByName(s, name)
-		if err != nil {
-			continue
-		}
-
+	for _, containerIf := range containers {
 		c, ok := containerIf.(*containerLXC)
 		if !ok {
-			logger.Errorf("got device event on non-LXC container?")
+			logger.Errorf("Got device event on non-LXC container?")
 			return
 		}
 
@@ -800,17 +854,17 @@ func deviceUSBEvent(s *state.State, usb usbDevice) {
 			if usb.action == "add" {
 				err := c.insertUnixDeviceNum(fmt.Sprintf("unix.%s", name), m, usb.major, usb.minor, usb.path, false)
 				if err != nil {
-					logger.Error("failed to create usb device", log.Ctx{"err": err, "usb": usb, "container": c.Name()})
+					logger.Error("Failed to create usb device", log.Ctx{"err": err, "usb": usb, "container": c.Name()})
 					return
 				}
 			} else if usb.action == "remove" {
 				err := c.removeUnixDeviceNum(fmt.Sprintf("unix.%s", name), m, usb.major, usb.minor, usb.path)
 				if err != nil {
-					logger.Error("failed to remove usb device", log.Ctx{"err": err, "usb": usb, "container": c.Name()})
+					logger.Error("Failed to remove usb device", log.Ctx{"err": err, "usb": usb, "container": c.Name()})
 					return
 				}
 			} else {
-				logger.Error("unknown action for usb device", log.Ctx{"usb": usb})
+				logger.Error("Unknown action for usb device", log.Ctx{"usb": usb})
 				continue
 			}
 		}
@@ -820,7 +874,7 @@ func deviceUSBEvent(s *state.State, usb usbDevice) {
 func deviceEventListener(s *state.State) {
 	chNetlinkCPU, chNetlinkNetwork, chUSB, err := deviceNetlinkListener()
 	if err != nil {
-		logger.Errorf("scheduler: couldn't setup netlink listener: %v", err)
+		logger.Errorf("scheduler: Couldn't setup netlink listener: %v", err)
 		return
 	}
 
@@ -1789,19 +1843,13 @@ func deviceInotifyDirDeleteEvent(s *state.State, target *sys.InotifyTargetInfo) 
 }
 
 func deviceInotifyDirRescan(s *state.State) {
-	containers, err := s.Cluster.ContainersList(db.CTypeRegular)
+	containers, err := containerLoadNodeAll(s)
 	if err != nil {
 		logger.Errorf("Failed to load containers: %s", err)
 		return
 	}
 
-	for _, name := range containers {
-		containerIf, err := containerLoadByName(s, name)
-		if err != nil {
-			logger.Errorf("Failed to load container \"%s\": %s", name, err)
-			continue
-		}
-
+	for _, containerIf := range containers {
 		c, ok := containerIf.(*containerLXC)
 		if !ok {
 			logger.Errorf("Received device event on non-LXC container")
@@ -1854,7 +1902,7 @@ func deviceInotifyDirCreateEvent(s *state.State, target *sys.InotifyTargetInfo) 
 		return
 	}
 
-	containers, err := s.Cluster.ContainersList(db.CTypeRegular)
+	containers, err := containerLoadNodeAll(s)
 	if err != nil {
 		logger.Errorf("Failed to load containers: %s", err)
 		return
@@ -1867,13 +1915,7 @@ func deviceInotifyDirCreateEvent(s *state.State, target *sys.InotifyTargetInfo) 
 	// ancestors
 	del := createAncestorPaths(targetName)
 	keep := []string{}
-	for _, name := range containers {
-		containerIf, err := containerLoadByName(s, name)
-		if err != nil {
-			logger.Errorf("Failed to load container \"%s\": %s", name, err)
-			continue
-		}
-
+	for _, containerIf := range containers {
 		c, ok := containerIf.(*containerLXC)
 		if !ok {
 			logger.Errorf("Received device event on non-LXC container")
@@ -1957,7 +1999,7 @@ func deviceInotifyFileEvent(s *state.State, target *sys.InotifyTargetInfo) {
 		return
 	}
 
-	containers, err := s.Cluster.ContainersList(db.CTypeRegular)
+	containers, err := containerLoadNodeAll(s)
 	if err != nil {
 		logger.Errorf("Failed to load containers: %s", err)
 		return
@@ -1967,13 +2009,7 @@ func deviceInotifyFileEvent(s *state.State, target *sys.InotifyTargetInfo) {
 	hasWatchers := false
 	// The absolute path of the file for which we received an event?
 	targetName := filepath.Join(parent.Path, target.Path)
-	for _, name := range containers {
-		containerIf, err := containerLoadByName(s, name)
-		if err != nil {
-			logger.Errorf("Failed to load container \"%s\": %s", name, err)
-			continue
-		}
-
+	for _, containerIf := range containers {
 		c, ok := containerIf.(*containerLXC)
 		if !ok {
 			logger.Errorf("Received device event on non-LXC container")

@@ -273,3 +273,68 @@ func (s *suite) BenchmarkPushPopBackDeque(c *gc.C) {
 		_, _ = d.PopBack()
 	}
 }
+
+func iterToSlice(iter deque.Iterator) []string {
+	var result []string
+	var value string
+	for iter.Next(&value) {
+		result = append(result, value)
+	}
+	return result
+}
+
+func (s *suite) TestIterEmpty(c *gc.C) {
+	c.Assert(iterToSlice(s.deque.Iterator()), gc.HasLen, 0)
+}
+
+func (s *suite) TestIter(c *gc.C) {
+	s.deque.PushFront("second")
+	s.deque.PushBack("third")
+	s.deque.PushFront("first")
+	c.Assert(iterToSlice(s.deque.Iterator()), jc.DeepEquals, []string{"first", "second", "third"})
+}
+
+func (s *suite) TestIterOverBlocksBack(c *gc.C) {
+	for i := 0; i < testLen; i++ {
+		s.deque.PushBack(i)
+	}
+
+	iter := s.deque.Iterator()
+	expect := 0
+	var obtained int
+	for iter.Next(&obtained) {
+		c.Assert(obtained, gc.Equals, expect)
+		expect++
+	}
+	c.Assert(expect, gc.Equals, testLen)
+}
+
+func (s *suite) TestIterOverBlocksFront(c *gc.C) {
+	for i := 0; i < testLen; i++ {
+		s.deque.PushFront(i)
+	}
+
+	iter := s.deque.Iterator()
+	expect := testLen - 1
+	var obtained int
+	for iter.Next(&obtained) {
+		c.Assert(obtained, gc.Equals, expect)
+		expect--
+	}
+	c.Assert(expect, gc.Equals, -1)
+}
+
+func (s *suite) TestWrongTypePanics(c *gc.C) {
+	// Use an int in the deque, and try to get strings out using the iterToSlice method.
+	s.deque.PushFront(14)
+
+	c.Assert(func() {
+		iterToSlice(s.deque.Iterator())
+	}, gc.PanicMatches, "reflect.Set: value of type int is not assignable to type string")
+
+	c.Assert(func() {
+		iter := s.deque.Iterator()
+		var i int
+		iter.Next(i)
+	}, gc.PanicMatches, "value is not a pointer")
+}

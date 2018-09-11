@@ -128,6 +128,24 @@ const AA_PROFILE_BASE = `
   mount options=(rw,bind) /sy[^s]*{,/**},
   mount options=(rw,bind) /sys?*{,/**},
 
+  # allow read-only bind-mounts of anything except /proc, /sys and /dev
+  mount options=(ro,remount,bind) -> /[^spd]*{,/**},
+  mount options=(ro,remount,bind) -> /d[^e]*{,/**},
+  mount options=(ro,remount,bind) -> /de[^v]*{,/**},
+  mount options=(ro,remount,bind) -> /dev/.[^l]*{,/**},
+  mount options=(ro,remount,bind) -> /dev/.l[^x]*{,/**},
+  mount options=(ro,remount,bind) -> /dev/.lx[^c]*{,/**},
+  mount options=(ro,remount,bind) -> /dev/.lxc?*{,/**},
+  mount options=(ro,remount,bind) -> /dev/[^.]*{,/**},
+  mount options=(ro,remount,bind) -> /dev?*{,/**},
+  mount options=(ro,remount,bind) -> /p[^r]*{,/**},
+  mount options=(ro,remount,bind) -> /pr[^o]*{,/**},
+  mount options=(ro,remount,bind) -> /pro[^c]*{,/**},
+  mount options=(ro,remount,bind) -> /proc?*{,/**},
+  mount options=(ro,remount,bind) -> /s[^y]*{,/**},
+  mount options=(ro,remount,bind) -> /sy[^s]*{,/**},
+  mount options=(ro,remount,bind) -> /sys?*{,/**},
+
   # allow moving mounts except for /proc, /sys and /dev
   mount options=(rw,move) /[^spd]*{,/**},
   mount options=(rw,move) /d[^e]*{,/**},
@@ -229,8 +247,8 @@ const AA_PROFILE_NESTING = `
   ptrace,
   signal,
 
-  deny /dev/.lxd/proc/** rw,
-  deny /dev/.lxd/sys/** rw,
+  deny /dev/.lxc/proc/** rw,
+  deny /dev/.lxc/sys/** rw,
 
   mount /var/lib/lxd/shmounts/ -> /var/lib/lxd/shmounts/,
   mount none -> /var/lib/lxd/shmounts/,
@@ -251,6 +269,7 @@ const AA_PROFILE_NESTING = `
 const AA_PROFILE_UNPRIVILEGED = `
   pivot_root,
 
+  # Allow modifying mount propagation
   mount options=(rw,make-slave) -> **,
   mount options=(rw,make-rslave) -> **,
   mount options=(rw,make-shared) -> **,
@@ -260,8 +279,12 @@ const AA_PROFILE_UNPRIVILEGED = `
   mount options=(rw,make-unbindable) -> **,
   mount options=(rw,make-runbindable) -> **,
 
+  # Allow all bind-mounts
   mount options=(rw,bind),
   mount options=(rw,rbind),
+
+  # Allow remounting things read-only
+  mount options=(ro,remount),
 `
 
 func mkApparmorName(name string) string {
@@ -477,7 +500,7 @@ func AADestroy(c container) error {
 	if state.OS.AppArmorStacking && !state.OS.AppArmorStacked {
 		p := path.Join("/sys/kernel/security/apparmor/policy/namespaces", AANamespace(c))
 		if err := os.Remove(p); err != nil {
-			logger.Error("error removing apparmor namespace", log.Ctx{"err": err, "ns": p})
+			logger.Error("Error removing apparmor namespace", log.Ctx{"err": err, "ns": p})
 		}
 	}
 

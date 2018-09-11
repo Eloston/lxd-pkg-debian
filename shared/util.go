@@ -25,7 +25,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/lxc/lxd/shared/cancel"
 	"github.com/lxc/lxd/shared/ioprogress"
@@ -89,7 +88,7 @@ func PathIsEmpty(path string) (bool, error) {
 
 // IsDir returns true if the given path is a directory.
 func IsDir(name string) bool {
-	stat, err := os.Lstat(name)
+	stat, err := os.Stat(name)
 	if err != nil {
 		return false
 	}
@@ -671,7 +670,7 @@ func TextEditor(inPath string, inContent []byte) ([]byte, error) {
 				}
 			}
 			if editor == "" {
-				return []byte{}, fmt.Errorf("No text editor found, please set the EDITOR environment variable.")
+				return []byte{}, fmt.Errorf("No text editor found, please set the EDITOR environment variable")
 			}
 		}
 	}
@@ -728,14 +727,14 @@ func ParseMetadata(metadata interface{}) (map[string]interface{}, error) {
 	if s.Kind() == reflect.Map {
 		for _, k := range s.MapKeys() {
 			if k.Kind() != reflect.String {
-				return nil, fmt.Errorf("Invalid metadata provided (key isn't a string).")
+				return nil, fmt.Errorf("Invalid metadata provided (key isn't a string)")
 			}
 			newMetadata[k.String()] = s.MapIndex(k).Interface()
 		}
 	} else if s.Kind() == reflect.Ptr && !s.Elem().IsValid() {
 		return nil, nil
 	} else {
-		return nil, fmt.Errorf("Invalid metadata provided (type isn't a map).")
+		return nil, fmt.Errorf("Invalid metadata provided (type isn't a map)")
 	}
 
 	return newMetadata, nil
@@ -744,23 +743,22 @@ func ParseMetadata(metadata interface{}) (map[string]interface{}, error) {
 // Parse a size string in bytes (e.g. 200kB or 5GB) into the number of bytes it
 // represents. Supports suffixes up to EB. "" == 0.
 func ParseByteSizeString(input string) (int64, error) {
-	suffixLen := 2
-
+	// Empty input
 	if input == "" {
 		return 0, nil
 	}
 
-	if unicode.IsNumber(rune(input[len(input)-1])) {
-		// No suffix --> bytes.
-		suffixLen = 0
-	} else if (len(input) >= 2) && (input[len(input)-1] == 'B') && unicode.IsNumber(rune(input[len(input)-2])) {
-		// "B" suffix --> bytes.
-		suffixLen = 1
-	} else if strings.HasSuffix(input, " bytes") {
-		// Backward compatible behaviour in case we talk to a LXD that
-		// still uses GetByteSizeString() that returns "n bytes".
-		suffixLen = 6
-	} else if (len(input) < 3) && (suffixLen == 2) {
+	// Find where the suffix begins
+	suffixLen := 0
+	for i, chr := range []byte(input) {
+		_, err := strconv.Atoi(string([]byte{chr}))
+		if err != nil {
+			suffixLen = len(input) - i
+			break
+		}
+	}
+
+	if suffixLen == len(input) {
 		return -1, fmt.Errorf("Invalid value: %s", input)
 	}
 
@@ -774,32 +772,37 @@ func ParseByteSizeString(input string) (int64, error) {
 		return -1, fmt.Errorf("Invalid integer: %s", input)
 	}
 
-	if valueInt < 0 {
-		return -1, fmt.Errorf("Invalid value: %d", valueInt)
-	}
-
-	// The value is already in bytes.
-	if suffixLen != 2 {
-		return valueInt, nil
-	}
-
 	// Figure out the multiplicator
 	multiplicator := int64(0)
 	switch suffix {
+	case "", "B", " bytes":
+		multiplicator = 1
 	case "kB":
-		multiplicator = 1024
+		multiplicator = 1000
 	case "MB":
-		multiplicator = 1024 * 1024
+		multiplicator = 1000 * 1000
 	case "GB":
-		multiplicator = 1024 * 1024 * 1024
+		multiplicator = 1000 * 1000 * 1000
 	case "TB":
-		multiplicator = 1024 * 1024 * 1024 * 1024
+		multiplicator = 1000 * 1000 * 1000 * 1000
 	case "PB":
-		multiplicator = 1024 * 1024 * 1024 * 1024 * 1024
+		multiplicator = 1000 * 1000 * 1000 * 1000 * 1000
 	case "EB":
+		multiplicator = 1000 * 1000 * 1000 * 1000 * 1000 * 1000
+	case "KiB":
+		multiplicator = 1024
+	case "MiB":
+		multiplicator = 1024 * 1024
+	case "GiB":
+		multiplicator = 1024 * 1024 * 1024
+	case "TiB":
+		multiplicator = 1024 * 1024 * 1024 * 1024
+	case "PiB":
+		multiplicator = 1024 * 1024 * 1024 * 1024 * 1024
+	case "EiB":
 		multiplicator = 1024 * 1024 * 1024 * 1024 * 1024 * 1024
 	default:
-		return -1, fmt.Errorf("Unsupported suffix: %s", suffix)
+		return -1, fmt.Errorf("Invalid value: %s", input)
 	}
 
 	return valueInt * multiplicator, nil
@@ -808,31 +811,40 @@ func ParseByteSizeString(input string) (int64, error) {
 // Parse a size string in bits (e.g. 200kbit or 5Gbit) into the number of bits
 // it represents. Supports suffixes up to Ebit. "" == 0.
 func ParseBitSizeString(input string) (int64, error) {
+	// Empty input
 	if input == "" {
 		return 0, nil
 	}
 
-	if len(input) < 5 {
+	// Find where the suffix begins
+	suffixLen := 0
+	for i, chr := range []byte(input) {
+		_, err := strconv.Atoi(string([]byte{chr}))
+		if err != nil {
+			suffixLen = len(input) - i
+			break
+		}
+	}
+
+	if suffixLen == len(input) {
 		return -1, fmt.Errorf("Invalid value: %s", input)
 	}
 
 	// Extract the suffix
-	suffix := input[len(input)-4:]
+	suffix := input[len(input)-suffixLen:]
 
 	// Extract the value
-	value := input[0 : len(input)-4]
+	value := input[0 : len(input)-suffixLen]
 	valueInt, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
 		return -1, fmt.Errorf("Invalid integer: %s", input)
 	}
 
-	if valueInt < 0 {
-		return -1, fmt.Errorf("Invalid value: %d", valueInt)
-	}
-
 	// Figure out the multiplicator
 	multiplicator := int64(0)
 	switch suffix {
+	case "", "bit":
+		multiplicator = 1
 	case "kbit":
 		multiplicator = 1000
 	case "Mbit":
@@ -845,6 +857,19 @@ func ParseBitSizeString(input string) (int64, error) {
 		multiplicator = 1000 * 1000 * 1000 * 1000 * 1000
 	case "Ebit":
 		multiplicator = 1000 * 1000 * 1000 * 1000 * 1000 * 1000
+	case "Kibit":
+		multiplicator = 1024
+	case "Mibit":
+		multiplicator = 1024 * 1024
+	case "Gibit":
+		multiplicator = 1024 * 1024 * 1024
+	case "Tibit":
+		multiplicator = 1024 * 1024 * 1024 * 1024
+	case "Pibit":
+		multiplicator = 1024 * 1024 * 1024 * 1024 * 1024
+	case "Eibit":
+		multiplicator = 1024 * 1024 * 1024 * 1024 * 1024 * 1024
+
 	default:
 		return -1, fmt.Errorf("Unsupported suffix: %s", suffix)
 	}
@@ -853,15 +878,15 @@ func ParseBitSizeString(input string) (int64, error) {
 }
 
 func GetByteSizeString(input int64, precision uint) string {
-	if input < 1024 {
+	if input < 1000 {
 		return fmt.Sprintf("%dB", input)
 	}
 
 	value := float64(input)
 
 	for _, unit := range []string{"kB", "MB", "GB", "TB", "PB", "EB"} {
-		value = value / 1024
-		if value < 1024 {
+		value = value / 1000
+		if value < 1000 {
 			return fmt.Sprintf("%.*f%s", precision, value, unit)
 		}
 	}
@@ -1046,4 +1071,36 @@ func downloadFileSha(httpClient *http.Client, useragent string, progress func(pr
 	}
 
 	return size, nil
+}
+
+func ParseNumberFromFile(file string) (int64, error) {
+	buf, err := ioutil.ReadFile(file)
+	if err != nil {
+		return int64(0), err
+	}
+
+	str := strings.TrimSpace(string(buf))
+	nr, err := strconv.Atoi(str)
+	if err != nil {
+		return int64(0), err
+	}
+
+	return int64(nr), nil
+}
+
+type ReadSeeker struct {
+	io.Reader
+	io.Seeker
+}
+
+func NewReadSeeker(reader io.Reader, seeker io.Seeker) *ReadSeeker {
+	return &ReadSeeker{Reader: reader, Seeker: seeker}
+}
+
+func (r *ReadSeeker) Read(p []byte) (n int, err error) {
+	return r.Reader.Read(p)
+}
+
+func (r *ReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	return r.Seeker.Seek(offset, whence)
 }

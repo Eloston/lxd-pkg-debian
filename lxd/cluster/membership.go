@@ -85,8 +85,8 @@ func Bootstrap(state *state.State, gateway *Gateway, name string) error {
 		return err
 	}
 
-	// Shutdown the gateway. This will trash any gRPC SQL connection
-	// against our in-memory dqlite driver and shutdown the associated raft
+	// Shutdown the gateway. This will trash any dqlite connection against
+	// our in-memory dqlite driver and shutdown the associated raft
 	// instance. We also lock regular access to the cluster database since
 	// we don't want any other database code to run while we're
 	// reconfiguring raft.
@@ -107,6 +107,7 @@ func Bootstrap(state *state.State, gateway *Gateway, name string) error {
 	if err != nil {
 		return errors.Wrap(err, "failed to re-initialize gRPC SQL gateway")
 	}
+
 	err = gateway.waitLeadership()
 	if err != nil {
 		return err
@@ -254,11 +255,11 @@ func Join(state *state.State, gateway *Gateway, cert *shared.CertInfo, name stri
 	var networks map[string]map[string]string
 	var operations []string
 	err = state.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		pools, err = tx.StoragePoolConfigs()
+		pools, err = tx.StoragePoolsNodeConfig()
 		if err != nil {
 			return err
 		}
-		networks, err = tx.NetworkConfigs()
+		networks, err = tx.NetworksNodeConfig()
 		if err != nil {
 			return err
 		}
@@ -367,13 +368,6 @@ func Join(state *state.State, gateway *Gateway, cert *shared.CertInfo, name stri
 				if !ok {
 					return fmt.Errorf("joining node has no config for pool %s", name)
 				}
-				// We only need to add the node-specific keys, since
-				// the other keys are global and are already there.
-				for key := range config {
-					if !shared.StringInSlice(key, db.StoragePoolNodeConfigKeys) {
-						delete(config, key)
-					}
-				}
 				err = tx.StoragePoolConfigAdd(id, node.ID, config)
 				if err != nil {
 					return errors.Wrap(err, "failed to add joining node's pool config")
@@ -394,13 +388,6 @@ func Join(state *state.State, gateway *Gateway, cert *shared.CertInfo, name stri
 			err := tx.NetworkNodeJoin(id, node.ID)
 			if err != nil {
 				return errors.Wrap(err, "failed to add joining node's to the network")
-			}
-			// We only need to add the node-specific keys, since
-			// the other keys are global and are already there.
-			for key := range config {
-				if !shared.StringInSlice(key, db.NetworkNodeConfigKeys) {
-					delete(config, key)
-				}
 			}
 			err = tx.NetworkConfigAdd(id, node.ID, config)
 			if err != nil {

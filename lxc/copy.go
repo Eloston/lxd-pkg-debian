@@ -20,6 +20,7 @@ type cmdCopy struct {
 	flagNoProfiles    bool
 	flagProfile       []string
 	flagConfig        []string
+	flagDevice        []string
 	flagEphemeral     bool
 	flagContainerOnly bool
 	flagMode          string
@@ -37,6 +38,7 @@ func (c *cmdCopy) Command() *cobra.Command {
 
 	cmd.RunE = c.Run
 	cmd.Flags().StringArrayVarP(&c.flagConfig, "config", "c", nil, i18n.G("Config key/value to apply to the new container")+"``")
+	cmd.Flags().StringArrayVarP(&c.flagDevice, "device", "d", nil, i18n.G("New key/value to apply to a specific device")+"``")
 	cmd.Flags().StringArrayVarP(&c.flagProfile, "profile", "p", nil, i18n.G("Profile to apply to the new container")+"``")
 	cmd.Flags().BoolVarP(&c.flagEphemeral, "ephemeral", "e", false, i18n.G("Ephemeral container"))
 	cmd.Flags().StringVar(&c.flagMode, "mode", "pull", i18n.G("Transfer mode. One of pull (default), push or relay")+"``")
@@ -63,11 +65,6 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 		return err
 	}
 
-	// Target member and destination remote can't be used together.
-	if c.flagTarget != "" && sourceRemote != destRemote {
-		return fmt.Errorf(i18n.G("You must use the same source and destination remote when using --target"))
-	}
-
 	// Make sure we have a container or snapshot name
 	if sourceName == "" {
 		return fmt.Errorf(i18n.G("You must specify a source container name"))
@@ -88,7 +85,6 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 	if err != nil {
 		return err
 	}
-	source = source.UseTarget(c.flagTarget)
 
 	// Connect to the destination host
 	var dest lxd.ContainerServer
@@ -103,6 +99,11 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 		}
 	}
 
+	// Confirm that --target is only used with a cluster
+	if c.flagTarget != "" && !dest.IsClustered() {
+		return fmt.Errorf(i18n.G("To use --target, the destination remote must be a cluster"))
+	}
+
 	// Parse the config overrides
 	configMap := map[string]string{}
 	for _, entry := range c.flagConfig {
@@ -112,6 +113,23 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 
 		fields := strings.SplitN(entry, "=", 2)
 		configMap[fields[0]] = fields[1]
+	}
+
+	// Parse the device overrides
+	deviceMap := map[string]map[string]string{}
+	for _, entry := range c.flagDevice {
+		if !strings.Contains(entry, "=") || !strings.Contains(entry, ",") {
+			return fmt.Errorf(i18n.G("Bad syntax, expecting <device>,<key>=<value>: %s"), entry)
+		}
+
+		deviceFields := strings.SplitN(entry, ",", 2)
+		keyFields := strings.SplitN(deviceFields[1], "=", 2)
+
+		if deviceMap[deviceFields[0]] == nil {
+			deviceMap[deviceFields[0]] = map[string]string{}
+		}
+
+		deviceMap[deviceFields[0]][keyFields[0]] = keyFields[1]
 	}
 
 	var op lxd.RemoteOperation
@@ -144,6 +162,20 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 			}
 		}
 
+		// Allow setting device overrides
+		if deviceMap != nil {
+			for k, m := range deviceMap {
+				if entry.Devices[k] == nil {
+					entry.Devices[k] = m
+					continue
+				}
+
+				for key, value := range m {
+					entry.Devices[k][key] = value
+				}
+			}
+		}
+
 		// Allow overriding the ephemeral status
 		if ephemeral == 1 {
 			entry.Ephemeral = true
@@ -165,7 +197,8 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 		}
 
 		// Do the actual copy
-		op, err = dest.CopyContainerSnapshot(source, *entry, &args)
+		dest = dest.UseTarget(c.flagTarget)
+		op, err = dest.CopyContainerSnapshot(source, srcFields[0], *entry, &args)
 		if err != nil {
 			return err
 		}
@@ -198,6 +231,20 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 			}
 		}
 
+		// Allow setting device overrides
+		if deviceMap != nil {
+			for k, m := range deviceMap {
+				if entry.Devices[k] == nil {
+					entry.Devices[k] = m
+					continue
+				}
+
+				for key, value := range m {
+					entry.Devices[k][key] = value
+				}
+			}
+		}
+
 		// Allow overriding the ephemeral status
 		if ephemeral == 1 {
 			entry.Ephemeral = true
@@ -219,6 +266,7 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 		}
 
 		// Do the actual copy
+		dest = dest.UseTarget(c.flagTarget)
 		op, err = dest.CopyContainer(source, *entry, &args)
 		if err != nil {
 			return err

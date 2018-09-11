@@ -30,6 +30,9 @@ LXD_NETNS=""
 # shellcheck disable=SC2034
 LXD_ALT_CERT=""
 
+# Always ignore SC2230 ('which' is non-standard. Use builtin 'command -v' instead.)
+export SHELLCHECK_OPTS="-e SC2230"
+
 import_subdir_files() {
     test "$1"
     # shellcheck disable=SC2039
@@ -208,6 +211,7 @@ run_test test_clustering_storage "clustering storage"
 run_test test_clustering_network "clustering network"
 run_test test_clustering_publish "clustering publish"
 run_test test_clustering_profiles "clustering profiles"
+run_test test_clustering_shutdown_nodes "clustering shutdown"
 #run_test test_clustering_upgrade "clustering upgrade"
 
 # shellcheck disable=SC2034

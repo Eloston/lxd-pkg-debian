@@ -595,7 +595,7 @@ func (c *cmdImageImport) packImageDir(path string) (string, error) {
 	defer outFile.Close()
 
 	outFileName := outFile.Name()
-	shared.RunCommand("tar", "-C", path, "--numeric-owner", "-cJf", outFileName, "rootfs", "templates", "metadata.yaml")
+	shared.RunCommand("tar", "-C", path, "--numeric-owner", "--xattrs", "-cJf", outFileName, "rootfs", "templates", "metadata.yaml")
 
 	return outFileName, nil
 }
@@ -654,7 +654,7 @@ func (c *cmdImageImport) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	if strings.HasPrefix(imageFile, "http://") {
-		return fmt.Errorf(i18n.G("Only https:// is supported for remote image import."))
+		return fmt.Errorf(i18n.G("Only https:// is supported for remote image import"))
 	}
 
 	createArgs := &lxd.ImageCreateArgs{}
@@ -690,6 +690,7 @@ func (c *cmdImageImport) Run(cmd *cobra.Command, args []string) error {
 		image.Source.Mode = "pull"
 		image.Source.Protocol = "direct"
 		image.Source.URL = imageFile
+		createArgs = nil
 	} else {
 		var meta io.ReadCloser
 		var rootfs io.ReadCloser

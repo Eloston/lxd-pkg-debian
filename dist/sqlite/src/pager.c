@@ -699,7 +699,7 @@ struct Pager {
   char *zJournal;             /* Name of the journal file */
   int (*xBusyHandler)(void*); /* Function to call when busy */
   void *pBusyHandlerArg;      /* Context argument for xBusyHandler */
-  int aStat[3];               /* Total cache hits, misses and writes */
+  int aStat[4];               /* Total cache hits, misses, writes, spills */
 #ifdef SQLITE_TEST
   int nRead;                  /* Database pages read */
 #endif
@@ -716,11 +716,12 @@ struct Pager {
 #ifndef SQLITE_OMIT_WAL
   Wal *pWal;                  /* Write-ahead log used by "journal_mode=wal" */
   char *zWal;                 /* File name for write-ahead log */
-#ifdef SQLITE_ENABLE_REPLICATION
-  u8 replicationMode;         /* Replication mode (NONE, LEADER, FOLLOWER) */
-  void *pReplicationCtx;      /* Replication context (user-defined) */
-#endif /* SQLITE_ENABLE_REPLICATION */
-#endif /* SQLITE_OMIT_WAL */
+#if defined(SQLITE_ENABLE_WAL_REPLICATION)
+  sqlite3_wal_replication* pWalReplication; /* Set when notifying WAL events */
+  void *pWalReplicationArg;                 /* Argument for WAL notifications */
+  u8 bWalReplicationFollower;               /* True when receiving WAL events */
+#endif /* SQLITE_ENABLE_WAL_REPLICATION */
+#endif /* !SQLITE_OMIT_WAL */
 };
 
 /*
@@ -731,6 +732,7 @@ struct Pager {
 #define PAGER_STAT_HIT   0
 #define PAGER_STAT_MISS  1
 #define PAGER_STAT_WRITE 2
+#define PAGER_STAT_SPILL 3
 
 /*
 ** The following global variables hold counters used for
@@ -1217,7 +1219,7 @@ static int jrnlBufferSize(Pager *pPager){
 #endif
 
 #ifdef SQLITE_ENABLE_BATCH_ATOMIC_WRITE
-  if( dc&SQLITE_IOCAP_BATCH_ATOMIC ){
+  if( pPager->dbSize>0 && (dc&SQLITE_IOCAP_BATCH_ATOMIC) ){
     return -1;
   }
 #endif
@@ -2116,15 +2118,16 @@ static int pager_end_transaction(Pager *pPager, int hasMaster, int bCommit){
   }
 
   if( pagerUseWal(pPager) ){
-#if defined(SQLITE_ENABLE_REPLICATION) && !defined(SQLITE_OMIT_WAL)
-    if( pPager->replicationMode==SQLITE_REPLICATION_LEADER ){
-      /* Fire the xEnd hook of the configured replication interface. The hook
-      ** implementation will typically use it to update its internal state.
-      ** The return code is currently ignored. */
-      assert( sqlite3GlobalConfig.replication.xEnd );
-      sqlite3GlobalConfig.replication.xEnd(pPager->pReplicationCtx);
+#if defined(SQLITE_ENABLE_WAL_REPLICATION) && !defined(SQLITE_OMIT_WAL)
+    if( pPager->pWalReplication ){
+      /* Fire the xEnd method of the configured replication interface. The
+      ** method implementation will typically use it to update its internal
+      ** state. The return code is currently ignored. */
+      assert( pPager->pWalReplication->xEnd );
+      pPager->pWalReplication->xEnd(
+          pPager->pWalReplication, pPager->pWalReplicationArg);
     }
-#endif /* SQLITE_ENABLE_REPLICATION */
+#endif /* SQLITE_ENABLE_WAL_REPLICATION && !SQLITE_OMIT_WAL */
     /* Drop the WAL write-lock, if any. Also, if the connection was in 
     ** locking_mode=exclusive mode but is no longer, drop the EXCLUSIVE 
     ** lock held on the database file.
@@ -2142,7 +2145,7 @@ static int pager_end_transaction(Pager *pPager, int hasMaster, int bCommit){
     rc = pager_truncate(pPager, pPager->dbSize);
   }
 
-  if( rc==SQLITE_OK && bCommit && isOpen(pPager->fd) ){
+  if( rc==SQLITE_OK && bCommit ){
     rc = sqlite3OsFileControl(pPager->fd, SQLITE_FCNTL_COMMIT_PHASETWO, 0);
     if( rc==SQLITE_NOTFOUND ) rc = SQLITE_OK;
   }
@@ -2961,9 +2964,7 @@ end_playback:
   ** assertion that the transaction counter was modified.
   */
 #ifdef SQLITE_DEBUG
-  if( pPager->fd->pMethods ){
-    sqlite3OsFileControlHint(pPager->fd,SQLITE_FCNTL_DB_UNCHANGED,0);
-  }
+  sqlite3OsFileControlHint(pPager->fd,SQLITE_FCNTL_DB_UNCHANGED,0);
 #endif
 
   /* If this playback is happening automatically as a result of an IO or 
@@ -3163,20 +3164,22 @@ static int pagerRollbackWal(Pager *pPager){
   **   + Reload page content from the database (if refcount>0).
   */
   pPager->dbSize = pPager->dbOrigSize;
-#if defined(SQLITE_ENABLE_REPLICATION) && !defined(SQLITE_OMIT_WAL)
-  if( pPager->replicationMode==SQLITE_REPLICATION_LEADER ){
-    /* When in leader replication mode fire the xUndo callback of the
-    ** replication implementation. The hook implementation is typically in
-    ** charge of broadcasting the event to other nodes, and ensure that a
-    ** quorum of them have received the message.
+#if defined(SQLITE_ENABLE_WAL_REPLICATION) && !defined(SQLITE_OMIT_WAL)
+  if( pPager->pWalReplication ){
+    /* When in leader WAL replication mode fire the xUndo method of the
+    ** replication implementation. The method implementation is typically in
+    ** charge of broadcasting the event to other nodes, and ensure that a quorum
+    ** of them have received the message.
     **
     ** The return code is currently ignored, since in any case we want to
-    ** rollback the transaction on this node. The replication implementation
+    ** rollback the transaction on this node. The WAL replication implementation
     ** should ensure graceful recovery after a failure due to loss of quorum.
     */
-    sqlite3GlobalConfig.replication.xUndo(pPager->pReplicationCtx);
+    assert( pPager->pWalReplication->xUndo );
+    pPager->pWalReplication->xUndo(
+        pPager->pWalReplication, pPager->pWalReplicationArg);
   }
-#endif /* SQLITE_ENABLE_REPLICATION */
+#endif /* SQLITE_ENABLE_WAL_REPLICATION && !SQLITE_OMIT_WAL */
   rc = sqlite3WalUndo(pPager->pWal, pagerUndoCallback, (void *)pPager);
   pList = sqlite3PcacheDirtyList(pPager->pPCache);
   while( pList && rc==SQLITE_OK ){
@@ -3237,39 +3240,48 @@ static int pagerWalFrames(
   pPager->aStat[PAGER_STAT_WRITE] += nList;
 
   if( pList->pgno==1 ) pager_write_changecounter(pList);
-#if defined(SQLITE_ENABLE_REPLICATION) && !defined(SQLITE_OMIT_WAL)
-  /* When in leader replication mode fire the xFrames callback of the configured
-  ** replication implementation. The hook implementation is typically in charge
-  ** of broadcasting the frames to other nodes, and ensure that a quorum of them
-  ** have received the message. */
-  if( pPager->replicationMode==SQLITE_REPLICATION_LEADER ){
-    /* Allocate a new buffer of replication pages to pass to the callback. */
-    sqlite3_replication_page *pReplPg;
-    pReplPg = (sqlite3_replication_page*)sqlite3_malloc(
-        sizeof(sqlite3_replication_page) * (nList));
-    if( pReplPg==0 ){
+#if defined(SQLITE_ENABLE_WAL_REPLICATION) && !defined(SQLITE_OMIT_WAL)
+  /* When in leader WAL replication mode fire the xFrames method of the
+  ** configured replication implementation. The method implementation is
+  ** typically in charge of broadcasting the frames to other nodes, and ensure
+  ** that a quorum of them have received the message. */
+  if( pPager->pWalReplication ){
+    assert( pPager->pWalReplication->xFrames );
+
+    /* Allocate a new buffer of replication pages to pass to xFrames. */
+    sqlite3_wal_replication_frame *aFrame;
+    aFrame = (sqlite3_wal_replication_frame*)sqlite3_malloc(
+        sizeof(sqlite3_wal_replication_frame) * (nList));
+    if( aFrame==0 ){
       rc = SQLITE_NOMEM_BKPT;
     }else{
       /* Copy into the replication pages list all data about dirty pages that
       ** should be written to the write-ahead log. */
       for(p=pList; p; p=p->pDirty){
-        pReplPg->pBuf = p->pData;
-        pReplPg->flags = p->flags;
-        pReplPg->pgno = p->pgno;
-        pReplPg += 1;
+        aFrame->pBuf = p->pData;
+        aFrame->pgno = p->pgno;
+        /* Check if this page already in the WAL. It will serve as a hint to
+        ** implementations of sqlite3_wal_replication.xFrames that optimize
+        ** replication by only sending binary diffs of WAL pages over the
+        ** network, as they can make assumptions about the frames contained
+        ** in the replicated WALs.
+        */
+        sqlite3WalFindFrame(pPager->pWal, p->pgno, &aFrame->iPrev);
+        aFrame++;
       }
-      pReplPg -= nList;
-      rc = sqlite3GlobalConfig.replication.xFrames(pPager->pReplicationCtx,
-          pPager->pageSize, nList, pReplPg, nTruncate, isCommit, pPager->walSyncFlags
+      aFrame -= nList;
+      rc = pPager->pWalReplication->xFrames(
+          pPager->pWalReplication, pPager->pWalReplicationArg,
+          pPager->pageSize, nList, aFrame, nTruncate, isCommit
       );
       /* Release the replication pages buffer. */
-      sqlite3_free(pReplPg);
+      sqlite3_free(aFrame);
     }
   }
   if( rc==SQLITE_OK ){
 #else
-  if( 1 ){
-#endif
+  {
+#endif /* SQLITE_ENABLE_WAL_REPLICATION && !SQLITE_OMIT_WAL */
     rc = sqlite3WalFrames(pPager->pWal,
         pPager->pageSize, pList, nTruncate, isCommit, pPager->walSyncFlags
     );
@@ -3764,20 +3776,18 @@ static int pagerOpentemp(
 ** retried. If it returns zero, then the SQLITE_BUSY error is
 ** returned to the caller of the pager API function.
 */
-void sqlite3PagerSetBusyhandler(
+void sqlite3PagerSetBusyHandler(
   Pager *pPager,                       /* Pager object */
   int (*xBusyHandler)(void *),         /* Pointer to busy-handler function */
   void *pBusyHandlerArg                /* Argument to pass to xBusyHandler */
 ){
+  void **ap;
   pPager->xBusyHandler = xBusyHandler;
   pPager->pBusyHandlerArg = pBusyHandlerArg;
-
-  if( isOpen(pPager->fd) ){
-    void **ap = (void **)&pPager->xBusyHandler;
-    assert( ((int(*)(void *))(ap[0]))==xBusyHandler );
-    assert( ap[1]==pBusyHandlerArg );
-    sqlite3OsFileControlHint(pPager->fd, SQLITE_FCNTL_BUSYHANDLER, (void *)ap);
-  }
+  ap = (void **)&pPager->xBusyHandler;
+  assert( ((int(*)(void *))(ap[0]))==xBusyHandler );
+  assert( ap[1]==pBusyHandlerArg );
+  sqlite3OsFileControlHint(pPager->fd, SQLITE_FCNTL_BUSYHANDLER, (void *)ap);
 }
 
 /*
@@ -4163,6 +4173,30 @@ static void pagerFreeMapHdrs(Pager *pPager){
   }
 }
 
+/* Verify that the database file has not be deleted or renamed out from
+** under the pager.  Return SQLITE_OK if the database is still where it ought
+** to be on disk.  Return non-zero (SQLITE_READONLY_DBMOVED or some other error
+** code from sqlite3OsAccess()) if the database has gone missing.
+*/
+static int databaseIsUnmoved(Pager *pPager){
+  int bHasMoved = 0;
+  int rc;
+
+  if( pPager->tempFile ) return SQLITE_OK;
+  if( pPager->dbSize==0 ) return SQLITE_OK;
+  assert( pPager->zFilename && pPager->zFilename[0] );
+  rc = sqlite3OsFileControl(pPager->fd, SQLITE_FCNTL_HAS_MOVED, &bHasMoved);
+  if( rc==SQLITE_NOTFOUND ){
+    /* If the HAS_MOVED file-control is unimplemented, assume that the file
+    ** has not been moved.  That is the historical behavior of SQLite: prior to
+    ** version 3.8.3, it never checked */
+    rc = SQLITE_OK;
+  }else if( rc==SQLITE_OK && bHasMoved ){
+    rc = SQLITE_READONLY_DBMOVED;
+  }
+  return rc;
+}
+
 
 /*
 ** Shutdown the page cache.  Free all memory and close all files.
@@ -4179,8 +4213,7 @@ static void pagerFreeMapHdrs(Pager *pPager){
 ** to the caller.
 */
 int sqlite3PagerClose(Pager *pPager, sqlite3 *db){
-  u8 *pTmp = (u8 *)pPager->pTmpSpace;
-
+  u8 *pTmp = (u8*)pPager->pTmpSpace;
   assert( db || pagerUseWal(pPager)==0 );
   assert( assert_pager_state(pPager) );
   disable_simulated_io_errors();
@@ -4189,16 +4222,23 @@ int sqlite3PagerClose(Pager *pPager, sqlite3 *db){
   /* pPager->errCode = 0; */
   pPager->exclusiveMode = 0;
 #ifndef SQLITE_OMIT_WAL
-  assert( db || pPager->pWal==0 );
-  sqlite3WalClose(pPager->pWal, db, pPager->walSyncFlags, pPager->pageSize,
-      (db && (db->flags & SQLITE_NoCkptOnClose) ? 0 : pTmp)
-  );
-  pPager->pWal = 0;
-#ifdef SQLITE_ENABLE_REPLICATION
-  pPager->replicationMode = SQLITE_REPLICATION_NONE;
-  pPager->pReplicationCtx = 0;
-#endif
-#endif
+  {
+    u8 *a = 0;
+    assert( db || pPager->pWal==0 );
+    if( db && 0==(db->flags & SQLITE_NoCkptOnClose) 
+     && SQLITE_OK==databaseIsUnmoved(pPager)
+    ){
+      a = pTmp;
+    }
+    sqlite3WalClose(pPager->pWal, db, pPager->walSyncFlags, pPager->pageSize,a);
+    pPager->pWal = 0;
+#if defined(SQLITE_ENABLE_WAL_REPLICATION)
+    pPager->pWalReplication = 0;
+    pPager->pWalReplicationArg = 0;
+    pPager->bWalReplicationFollower = 0;
+#endif /* SQLITE_ENABLE_WAL_REPLICATION */
+  }
+#endif /* !SQLITE_OMIT_WAL */
   pager_reset(pPager);
   if( MEMDB ){
     pager_unlock(pPager);
@@ -4654,6 +4694,7 @@ static int pagerStress(void *p, PgHdr *pPg){
     return SQLITE_OK;
   }
 
+  pPager->aStat[PAGER_STAT_SPILL]++;
   pPg->pDirty = 0;
   if( pagerUseWal(pPager) ){
     /* Write a single frame for this page to the log. */
@@ -4759,6 +4800,11 @@ int sqlite3PagerOpen(
   int rc = SQLITE_OK;      /* Return code */
   int tempFile = 0;        /* True for temp files (incl. in-memory files) */
   int memDb = 0;           /* True if this is an in-memory file */
+#ifdef SQLITE_ENABLE_DESERIALIZE
+  int memJM = 0;           /* Memory journal mode */
+#else
+# define memJM 0
+#endif
   int readOnly = 0;        /* True if this is a read-only file */
   int journalFileSize;     /* Bytes to allocate for each journal fd */
   char *zPathname = 0;     /* Full path to database file */
@@ -4874,7 +4920,12 @@ int sqlite3PagerOpen(
     memcpy(pPager->zWal, zPathname, nPathname);
     memcpy(&pPager->zWal[nPathname], "-wal\000", 4+1);
     sqlite3FileSuffix3(pPager->zFilename, pPager->zWal);
-#endif
+#ifdef SQLITE_ENABLE_WAL_REPLICAtION
+    pPager->pWalReplication = 0;
+    pPager->pWalReplicationArg = 0;
+    pPager->bWalReplicationFollower = 0;
+#endif /* SQLITE_ENABLE_WAL_REPLICAtION */
+#endif /* !SQLITE_OMIT_WAL */
     sqlite3DbFree(0, zPathname);
   }
   pPager->pVfs = pVfs;
@@ -4886,7 +4937,10 @@ int sqlite3PagerOpen(
     int fout = 0;                    /* VFS flags returned by xOpen() */
     rc = sqlite3OsOpen(pVfs, pPager->zFilename, pPager->fd, vfsFlags, &fout);
     assert( !memDb );
-    readOnly = (fout&SQLITE_OPEN_READONLY);
+#ifdef SQLITE_ENABLE_DESERIALIZE
+    memJM = (fout&SQLITE_OPEN_MEMORY)!=0;
+#endif
+    readOnly = (fout&SQLITE_OPEN_READONLY)!=0;
 
     /* If the file was successfully opened for read/write access,
     ** choose a default page size in case we have to create the
@@ -5017,7 +5071,7 @@ act_like_temp_file:
   setSectorSize(pPager);
   if( !useJournal ){
     pPager->journalMode = PAGER_JOURNALMODE_OFF;
-  }else if( memDb ){
+  }else if( memDb || memJM ){
     pPager->journalMode = PAGER_JOURNALMODE_MEMORY;
   }
   /* pPager->xBusyHandler = 0; */
@@ -5031,30 +5085,6 @@ act_like_temp_file:
   return SQLITE_OK;
 }
 
-
-/* Verify that the database file has not be deleted or renamed out from
-** under the pager.  Return SQLITE_OK if the database is still were it ought
-** to be on disk.  Return non-zero (SQLITE_READONLY_DBMOVED or some other error
-** code from sqlite3OsAccess()) if the database has gone missing.
-*/
-static int databaseIsUnmoved(Pager *pPager){
-  int bHasMoved = 0;
-  int rc;
-
-  if( pPager->tempFile ) return SQLITE_OK;
-  if( pPager->dbSize==0 ) return SQLITE_OK;
-  assert( pPager->zFilename && pPager->zFilename[0] );
-  rc = sqlite3OsFileControl(pPager->fd, SQLITE_FCNTL_HAS_MOVED, &bHasMoved);
-  if( rc==SQLITE_NOTFOUND ){
-    /* If the HAS_MOVED file-control is unimplemented, assume that the file
-    ** has not been moved.  That is the historical behavior of SQLite: prior to
-    ** version 3.8.3, it never checked */
-    rc = SQLITE_OK;
-  }else if( rc==SQLITE_OK && bHasMoved ){
-    rc = SQLITE_READONLY_DBMOVED;
-  }
-  return rc;
-}
 
 
 /*
@@ -5743,6 +5773,7 @@ void sqlite3PagerUnrefPageOne(DbPage *pPg){
   assert( pPg->pgno==1 );
   assert( (pPg->flags & PGHDR_MMAP)==0 ); /* Page1 is never memory mapped */
   pPager = pPg->pPager;
+  sqlite3PagerResetLockTimeout(pPager);
   sqlite3PcacheRelease(pPg);
   pagerUnlockIfUnused(pPager);
 }
@@ -5880,39 +5911,40 @@ int sqlite3PagerBegin(Pager *pPager, int exFlag, int subjInMemory){
         (void)sqlite3WalExclusiveMode(pPager->pWal, 1);
       }
 
-#if defined(SQLITE_ENABLE_REPLICATION) && !defined(SQLITE_OMIT_WAL)
-      if( pPager->replicationMode==SQLITE_REPLICATION_LEADER ){
-        /* Fire the xBegin hook of the configured replication interface. The
-        ** hook implementation is typically responsible of checking that
-        ** this SQLite node is the cluster leader, and to clear any dangling
-        ** transactions on connections in follower replication mode that might
-        ** have been left around after a leadership change.
+#if defined(SQLITE_ENABLE_WAL_REPLICATION) && !defined(SQLITE_OMIT_WAL)
+      if( pPager->pWalReplication ){
+        /* Fire the xBegin method of the configured WAL replication
+        ** implementation. The method implementation is typically responsible of
+        ** checking that this SQLite node is the cluster leader, and to clear
+        ** any dangling transactions on connections in follower WAL replication
+        ** mode that might have been left around after a leadership change.
         */
-        assert( sqlite3GlobalConfig.replication.xBegin );
-        rc = sqlite3GlobalConfig.replication.xBegin(pPager->pReplicationCtx);
+        assert( pPager->pWalReplication->xBegin );
+        rc = pPager->pWalReplication->xBegin(
+            pPager->pWalReplication, pPager->pWalReplicationArg);
       }
       if( rc==SQLITE_OK ){
 #else
-      if( 1 ){
-#endif /* SQLITE_ENABLE_REPLICATION */
+      {
+#endif /* SQLITE_ENABLE_WAL_REPLICATION && !SQLITE_OMIT_WAL */
         /* Grab the write lock on the log file. If successful, upgrade to
         ** PAGER_RESERVED state. Otherwise, return an error code to the caller.
         ** The busy-handler is not invoked if another connection already
         ** holds the write-lock. If possible, the upper layer will call it.
         */
         rc = sqlite3WalBeginWriteTransaction(pPager->pWal);
-#if defined(SQLITE_ENABLE_REPLICATION) && !defined(SQLITE_OMIT_WAL)
-        if( rc!=SQLITE_OK
-         && pPager->replicationMode==SQLITE_REPLICATION_LEADER ){
+#if defined(SQLITE_ENABLE_WAL_REPLICATION) && !defined(SQLITE_OMIT_WAL)
+        if( rc!=SQLITE_OK && pPager->pWalReplication ){
           /* Fire the xAbort hook of the configured replication interface. The
           ** hook implementation logic should typically cleanup any state that
           ** was set in the xBegin hook. The return code of xAbort is currently
           ** ignored.
           */
-          assert( sqlite3GlobalConfig.replication.xAbort );
-          sqlite3GlobalConfig.replication.xAbort(pPager->pReplicationCtx);
+          assert( pPager->pWalReplication->xAbort );
+          pPager->pWalReplication->xAbort(
+              pPager->pWalReplication, pPager->pWalReplicationArg);
         }
-#endif /* SQLITE_ENABLE_REPLICATION */
+#endif /* SQLITE_ENABLE_WAL_REPLICATION && !SQLITE_OMIT_WAL */
       }
     }else{
       /* Obtain a RESERVED lock on the database file. If the exFlag parameter
@@ -6366,12 +6398,9 @@ static int pager_incr_changecounter(Pager *pPager, int isDirectMode){
 */
 int sqlite3PagerSync(Pager *pPager, const char *zMaster){
   int rc = SQLITE_OK;
-
-  if( isOpen(pPager->fd) ){
-    void *pArg = (void*)zMaster;
-    rc = sqlite3OsFileControl(pPager->fd, SQLITE_FCNTL_SYNC, pArg);
-    if( rc==SQLITE_NOTFOUND ) rc = SQLITE_OK;
-  }
+  void *pArg = (void*)zMaster;
+  rc = sqlite3OsFileControl(pPager->fd, SQLITE_FCNTL_SYNC, pArg);
+  if( rc==SQLITE_NOTFOUND ) rc = SQLITE_OK;
   if( rc==SQLITE_OK && !pPager->noSync ){
     assert( !MEMDB );
     rc = sqlite3OsSync(pPager->fd, pPager->syncFlags);
@@ -6592,8 +6621,9 @@ int sqlite3PagerCommitPhaseOne(
       if( bBatch ){
         if( rc==SQLITE_OK ){
           rc = sqlite3OsFileControl(fd, SQLITE_FCNTL_COMMIT_ATOMIC_WRITE, 0);
-        }else{
-          sqlite3OsFileControl(fd, SQLITE_FCNTL_ROLLBACK_ATOMIC_WRITE, 0);
+        }
+        if( rc!=SQLITE_OK ){
+          sqlite3OsFileControlHint(fd, SQLITE_FCNTL_ROLLBACK_ATOMIC_WRITE, 0);
         }
       }
 
@@ -6817,8 +6847,12 @@ int *sqlite3PagerStats(Pager *pPager){
 #endif
 
 /*
-** Parameter eStat must be either SQLITE_DBSTATUS_CACHE_HIT or
-** SQLITE_DBSTATUS_CACHE_MISS. Before returning, *pnVal is incremented by the
+** Parameter eStat must be one of SQLITE_DBSTATUS_CACHE_HIT, _MISS, _WRITE,
+** or _WRITE+1.  The SQLITE_DBSTATUS_CACHE_WRITE+1 case is a translation
+** of SQLITE_DBSTATUS_CACHE_SPILL.  The _SPILL case is not contiguous because
+** it was added later.
+**
+** Before returning, *pnVal is incremented by the
 ** current cache hit or miss count, according to the value of eStat. If the 
 ** reset parameter is non-zero, the cache hit or miss count is zeroed before 
 ** returning.
@@ -6828,15 +6862,18 @@ void sqlite3PagerCacheStat(Pager *pPager, int eStat, int reset, int *pnVal){
   assert( eStat==SQLITE_DBSTATUS_CACHE_HIT
        || eStat==SQLITE_DBSTATUS_CACHE_MISS
        || eStat==SQLITE_DBSTATUS_CACHE_WRITE
+       || eStat==SQLITE_DBSTATUS_CACHE_WRITE+1
   );
 
   assert( SQLITE_DBSTATUS_CACHE_HIT+1==SQLITE_DBSTATUS_CACHE_MISS );
   assert( SQLITE_DBSTATUS_CACHE_HIT+2==SQLITE_DBSTATUS_CACHE_WRITE );
-  assert( PAGER_STAT_HIT==0 && PAGER_STAT_MISS==1 && PAGER_STAT_WRITE==2 );
+  assert( PAGER_STAT_HIT==0 && PAGER_STAT_MISS==1
+           && PAGER_STAT_WRITE==2 && PAGER_STAT_SPILL==3 );
 
-  *pnVal += pPager->aStat[eStat - SQLITE_DBSTATUS_CACHE_HIT];
+  eStat -= SQLITE_DBSTATUS_CACHE_HIT;
+  *pnVal += pPager->aStat[eStat];
   if( reset ){
-    pPager->aStat[eStat - SQLITE_DBSTATUS_CACHE_HIT] = 0;
+    pPager->aStat[eStat] = 0;
   }
 }
 
@@ -7039,6 +7076,16 @@ sqlite3_vfs *sqlite3PagerVfs(Pager *pPager){
 sqlite3_file *sqlite3PagerFile(Pager *pPager){
   return pPager->fd;
 }
+
+#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
+/*
+** Reset the lock timeout for pager.
+*/
+void sqlite3PagerResetLockTimeout(Pager *pPager){
+  int x = 0;
+  sqlite3OsFileControl(pPager->fd, SQLITE_FCNTL_LOCK_TIMEOUT, &x);
+}
+#endif
 
 /*
 ** Return the file handle for the journal file (if it exists).
@@ -7500,6 +7547,7 @@ int sqlite3PagerCheckpoint(
         pPager->walSyncFlags, pPager->pageSize, (u8 *)pPager->pTmpSpace,
         pnLog, pnCkpt
     );
+    sqlite3PagerResetLockTimeout(pPager);
   }
   return rc;
 }
@@ -7707,111 +7755,153 @@ int sqlite3PagerSnapshotRecover(Pager *pPager){
 }
 #endif /* SQLITE_ENABLE_SNAPSHOT */
 
-#ifdef SQLITE_ENABLE_REPLICATION
+#ifdef SQLITE_ENABLE_WAL_REPLICATION
 /*
-** Return the current write-ahead log replication mode set for this pager.
+** Get the current WAL replication mode enabled on this pager.
+**
+** If the pager is not in WAL mode, an error is returned.
+**
+** If no WAL replication is enabled, *bpEnabled will be set to 0.
+**
+** If leader WAL replication is enabled, *bpEnabled will be set to 1 and
+** *ppReplication will point the the WAL replication implementation currently in
+** use.
+**
+** If follower WAL replication is enabled, *bpEnabled will be set to 1 and
+** *ppReplication to NULL.
 */
-int sqlite3PagerReplicationModeGet(Pager *pPager) {
-  return (int)(pPager->replicationMode);
-}
-
-/*
-** Set the pager's replication mode.
-**
-** If this is not a WAL database, return an error.
-**
-** If the given mode is SQLITE_REPLICATION_LEADER, this pager will fire the
-** various callbacks defined in the sqlite3_replication_methods interface (which
-** must have been configured with SQLITE_CONFIG_REPLICATION), notifying the
-** replication implementation of events such as beginning a write transaction,
-** writing new frames to the write-ahead log, undoing a write transaction and
-** ending a write transaction. In all these cases, the given context pointer
-** will be passed as argument to the sqlite3_replication_methods hooks. If the
-** current mode is not SQLITE_REPLICATION_NONE, trying to set
-** SQLITE_REPLICATION_LEADER produces an error.
-**
-** If the given mode is SQLITE_REPLICATION_FOLLOWER, this pager is expected to
-** be used only for replicating write transactions. If the current replication
-** mode of this pager is not SQLITE_REPLICATION_NONE, then an error is returned.
-**
-** If the given mode is SQLITE_REPLICATION_NONE, this pager will disable leader
-** or follower replication. If the current mode is neither
-** SQLITE_REPLICATION_LEADER or SQLITE_REPLICATION_FOLLOWER, trying to set
-** SQLITE_REPLICATION_NONE produces an error.
-*/
-int sqlite3PagerReplicationModeSet(
+int sqlite3PagerWalReplicationGet(
   Pager *pPager,
-  sqlite3 *db,
-  u8 mode,
-  void *pCtx
-){
-  int rc = SQLITE_OK;
-  u8 *pTmp = (u8 *)pPager->pTmpSpace;
+  int *pbEnabled,                         /* OUT: True if replication is on */
+  sqlite3_wal_replication **ppReplication /* OUT: Set for leader replication */
+) {
+  /* Valid input */
+  assert( pPager );
+  assert( pbEnabled );
+  assert( ppReplication );
+
+  /* Current WAL replication mode must be either leader replication, follower
+  ** replication, or no replication at all.
+  */
+  assert( (pPager->pWalReplication!=0 && pPager->bWalReplicationFollower==0)
+       || (pPager->pWalReplication==0 && pPager->bWalReplicationFollower==1)
+       || (pPager->pWalReplication==0 && pPager->bWalReplicationFollower==0)
+  );
+
+  /* The WAL hook replication argument can be set only if leader WAL replication
+  ** is enabled.
+  */
+  assert( pPager->pWalReplication!=0 || pPager->pWalReplicationArg==0 );
 
   /* We require the database to be in WAL mode */
   if( pPager->journalMode!=PAGER_JOURNALMODE_WAL ){
     return SQLITE_ERROR;
   }
 
-  /* Make sure the given mode is a valid one */
-  assert( mode==SQLITE_REPLICATION_NONE
-       || mode==SQLITE_REPLICATION_LEADER
-       || mode==SQLITE_REPLICATION_FOLLOWER
+  *pbEnabled = pPager->pWalReplication!=0 || pPager->bWalReplicationFollower==1;
+  *ppReplication = pPager->pWalReplication;
+
+  return SQLITE_OK;
+}
+
+/*
+** Change the pager's WAL replication mode.
+**
+** If this is not a WAL database, return an error.
+**
+** If the bEnable flag is 1 and pReplication is not NULL, then enable leader WAL
+** replication. This pager will fire the various callbacks defined in the
+** sqlite3_wal_replication interface, notifying the pReplication implementation
+** of events such as beginning a write transaction, writing new frames to the
+** write-ahead log, undoing a write transaction and ending a write
+** transaction. The given pArg will be passed back when invoking the hooks
+** defined in the pReplication implementation.
+**
+** If the bEnable flag is 1 and pReplication is NULL, then enable follower WAL
+** replication. This pager will be expected to be used only for replicating WAL
+** events broadcasted by another pager in leader WAL replication mode.
+**
+** If the bEnabled flag is 1 and WAL replication is already enabled on this
+** pager (either leader or follower WAL replication), an error is returned.
+**
+** If the bEnabled flag is 0 and either leader or follower WAL replication is
+** enabled on this pager, the pager will be reset to no WAL
+** replication. Otherwise, if no WAL replication was configured for this pager,
+** an error is returned.
+*/
+int sqlite3PagerWalReplicationSet(
+  Pager *pPager,
+  sqlite3 *db,
+  int bEnable,                           /* True to enable WAL replication */
+  sqlite3_wal_replication *pReplication, /* Leader WAL replication */
+  void *pArg                             /* Leader WAL replication argument */
+){
+  u8 *pTmp;
+  int rc = SQLITE_OK;
+
+  /* Valid input */
+  assert( pPager );
+  assert( bEnable==0 || bEnable==1 );
+  assert( bEnable==1 || pReplication==0 );
+  assert( pReplication!=0 || pArg==0 );
+
+  /* Current WAL replication mode must be either leader replication, follower
+  ** replication, or no replication at all.
+  */
+  assert( (pPager->pWalReplication!=0 && pPager->bWalReplicationFollower==0)
+       || (pPager->pWalReplication==0 && pPager->bWalReplicationFollower==1)
+       || (pPager->pWalReplication==0 && pPager->bWalReplicationFollower==0)
   );
 
-  if( mode==SQLITE_REPLICATION_LEADER ){
-    /* When setting leader replication, the replication methods must
-    ** have been configured. */
-    assert( sqlite3GlobalConfig.replication.xBegin
-         || sqlite3GlobalConfig.replication.xFrames
-         || sqlite3GlobalConfig.replication.xUndo
-         || sqlite3GlobalConfig.replication.xEnd
-    );
+  /* The WAL replication method argument can be set only if leader WAL
+  ** replication is enabled.
+  */
+  assert( pPager->pWalReplication!=0 || pPager->pWalReplicationArg==0 );
+
+  /* We require the database to be in WAL mode */
+  if( pPager->journalMode!=PAGER_JOURNALMODE_WAL ){
+    return SQLITE_ERROR;
+  }
+
+  if( bEnable ){
+    /* We require WAL replication to be currently disabled */
+    if( pPager->pWalReplication!=0 || pPager->bWalReplicationFollower==1 ){
+      return SQLITE_ERROR;
+    }
+    pPager->bWalReplicationFollower = pReplication == 0;
+    pPager->pWalReplication = pReplication;
+    pPager->pWalReplicationArg = pArg;
+
+    /* In follower mode we also need to manually open the WAL, since it
+    ** won't happen as consequence of regular pager operations.
+    */
+    if( pPager->bWalReplicationFollower && !pPager->pWal ){
+      rc = sqlite3WalOpen(pPager->pVfs,
+        pPager->fd, pPager->zWal, pPager->exclusiveMode,
+        pPager->journalSizeLimit, &pPager->pWal
+      );
+    }
   }else{
-    /* Passing a context is not legal for non-leader replication modes */
-    assert( !pCtx );
-  }
+    /* We require WAL replication to be currently enabled */
+    if( pPager->pWalReplication==0 && pPager->bWalReplicationFollower==0 ){
+      return SQLITE_ERROR;
+    }
 
-  /* Check the requested state transition is legal. */
-  switch( mode ){
-    case SQLITE_REPLICATION_LEADER: {
-      if( pPager->replicationMode!=SQLITE_REPLICATION_NONE ){
-        rc = SQLITE_ERROR;
-      }
-      break;
+    /* In follower mode we also need to manually close the WAL, since it
+    ** won't happen as consequence of regular pager operations.
+    */
+    if( pPager->bWalReplicationFollower ){
+      assert( pPager->pWal );
+      pTmp = (u8 *)pPager->pTmpSpace;
+      sqlite3WalClose(pPager->pWal, db, pPager->walSyncFlags, pPager->pageSize,
+          (db && (db->flags & SQLITE_NoCkptOnClose) ? 0 : pTmp)
+      );
+      pPager->pWal = 0;
     }
-    case SQLITE_REPLICATION_FOLLOWER: {
-      if( pPager->replicationMode!=SQLITE_REPLICATION_NONE ){
-        rc = SQLITE_ERROR;
-      }else if( !pPager->pWal ){
-        /* In follower mode we also need to manually open the WAL, since it
-        ** won't happen as consequence of regular pager operations.*/
-        rc = sqlite3WalOpen(pPager->pVfs,
-            pPager->fd, pPager->zWal, pPager->exclusiveMode,
-            pPager->journalSizeLimit, &pPager->pWal
-        );
-      }
-      break;
-    }
-    case SQLITE_REPLICATION_NONE: {
-      if( pPager->replicationMode!=SQLITE_REPLICATION_LEADER
-       && pPager->replicationMode!=SQLITE_REPLICATION_FOLLOWER ){
-        rc = SQLITE_ERROR;
-      }else{
-        /* In follower mode we also need to manually close the WAL, since it
-        ** won't happen as consequence of regular pager operations.*/
-        sqlite3WalClose(pPager->pWal, db, pPager->walSyncFlags, pPager->pageSize,
-            (db && (db->flags & SQLITE_NoCkptOnClose) ? 0 : pTmp)
-        );
-        pPager->pWal = 0;
-      }
-      break;
-    }
-  }
 
-  if( rc==SQLITE_OK ){
-    pPager->replicationMode = mode;
-    pPager->pReplicationCtx = pCtx;
+    pPager->bWalReplicationFollower = 0;
+    pPager->pWalReplication = 0;
+    pPager->pWalReplicationArg = 0;
   }
 
   return rc;
@@ -7823,28 +7913,33 @@ int sqlite3PagerReplicationModeSet(
 ** If the isBegin flag is true, also start a new WAL write transaction. If the
 ** commit flag true, also commit the transaction.
 **
-** This interface must be called only on connections in follower replication
-** mode (i.e. pPager->replicationMode is set to SQLITE_REPLICATION_FOLLOWER).
+** This interface must be called only on connections in follower WAL replication
+** mode (i.e. pPager->bWalReplicationFollower is set to 1).
 */
-int sqlite3PagerReplicationFrames(
+int sqlite3PagerWalReplicationFrames(
   Pager *pPager,
   int isBegin,
   int szPage,
-  int nList,
-  sqlite3_replication_page *pList,
+  int nFrame,
+  unsigned *aPgno,
+  void *aPage,
   unsigned nTruncate,
-  int isCommit,
-  int sync_flags
+  int isCommit
 ){
   int rc;
   int changed;
   int i;
-  sqlite3_replication_page *pNext;
-  PgHdr* pPgHdr;
-  int mode = sqlite3PagerReplicationModeGet(pPager);
+  PgHdr* pList;
 
-  /* Make sure we are in follower replication mode */
-  assert( mode==SQLITE_REPLICATION_FOLLOWER );
+  /* Make sure we are in follower WAL replication mode */
+  if( pPager->bWalReplicationFollower!=1 ){
+    return SQLITE_ERROR;
+  }
+
+  /* Make sure the page size matches the one set for this pager */
+  if( szPage!=pPager->pageSize ){
+    return SQLITE_ERROR;
+  }
 
   /* If the isBegin flag is on, start a new WAL write transaction */
   if( isBegin ){
@@ -7859,30 +7954,27 @@ int sqlite3PagerReplicationFrames(
 
   /* Create a buffer of nList page headers and link them together
   ** using the PgHdr->pDirty pointer. */
-  pNext = pList;
-  pPgHdr = (PgHdr*)sqlite3_malloc(sizeof(PgHdr) * (nList));
-  if( pPgHdr==0 ){
+  pList = (PgHdr*)sqlite3_malloc(sizeof(PgHdr) * (nFrame));
+  if( pList==0 ){
     return SQLITE_NOMEM_BKPT;
   }
-  for (i=0; i<nList; i++) {
+  for (i=0; i<nFrame; i++) {
     /* Initialize only the PgHdr fields that matter for sqlite3WalFrames, namely
     ** pData, pDirty, pgno and flags. */
-    pPgHdr->pData = pNext->pBuf;
-    pPgHdr->pDirty = i==nList-1 ? 0 : pPgHdr + 1;
-    pPgHdr->pgno = pNext->pgno;
-    pPgHdr->flags = pNext->flags;
-
-    pNext += 1;
-    pPgHdr += 1;
+    pList->pData = aPage + (pPager->pageSize * i);
+    pList->pDirty = i==nFrame-1 ? 0 : pList + 1;
+    pList->pgno = aPgno[i];
+    pList->flags = 0;
+    pList++;
   }
-  pPgHdr -= nList;
+  pList -= nFrame;
 
   /* Write the frames */
   rc = sqlite3WalFrames(pPager->pWal,
-      szPage, pPgHdr, nTruncate, isCommit, sync_flags);
+      pPager->pageSize, pList, nTruncate, isCommit, pPager->walSyncFlags);
 
   /* Free the page headers buffer */
-  sqlite3_free(pPgHdr);
+  sqlite3_free(pList);
 
   /* If the commit flag is on, also finalize the transaction */
   if( rc==SQLITE_OK && isCommit ){
@@ -7893,7 +7985,7 @@ int sqlite3PagerReplicationFrames(
   return rc;
 }
 
-/* No-op undo callback for follower replication mode */
+/* No-op undo callback for follower WAL replication mode */
 static int pagerNoopUndoCallback(void *pCtx, Pgno iPg) {
   return SQLITE_OK;
 }
@@ -7902,12 +7994,13 @@ static int pagerNoopUndoCallback(void *pCtx, Pgno iPg) {
 ** Undo WAL changes in the context of a replicated transaction, performing a
 ** rollback.
 */
-int sqlite3PagerReplicationUndo(Pager *pPager){
+int sqlite3PagerWalReplicationUndo(Pager *pPager){
   int rc;
-  int mode = sqlite3PagerReplicationModeGet(pPager);
 
   /* Make sure we are in follower replication mode */
-  assert( mode==SQLITE_REPLICATION_FOLLOWER );
+  if( pPager->bWalReplicationFollower!=1 ){
+    return SQLITE_ERROR;
+  }
 
   rc = sqlite3WalUndo(pPager->pWal, pagerNoopUndoCallback, (void *)pPager);
 
@@ -7922,17 +8015,17 @@ int sqlite3PagerReplicationUndo(Pager *pPager){
 /*
 ** Checkpoint a replicated WAL.
 */
-int sqlite3PagerReplicationCheckpoint(
+int sqlite3PagerWalReplicationCheckpoint(
   Pager *pPager,
   sqlite3 *db,
   int eMode,
   int *pnLog,
   int *pnCkpt
 ){
-  int mode = sqlite3PagerReplicationModeGet(pPager);
-
   /* Make sure we are in follower replication mode */
-  assert( mode==SQLITE_REPLICATION_FOLLOWER );
+  if( pPager->bWalReplicationFollower!=1 ){
+    return SQLITE_ERROR;
+  }
 
   return sqlite3WalCheckpoint(pPager->pWal, db, eMode,
       (eMode==SQLITE_CHECKPOINT_PASSIVE ? 0 : pPager->xBusyHandler),
@@ -7941,9 +8034,7 @@ int sqlite3PagerReplicationCheckpoint(
       pnLog, pnCkpt
   );
 }
-
-#endif /* SQLITE_ENABLE_REPLICATION */
-
+#endif /* SQLITE_ENABLE_WAL_REPLICATION */
 #endif /* !SQLITE_OMIT_WAL */
 
 #ifdef SQLITE_ENABLE_ZIPVFS

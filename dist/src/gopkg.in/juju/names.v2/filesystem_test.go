@@ -17,23 +17,31 @@ var _ = gc.Suite(&filesystemSuite{})
 
 func (s *filesystemSuite) TestFilesystemTag(c *gc.C) {
 	c.Assert(names.NewFilesystemTag("1").String(), gc.Equals, "filesystem-1")
+	c.Assert(names.NewFilesystemTag("0/lxc/0/0").String(), gc.Equals, "filesystem-0-lxc-0-0")
+	c.Assert(names.NewFilesystemTag("1/0").String(), gc.Equals, "filesystem-1-0")
+	c.Assert(names.NewFilesystemTag("some-unit/0/0").String(), gc.Equals, "filesystem-some-unit-0-0")
 }
 
 func (s *filesystemSuite) TestFilesystemIdValidity(c *gc.C) {
 	assertFilesystemIdValid(c, "0")
+	assertFilesystemIdValid(c, "0/0")
 	assertFilesystemIdValid(c, "0/lxc/0/0")
 	assertFilesystemIdValid(c, "1000")
+	assertFilesystemIdValid(c, "some-unit/0/0")
+	assertFilesystemIdValid(c, "some-unit/0/1000")
 	assertFilesystemIdInvalid(c, "-1")
 	assertFilesystemIdInvalid(c, "")
 	assertFilesystemIdInvalid(c, "one")
 	assertFilesystemIdInvalid(c, "#")
-	assertFilesystemIdInvalid(c, "0/0/0") // 0/0 is not a valid machine ID
+	assertFilesystemIdInvalid(c, "0/0/0") // 0/0 is not a valid machine or unit ID
 }
 
 func (s *filesystemSuite) TestParseFilesystemTag(c *gc.C) {
 	assertParseFilesystemTag(c, "filesystem-0", names.NewFilesystemTag("0"))
+	assertParseFilesystemTag(c, "filesystem-0-0", names.NewFilesystemTag("0/0"))
 	assertParseFilesystemTag(c, "filesystem-88", names.NewFilesystemTag("88"))
 	assertParseFilesystemTag(c, "filesystem-0-lxc-0-88", names.NewFilesystemTag("0/lxc/0/88"))
+	assertParseFilesystemTag(c, "filesystem-some-unit-0-88", names.NewFilesystemTag("some-unit/0/88"))
 	assertParseFilesystemTagInvalid(c, "", names.InvalidTagError("", ""))
 	assertParseFilesystemTagInvalid(c, "one", names.InvalidTagError("one", ""))
 	assertParseFilesystemTagInvalid(c, "filesystem-", names.InvalidTagError("filesystem-", names.FilesystemTagKind))
@@ -44,6 +52,7 @@ func (s *filesystemSuite) TestFilesystemMachine(c *gc.C) {
 	assertFilesystemMachine(c, "0/0", names.NewMachineTag("0"))
 	assertFilesystemMachine(c, "0/lxc/0/0", names.NewMachineTag("0/lxc/0"))
 	assertFilesystemNoMachine(c, "0")
+	assertFilesystemNoMachine(c, "some-unit/0/0")
 }
 
 func assertFilesystemMachine(c *gc.C, id string, expect names.MachineTag) {
@@ -54,6 +63,14 @@ func assertFilesystemMachine(c *gc.C, id string, expect names.MachineTag) {
 
 func assertFilesystemNoMachine(c *gc.C, id string) {
 	_, ok := names.FilesystemMachine(names.NewFilesystemTag(id))
+	c.Assert(ok, gc.Equals, false)
+}
+
+func (s *filesystemSuite) TestFilesystemUnit(c *gc.C) {
+	t, ok := names.FilesystemUnit(names.NewFilesystemTag("some-unit/0/0"))
+	c.Assert(ok, gc.Equals, true)
+	c.Assert(t, gc.Equals, names.NewUnitTag("some-unit/0"))
+	_, ok = names.FilesystemUnit(names.NewFilesystemTag("0/0"))
 	c.Assert(ok, gc.Equals, false)
 }
 

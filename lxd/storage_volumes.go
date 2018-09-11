@@ -21,6 +21,27 @@ import (
 	log "github.com/lxc/lxd/shared/log15"
 )
 
+var storagePoolVolumesCmd = Command{
+	name: "storage-pools/{name}/volumes",
+	get:  storagePoolVolumesGet,
+	post: storagePoolVolumesPost,
+}
+
+var storagePoolVolumesTypeCmd = Command{
+	name: "storage-pools/{name}/volumes/{type}",
+	get:  storagePoolVolumesTypeGet,
+	post: storagePoolVolumesTypePost,
+}
+
+var storagePoolVolumeTypeCmd = Command{
+	name:   "storage-pools/{pool}/volumes/{type}/{name:.*}",
+	post:   storagePoolVolumeTypePost,
+	get:    storagePoolVolumeTypeGet,
+	put:    storagePoolVolumeTypePut,
+	patch:  storagePoolVolumeTypePatch,
+	delete: storagePoolVolumeTypeDelete,
+}
+
 // /1.0/storage-pools/{name}/volumes
 // List all storage volumes attached to a given storage pool.
 func storagePoolVolumesGet(d *Daemon, r *http.Request) Response {
@@ -66,8 +87,6 @@ func storagePoolVolumesGet(d *Daemon, r *http.Request) Response {
 
 	return SyncResponse(true, volumes)
 }
-
-var storagePoolVolumesCmd = Command{name: "storage-pools/{name}/volumes", get: storagePoolVolumesGet}
 
 // /1.0/storage-pools/{name}/volumes/{type}
 // List all storage volumes of a given volume type for a given storage pool.
@@ -138,7 +157,7 @@ func storagePoolVolumesTypeGet(d *Daemon, r *http.Request) Response {
 }
 
 // /1.0/storage-pools/{name}/volumes/{type}
-// Create a storage volume of a given volume type in a given storage pool.
+// Create a storage volume in a given storage pool.
 func storagePoolVolumesTypePost(d *Daemon, r *http.Request) Response {
 	response := ForwardedResponseIfTargetIsRemote(d, r)
 	if response != nil {
@@ -162,11 +181,7 @@ func storagePoolVolumesTypePost(d *Daemon, r *http.Request) Response {
 		return BadRequest(fmt.Errorf("Storage volume names may not contain slashes"))
 	}
 
-	// Check that the user gave use a storage volume type for the storage
-	// volume we are about to create.
-	if req.Type == "" {
-		return BadRequest(fmt.Errorf("you must provide a storage volume type of the storage volume"))
-	}
+	req.Type = mux.Vars(r)["type"]
 
 	// We currently only allow to create storage volumes of type
 	// storagePoolVolumeTypeCustom. So check, that nothing else was
@@ -218,12 +233,66 @@ func doVolumeCreateOrCopy(d *Daemon, poolName string, req *api.StorageVolumesPos
 	}
 
 	return OperationResponse(op)
+
+}
+
+// /1.0/storage-pools/{name}/volumes/{type}
+// Create a storage volume of a given volume type in a given storage pool.
+func storagePoolVolumesPost(d *Daemon, r *http.Request) Response {
+	response := ForwardedResponseIfTargetIsRemote(d, r)
+	if response != nil {
+		return response
+	}
+
+	req := api.StorageVolumesPost{}
+
+	// Parse the request.
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		return BadRequest(err)
+	}
+
+	// Sanity checks.
+	if req.Name == "" {
+		return BadRequest(fmt.Errorf("No name provided"))
+	}
+
+	if strings.Contains(req.Name, "/") {
+		return BadRequest(fmt.Errorf("Storage volume names may not contain slashes"))
+	}
+
+	// Check that the user gave use a storage volume type for the storage
+	// volume we are about to create.
+	if req.Type == "" {
+		return BadRequest(fmt.Errorf("You must provide a storage volume type of the storage volume"))
+	}
+
+	// We currently only allow to create storage volumes of type
+	// storagePoolVolumeTypeCustom. So check, that nothing else was
+	// requested.
+	if req.Type != storagePoolVolumeTypeNameCustom {
+		return BadRequest(fmt.Errorf(`Currently not allowed to create `+
+			`storage volumes of type %s`, req.Type))
+	}
+
+	poolName := mux.Vars(r)["name"]
+
+	switch req.Source.Type {
+	case "":
+		return doVolumeCreateOrCopy(d, poolName, &req)
+	case "copy":
+		return doVolumeCreateOrCopy(d, poolName, &req)
+	case "migration":
+		return doVolumeMigration(d, poolName, &req)
+	default:
+		return BadRequest(fmt.Errorf("unknown source type %s", req.Source.Type))
+	}
 }
 
 func doVolumeMigration(d *Daemon, poolName string, req *api.StorageVolumesPost) Response {
 	// Validate migration mode
 	if req.Source.Mode != "pull" && req.Source.Mode != "push" {
-		return NotImplemented
+		return NotImplemented(fmt.Errorf("Mode '%s' not implemented", req.Source.Mode))
 	}
 
 	storage, err := storagePoolVolumeDBCreateInternal(d.State(), poolName, req)
@@ -299,8 +368,6 @@ func doVolumeMigration(d *Daemon, poolName string, req *api.StorageVolumesPost) 
 
 	return OperationResponse(op)
 }
-
-var storagePoolVolumesTypeCmd = Command{name: "storage-pools/{name}/volumes/{type}", get: storagePoolVolumesTypeGet, post: storagePoolVolumesTypePost}
 
 // /1.0/storage-pools/{name}/volumes/{type}/{name}
 // Rename a storage volume of a given volume type in a given storage pool.
@@ -418,8 +485,10 @@ func storagePoolVolumeTypePost(d *Daemon, r *http.Request) Response {
 	// Check that the name isn't already in use.
 	_, err = d.cluster.StoragePoolNodeVolumeGetTypeID(req.Name,
 		storagePoolVolumeTypeCustom, poolID)
-	if err == nil || err != nil && err != db.ErrNoSuchObject {
-		return Conflict
+	if err == nil {
+		return Conflict(fmt.Errorf("Name '%s' already in use", req.Name))
+	} else if err != nil && err != db.ErrNoSuchObject {
+		return Conflict(err)
 	}
 
 	doWork := func() error {
@@ -758,7 +827,7 @@ func storagePoolVolumeTypeDelete(d *Daemon, r *http.Request) Response {
 
 	s, err := storagePoolVolumeInit(d.State(), poolName, volumeName, volumeType)
 	if err != nil {
-		return NotFound
+		return NotFound(err)
 	}
 
 	switch volumeType {
@@ -777,5 +846,3 @@ func storagePoolVolumeTypeDelete(d *Daemon, r *http.Request) Response {
 
 	return EmptySyncResponse
 }
-
-var storagePoolVolumeTypeCmd = Command{name: "storage-pools/{pool}/volumes/{type}/{name:.*}", post: storagePoolVolumeTypePost, get: storagePoolVolumeTypeGet, put: storagePoolVolumeTypePut, patch: storagePoolVolumeTypePatch, delete: storagePoolVolumeTypeDelete}

@@ -88,12 +88,13 @@ func createFromImage(d *Daemon, req *api.ContainersPost) Response {
 
 	run := func(op *operation) error {
 		args := db.ContainerArgs{
-			Config:    req.Config,
-			Ctype:     db.CTypeRegular,
-			Devices:   req.Devices,
-			Ephemeral: req.Ephemeral,
-			Name:      req.Name,
-			Profiles:  req.Profiles,
+			Config:      req.Config,
+			Ctype:       db.CTypeRegular,
+			Description: req.Description,
+			Devices:     req.Devices,
+			Ephemeral:   req.Ephemeral,
+			Name:        req.Name,
+			Profiles:    req.Profiles,
 		}
 
 		var info *api.Image
@@ -137,12 +138,13 @@ func createFromImage(d *Daemon, req *api.ContainersPost) Response {
 
 func createFromNone(d *Daemon, req *api.ContainersPost) Response {
 	args := db.ContainerArgs{
-		Config:    req.Config,
-		Ctype:     db.CTypeRegular,
-		Devices:   req.Devices,
-		Ephemeral: req.Ephemeral,
-		Name:      req.Name,
-		Profiles:  req.Profiles,
+		Config:      req.Config,
+		Ctype:       db.CTypeRegular,
+		Description: req.Description,
+		Devices:     req.Devices,
+		Ephemeral:   req.Ephemeral,
+		Name:        req.Name,
+		Profiles:    req.Profiles,
 	}
 
 	if req.Architecture != "" {
@@ -172,7 +174,7 @@ func createFromNone(d *Daemon, req *api.ContainersPost) Response {
 func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 	// Validate migration mode
 	if req.Source.Mode != "pull" && req.Source.Mode != "push" {
-		return NotImplemented
+		return NotImplemented(fmt.Errorf("Mode '%s' not implemented", req.Source.Mode))
 	}
 
 	var c container
@@ -190,6 +192,7 @@ func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 		Config:       req.Config,
 		Ctype:        db.CTypeRegular,
 		Devices:      req.Devices,
+		Description:  req.Description,
 		Ephemeral:    req.Ephemeral,
 		Name:         req.Name,
 		Profiles:     req.Profiles,
@@ -245,13 +248,13 @@ func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 		}
 	}
 
-	logger.Debugf("No valid storage pool in the container's local root disk device and profiles found.")
+	logger.Debugf("No valid storage pool in the container's local root disk device and profiles found")
 	// If there is just a single pool in the database, use that
 	if storagePool == "" {
 		pools, err := d.cluster.StoragePools()
 		if err != nil {
 			if err == db.ErrNoSuchObject {
-				return BadRequest(fmt.Errorf("This LXD instance does not have any storage pools configured."))
+				return BadRequest(fmt.Errorf("This LXD instance does not have any storage pools configured"))
 			}
 			return SmartError(err)
 		}
@@ -313,7 +316,7 @@ func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 		}
 	} else {
 		// Retrieve the future storage pool
-		cM, err := containerLXCLoad(d.State(), args)
+		cM, err := containerLXCLoad(d.State(), args, nil)
 		if err != nil {
 			return InternalError(err)
 		}
@@ -324,7 +327,7 @@ func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 		}
 
 		if rootDiskDevice["pool"] == "" {
-			return BadRequest(fmt.Errorf("The container's root device is missing the pool property."))
+			return BadRequest(fmt.Errorf("The container's root device is missing the pool property"))
 		}
 
 		storagePool = rootDiskDevice["pool"]
@@ -502,6 +505,7 @@ func createFromCopy(d *Daemon, req *api.ContainersPost) Response {
 		BaseImage:    req.Source.BaseImage,
 		Config:       req.Config,
 		Ctype:        db.CTypeRegular,
+		Description:  req.Description,
 		Devices:      req.Devices,
 		Ephemeral:    req.Ephemeral,
 		Name:         req.Name,
@@ -578,7 +582,7 @@ func containersPost(d *Daemon, r *http.Request) Response {
 	// If no storage pool is found, error out.
 	pools, err := d.cluster.StoragePools()
 	if err != nil || len(pools) == 0 {
-		return BadRequest(fmt.Errorf("No storage pool found. Please create a new storage pool."))
+		return BadRequest(fmt.Errorf("No storage pool found. Please create a new storage pool"))
 	}
 
 	if req.Name == "" {

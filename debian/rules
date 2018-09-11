@@ -13,8 +13,10 @@ export DH_GOPKG := github.com/lxc/lxd
 export GOPATH := $(CURDIR)/obj-$(DEB_BUILD_GNU_TYPE)
 export USE_EMBEDDED := true
 export USE_SHLIBS := false
-export CGO_LDFLAGS=-L$(CURDIR)/dist/sqlite/.libs/
-export CGO_CFLAGS=-I$(CURDIR)/dist/sqlite/
+
+# Handled sqlite/dqlite custom libraries
+export CGO_LDFLAGS=-L$(CURDIR)/dist/sqlite/.libs/ -L$(CURDIR)/dist/dqlite/.libs/
+export CGO_CFLAGS=-I$(CURDIR)/dist/sqlite/ -I$(CURDIR)/dist/dqlite/include/
 
 ifeq ($(USE_SHLIBS), true)
 export DH_GOLANG_LINK_SHARED := 1
@@ -25,7 +27,17 @@ endif
 
 override_dh_auto_build:
 	# Build our own sqlite3
-	cd dist/sqlite && ./configure --enable-replication && make
+	cd dist/sqlite && \
+		./configure --enable-replication --disable-amalgation --disable-tcl && \
+		make
+
+	# And build dqlite
+	cd dist/dqlite && \
+		autoreconf -i && \
+		PKG_CONFIG_PATH="$(CURDIR)/dist/sqlite/" ./configure && \
+		sed -i 's|^hardcode_libdir_flag_spec=.*|hardcode_libdir_flag_spec=""|g' libtool && \
+		sed -i 's|^runpath_var=LD_RUN_PATH|runpath_var=DIE_RPATH_DIE|g' libtool && \
+		make CFLAGS="-I$(CURDIR)/dist/sqlite/" LDFLAGS="-L$(CURDIR)/dist/sqlite/.libs"
 
 	# And then build using it
 	dh_auto_build -- -tags libsqlite3
@@ -97,7 +109,7 @@ override_dh_install:
 	help2man $(PKGDIR)/usr/bin/fuidshift -n "uid/gid shifter" --no-info > $(PKGDIR)/usr/share/man/man1/fuidshift.1
 	help2man $(PKGDIR)/usr/bin/lxc-to-lxd -n "Convert LXC containers to LXD" --no-info --version-string=$(VERSION) > $(PKGDIR)/usr/share/man/man1/lxc-to-lxd.1
 	help2man $(PKGDIR)/usr/bin/lxd-benchmark -n "The container lightervisor - benchmark" --no-info --no-discard-stderr > $(PKGDIR)/usr/share/man/man1/lxd-benchmark.1
-	$(PKGDIR)/usr/bin/lxd manpage $(PKGDIR)/usr/share/man/man1/
+	LD_LIBRARY_PATH=$(PKGDIR)/dist/sqlite/.libs/:$(CURDIR)/dist/dqlite/.libs/:${LD_LIBRARY_PATH} $(PKGDIR)/usr/bin/lxd manpage $(PKGDIR)/usr/share/man/man1/
 	$(PKGDIR)/usr/bin/lxc manpage $(PKGDIR)/usr/share/man/man1/
 
 	# Install bash completion scripts
@@ -122,16 +134,20 @@ override_dh_install:
 	mkdir -p $(PKGDIR)/etc/sysctl.d
 	cp debian/lxd.sysctl $(PKGDIR)/etc/sysctl.d/10-lxd-inotify.conf
 
-	# Include wrappers and sqlite3 library
+	# Include wrappers, sqlite3 and dqlite libraries
 	mkdir -p $(PKGDIR)/usr/lib/lxd/
 	mv $(PKGDIR)/usr/bin/lxd $(PKGDIR)/usr/lib/lxd/
 	cp debian/wrappers/lxd $(PKGDIR)/usr/bin/
 	cp debian/wrappers/shutdown $(PKGDIR)/usr/lib/lxd/
 	cp debian/wrappers/upgrade-bridge $(PKGDIR)/usr/lib/lxd/
 	cp dist/sqlite/.libs/libsqlite3.so.0* $(PKGDIR)/usr/lib/lxd/
+	cp dist/dqlite/.libs/libdqlite.so.0* $(PKGDIR)/usr/lib/lxd/
 
 	# Trigger normal dh_install
 	dh_install
+
+override_dh_shlibdeps:
+	LD_LIBRARY_PATH=$(PKGDIR)/usr/lib/lxd/:${LD_LIBRARY_PATH} dh_shlibdeps -v
 
 override_dh_installinit:
 	# Disable upstart integration on artful+

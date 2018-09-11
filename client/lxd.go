@@ -34,7 +34,7 @@ type ProtocolLXD struct {
 	httpUserAgent   string
 
 	bakeryClient         *httpbakery.Client
-	bakeryInteractor     httpbakery.Interactor
+	bakeryInteractor     []httpbakery.Interactor
 	requireAuthenticated bool
 
 	clusterTarget string
@@ -121,7 +121,7 @@ func (r *ProtocolLXD) RawOperation(method string, path string, data interface{},
 }
 
 // Internal functions
-func (r *ProtocolLXD) parseResponse(resp *http.Response) (*api.Response, string, error) {
+func lxdParseResponse(resp *http.Response) (*api.Response, string, error) {
 	// Get the ETag
 	etag := resp.Header.Get("ETag")
 
@@ -221,14 +221,30 @@ func (r *ProtocolLXD) rawQuery(method string, url string, data interface{}, ETag
 	}
 	defer resp.Body.Close()
 
-	return r.parseResponse(resp)
+	return lxdParseResponse(resp)
 }
 
 func (r *ProtocolLXD) query(method string, path string, data interface{}, ETag string) (*api.Response, string, error) {
 	// Generate the URL
 	url := fmt.Sprintf("%s/1.0%s", r.httpHost, path)
 
-	return r.rawQuery(method, url, data, ETag)
+	// Parse the full URI
+	fields, err := neturl.Parse(url)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Extract query fields and update for cluster targeting
+	values := fields.Query()
+	if r.clusterTarget != "" {
+		if values.Get("target") == "" {
+			values.Set("target", r.clusterTarget)
+		}
+	}
+	fields.RawQuery = values.Encode()
+
+	// Run the actual query
+	return r.rawQuery(method, fields.String(), data, ETag)
 }
 
 func (r *ProtocolLXD) queryStruct(method string, path string, data interface{}, ETag string, target interface{}) (string, error) {
@@ -350,6 +366,8 @@ func (r *ProtocolLXD) setupBakeryClient() {
 	r.bakeryClient = httpbakery.NewClient()
 	r.bakeryClient.Client = r.http
 	if r.bakeryInteractor != nil {
-		r.bakeryClient.AddInteractor(r.bakeryInteractor)
+		for _, interactor := range r.bakeryInteractor {
+			r.bakeryClient.AddInteractor(interactor)
+		}
 	}
 }

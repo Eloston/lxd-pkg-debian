@@ -178,9 +178,9 @@ func (s *execWs) Do(op *operation) error {
 					// If an abnormal closure occurred, kill the attached process.
 					err := syscall.Kill(attachedChildPid, syscall.SIGKILL)
 					if err != nil {
-						logger.Debugf("Failed to send SIGKILL to pid %d.", attachedChildPid)
+						logger.Debugf("Failed to send SIGKILL to pid %d", attachedChildPid)
 					} else {
-						logger.Debugf("Sent SIGKILL to pid %d.", attachedChildPid)
+						logger.Debugf("Sent SIGKILL to pid %d", attachedChildPid)
 					}
 					return
 				}
@@ -218,10 +218,10 @@ func (s *execWs) Do(op *operation) error {
 					}
 				} else if command.Command == "signal" {
 					if err := syscall.Kill(attachedChildPid, syscall.Signal(command.Signal)); err != nil {
-						logger.Debugf("Failed forwarding signal '%s' to PID %d.", command.Signal, attachedChildPid)
+						logger.Debugf("Failed forwarding signal '%d' to PID %d", command.Signal, attachedChildPid)
 						continue
 					}
-					logger.Debugf("Forwarded signal '%d' to PID %d.", command.Signal, attachedChildPid)
+					logger.Debugf("Forwarded signal '%d' to PID %d", command.Signal, attachedChildPid)
 				}
 			}
 		}()
@@ -367,11 +367,11 @@ func containerExecPost(d *Daemon, r *http.Request) Response {
 	}
 
 	if !c.IsRunning() {
-		return BadRequest(fmt.Errorf("Container is not running."))
+		return BadRequest(fmt.Errorf("Container is not running"))
 	}
 
 	if c.IsFrozen() {
-		return BadRequest(fmt.Errorf("Container is frozen."))
+		return BadRequest(fmt.Errorf("Container is frozen"))
 	}
 
 	env := map[string]string{}
@@ -498,7 +498,7 @@ func containerExecPost(d *Daemon, r *http.Request) Response {
 
 		err = op.UpdateMetadata(metadata)
 		if err != nil {
-			logger.Error("error updating metadata for cmd", log.Ctx{"err": err, "cmd": post.Command})
+			logger.Error("Error updating metadata for cmd", log.Ctx{"err": err, "cmd": post.Command})
 		}
 
 		return cmdErr

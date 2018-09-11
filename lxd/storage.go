@@ -407,7 +407,7 @@ func storagePoolVolumeAttachInit(s *state.State, poolName string, volumeName str
 	if poolVolumePut.Config["volatile.idmap.last"] != "" {
 		lastIdmap, err = idmapsetFromString(poolVolumePut.Config["volatile.idmap.last"])
 		if err != nil {
-			logger.Errorf("failed to unmarshal last idmapping: %s", poolVolumePut.Config["volatile.idmap.last"])
+			logger.Errorf("Failed to unmarshal last idmapping: %s", poolVolumePut.Config["volatile.idmap.last"])
 			return nil, err
 		}
 	}
@@ -478,14 +478,20 @@ func storagePoolVolumeAttachInit(s *state.State, poolName string, volumeName str
 			defer func() {
 				_, err := st.StoragePoolVolumeUmount()
 				if err != nil {
-					logger.Warnf("failed to unmount storage volume")
+					logger.Warnf("Failed to unmount storage volume")
 				}
 			}()
 		}
 
 		// unshift rootfs
 		if lastIdmap != nil {
-			err := lastIdmap.UnshiftRootfs(remapPath)
+			var err error
+
+			if st.GetStorageType() == storageTypeZfs {
+				err = lastIdmap.UnshiftRootfs(remapPath, zfsIdmapSetSkipper)
+			} else {
+				err = lastIdmap.UnshiftRootfs(remapPath, nil)
+			}
 			if err != nil {
 				logger.Errorf("Failed to unshift \"%s\"", remapPath)
 				return nil, err
@@ -495,7 +501,13 @@ func storagePoolVolumeAttachInit(s *state.State, poolName string, volumeName str
 
 		// shift rootfs
 		if nextIdmap != nil {
-			err := nextIdmap.ShiftRootfs(remapPath)
+			var err error
+
+			if st.GetStorageType() == storageTypeZfs {
+				err = nextIdmap.ShiftRootfs(remapPath, zfsIdmapSetSkipper)
+			} else {
+				err = nextIdmap.ShiftRootfs(remapPath, nil)
+			}
 			if err != nil {
 				logger.Errorf("Failed to shift \"%s\"", remapPath)
 				return nil, err
@@ -816,10 +828,10 @@ func SetupStorageDriver(s *state.State, forceCheck bool) error {
 	pools, err := s.Cluster.StoragePoolsNotPending()
 	if err != nil {
 		if err == db.ErrNoSuchObject {
-			logger.Debugf("No existing storage pools detected.")
+			logger.Debugf("No existing storage pools detected")
 			return nil
 		}
-		logger.Debugf("Failed to retrieve existing storage pools.")
+		logger.Debugf("Failed to retrieve existing storage pools")
 		return err
 	}
 
@@ -836,17 +848,17 @@ func SetupStorageDriver(s *state.State, forceCheck bool) error {
 		}
 
 		if !shared.StringInSlice("storage_api", appliedPatches) {
-			logger.Warnf("Incorrectly applied \"storage_api\" patch. Skipping storage pool initialization as it might be corrupt.")
+			logger.Warnf("Incorrectly applied \"storage_api\" patch, skipping storage pool initialization as it might be corrupt")
 			return nil
 		}
 
 	}
 
 	for _, pool := range pools {
-		logger.Debugf("Initializing and checking storage pool \"%s\".", pool)
+		logger.Debugf("Initializing and checking storage pool \"%s\"", pool)
 		s, err := storagePoolInit(s, pool)
 		if err != nil {
-			logger.Errorf("Error initializing storage pool \"%s\": %s. Correct functionality of the storage pool cannot be guaranteed.", pool, err)
+			logger.Errorf("Error initializing storage pool \"%s\": %s, correct functionality of the storage pool cannot be guaranteed", pool, err)
 			continue
 		}
 

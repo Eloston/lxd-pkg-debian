@@ -1,0 +1,718 @@
+# 2018 February 15
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# This file implements regression tests for SQLite library. The focus
+# of this file are the sqlite3_wal_replication_xxx() APIs.
+#
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+ifcapable !wal_replication {finish_test; return}
+set testprefix walreplication
+
+proc sqlite3_wal {args} {
+  [lindex $args 0] eval { PRAGMA page_size = 1024 }
+  [lindex $args 0] eval { PRAGMA journal_mode = wal }
+}
+
+proc reset_db2 {} {
+  catch {db2 close}
+  forcedelete test2.db
+  forcedelete test2.db-journal
+  forcedelete test2.db-wal
+  sqlite3 db2 ./test2.db
+}
+
+#----------------------------------------------------------------------------
+# The following block of tests - walreplication-1.* - focus on testing the
+# implementation of the sqlite3_wal_replication_find(),
+# sqlite3_wal_replication_register() and sqlite3_wal_replication_unregister()
+# interfaces.
+
+# Test that by default no WAL replication implementation is registered.
+#
+do_test 1.1 {
+  sqlite3_wal_replication_find
+} {}
+
+# Test registering the stub WAL replication implementation. Since it's the first
+# implementation registered, it becomes the default even if the default flag is
+# off.
+#
+do_test 1.2.1 {
+  sqlite3_wal_replication_register 0
+  sqlite3_wal_replication_find
+} {test}
+do_test 1.2.2 {
+  sqlite3_wal_replication_find test
+} {test}
+
+# Test registering again the stub WAL replication implementation.
+#
+do_test 1.3.1 {
+  sqlite3_wal_replication_register 0
+  sqlite3_wal_replication_find
+} {test}
+do_test 1.3.2 {
+  sqlite3_wal_replication_find test
+} {test}
+
+# Test registering one more time the stub WAL replication implementation, with
+# the default flag on.
+#
+do_test 1.4.1 {
+  sqlite3_wal_replication_register 1
+  sqlite3_wal_replication_find
+} {test}
+do_test 1.4.2 {
+  sqlite3_wal_replication_find test
+} {test}
+
+# Test registering the alternate stub WAL replication implementation, with the
+# default flag off.
+#
+do_test 1.5.1 {
+  sqlite3_wal_replication_register 0 1
+  sqlite3_wal_replication_find
+} {test}
+do_test 1.5.2 {
+  sqlite3_wal_replication_find test-alt
+} {test-alt}
+
+# Test registering again the alternate stub WAL replication implementation, with
+# the default flag on.
+#
+do_test 1.6.1 {
+  sqlite3_wal_replication_register 1 1
+  sqlite3_wal_replication_find
+} {test-alt}
+do_test 1.6.2 {
+  sqlite3_wal_replication_find test-alt
+} {test-alt}
+do_test 1.6.3 {
+  sqlite3_wal_replication_find test
+} {test}
+
+# Test unregistering the alternate stub WAL replication implementation. The
+# other one becomes the new default.
+#
+do_test 1.7.1 {
+  sqlite3_wal_replication_unregister 1
+  sqlite3_wal_replication_find test-alt
+} {}
+do_test 1.7.2 {
+  sqlite3_wal_replication_find
+} {test}
+
+# Test unregistering the stub WAL replication implementation. No registered
+# implementation is left.
+#
+do_test 1.8.1 {
+  sqlite3_wal_replication_unregister
+  sqlite3_wal_replication_find test
+} {}
+do_test 1.8.2 {
+  sqlite3_wal_replication_find
+} {}
+
+#-------------------------------------------------------------------------
+# The following block of tests - walreplication-2.* - focus on testing the
+# implementation of the sqlite3_wal_replication_enabled() interface.
+
+# Test that an error is returned if the database is not in WAL mode.
+#
+do_test 2.1 {
+  execsql { PRAGMA journal_mode = DELETE }
+  list [catch {sqlite3_wal_replication_enabled db main} msg] $msg
+} {1 SQLITE_ERROR}
+
+# Test that an error is returned if the given schema name does not exist.
+#
+do_test 2.2 {
+  list [catch {sqlite3_wal_replication_enabled db garbage} msg] $msg
+} {1 SQLITE_ERROR}
+
+# Test that by default no WAL synchronous replication is enabled.
+#
+do_test 2.3 {
+  reset_db
+  sqlite3_wal db
+  sqlite3_wal_replication_enabled db main
+} {false}
+
+#-------------------------------------------------------------------------
+# The following block of tests - walreplication-3.* - focus on testing the
+# implementation of the sqlite3_wal_replication_leader() interface.
+
+# Test that an error is returned if the database is not in WAL mode.
+#
+do_test 3.1 {
+  reset_db
+  execsql { PRAGMA journal_mode = DELETE }
+  list [catch {sqlite3_wal_replication_leader db main} msg] $msg
+} {1 SQLITE_ERROR}
+
+# Test that an error is returned if the given schema name is invalid.
+#
+do_test 3.2 {
+  list [catch {sqlite3_wal_replication_leader db garbage} msg] $msg
+} {1 SQLITE_ERROR}
+
+# Test that an error is returned if the given WAL replication name is not
+# registered
+#
+do_test 3.3 {
+  reset_db
+  sqlite3_wal db
+  list [catch {sqlite3_wal_replication_leader db main garbage} msg] $msg
+} {1 SQLITE_ERROR}
+
+# Test that leader WAL replication is enabled after a successful call.
+#
+do_test 3.4 {
+  sqlite3_wal_replication_register 1
+  sqlite3_wal_replication_leader db main
+  sqlite3_wal_replication_enabled db main
+} {true test}
+
+# Test that trying to enable leader replication twice for the same
+# database results in an error.
+#
+do_test 3.5 {
+  list [catch {sqlite3_wal_replication_leader db main} msg] $msg
+} {1 SQLITE_ERROR}
+
+# Test that an error is returned if the connection is currently configured for
+# follower WAL replication.
+#
+do_test 3.6 {
+  reset_db
+  sqlite3_wal db
+  sqlite3_wal_replication_follower db main
+  list [catch {sqlite3_wal_replication_leader db main} msg] $msg
+} {1 SQLITE_ERROR}
+
+# Test that a connection in leader replication mode works transparently from the
+# user point of view, and that regular write queries and rollbacks can be
+# performed.
+#
+do_test 3.7.1 {
+  reset_db
+  sqlite3_wal db
+  sqlite3_wal_replication_leader db main
+  execsql {
+    CREATE TABLE test (n INT);
+    INSERT INTO test(n) VALUES(1);
+    SELECT n FROM test;
+  }
+} {1}
+do_test 3.7.2 {
+  execsql {
+    BEGIN;
+    INSERT INTO test(n) VALUES(2);
+    ROLLBACK;
+    SELECT n FROM test;
+  }
+} {1}
+
+# Test that checkpoint-on-close is disabled for leader connections.
+#
+do_test 3.8 {
+  db close
+  file exists test.db-wal
+} {1}
+
+#-------------------------------------------------------------------------
+# The following block of tests - walreplication-4.* - focus on testing the
+# implementation of the sqlite3_wal_replication_follower() interface.
+
+# Test that an error is returned if the database is not in WAL mode.
+#
+do_test 4.1 {
+  reset_db
+  execsql { PRAGMA journal_mode = DELETE }
+  list [catch {sqlite3_wal_replication_follower db main} msg] $msg
+} {1 SQLITE_ERROR}
+
+# Test that an error is returned if the given schema name is invalid.
+#
+do_test 4.2 {
+  reset_db
+  list [catch {sqlite3_wal_replication_follower db garbage} msg] $msg
+} {1 SQLITE_ERROR}
+
+# Test that follower WAL replication is enabled after a successful call.
+#
+do_test 4.3 {
+  reset_db
+  sqlite3_wal db
+  sqlite3_wal_replication_follower db main
+  sqlite3_wal_replication_enabled db main
+} {true}
+
+# Test that trying to enable follower replication twice for the same
+# database results in an error.
+#
+do_test 4.4 {
+  list [catch {sqlite3_wal_replication_follower db main} msg] $msg
+} {1 SQLITE_ERROR}
+
+# Test that an error is returned if leader WAL replication is enabled.
+#
+do_test 4.5 {
+  reset_db
+  sqlite3_wal db
+  sqlite3_wal_replication_leader db main
+  list [catch {sqlite3_wal_replication_follower db main} msg] $msg
+} {1 SQLITE_ERROR}
+
+# Test that an error is returned when trying to perform a backup in follower WAL
+# replication mode.
+#
+do_test 4.6 {
+  reset_db
+  sqlite3_wal db
+  execsql { CREATE TABLE test (n INT) }
+  sqlite3_wal_replication_follower db main
+  catch { db2 close }
+  sqlite3 db2 test2.db
+  list [catch {sqlite3_backup B db2 main db main} msg] $msg
+} {1 {sqlite3_backup_init() failed}}
+
+# Test that checkpoint-on-close is disabled for follower connections.
+#
+do_test 4.7 {
+  db close
+  file exists test.db-wal
+} {1}
+
+# Test that an error is returned when trying to perform a query on a connection
+# in follower WAL replication mode.
+#
+do_test 4.8.1 {
+  reset_db
+  sqlite3_wal db
+  sqlite3_wal_replication_follower db main
+  list [catch {db eval {SELECT 1}} msg] $msg
+} {1 {database is in follower replication mode: main}}
+do_test 4.8.2 {
+  # if the connection that is set back to no replication, it can perform queries
+  # again.
+  sqlite3_wal_replication_none db main
+  execsql {SELECT 1}
+} {1}
+
+#-------------------------------------------------------------------------
+# The following block of tests - walreplication-5.* - focus on testing the
+# implementation of the sqlite3_wal_replication_none() interface.
+
+# Test that an error is returned if the database is not in WAL mode.
+#
+do_test 5.1 {
+  reset_db
+  execsql { PRAGMA journal_mode = DELETE }
+  list [catch {sqlite3_wal_replication_none db main} msg] $msg
+} {1 SQLITE_ERROR}
+
+# Test that an error is returned if the given schema name is invalid.
+#
+do_test 5.2 {
+  list [catch {sqlite3_wal_replication_none db garbage} msg] $msg
+} {1 SQLITE_ERROR}
+
+# Test that an error is returned if the connection hasn't been configured for
+# either leader or follower WAL replication.
+#
+do_test 5.3 {
+  reset_db
+  sqlite3_wal db
+  list [catch {sqlite3_wal_replication_none db main} msg] $msg
+} {1 SQLITE_ERROR}
+
+# Test that a connection can be set back to no replication after it
+# was set to leader replication.
+#
+do_test 5.4 {
+  reset_db
+  sqlite3_wal db
+  sqlite3_wal_replication_leader db main
+  sqlite3_wal_replication_none db main
+  sqlite3_wal_replication_enabled db main
+} {false}
+
+# Test that a connection can be set back to no replication after it
+# was set to follower replication.
+#
+do_test 5.5 {
+  reset_db
+  sqlite3_wal db
+  sqlite3_wal_replication_follower db main
+  sqlite3_wal_replication_none db main
+  sqlite3_wal_replication_enabled db main
+} {false}
+
+#-------------------------------------------------------------------------
+# The following block of tests - walreplication-6.* - focus on testing the
+# implementation of the sqlite3_replication_frames() and
+# sqlite3_replication_undo() interfaces, by running them against follower
+# connection using the test WAL replication implementation.
+
+# Test that replicated transactions work transparently from the leader
+# connection user's point of view, and that WAL frames are replicated to
+# the leader connection.
+#
+do_test 6.1.1 {
+  reset_db
+  reset_db2
+  sqlite3_wal db
+  sqlite3_wal db2
+  sqlite3_wal_replication_leader db main
+  sqlite3_wal_replication_follower db2 main
+  execsql {
+    CREATE TABLE test (n INT);
+    INSERT INTO test(n) VALUES(1);
+    SELECT n FROM test;
+  }
+} {1}
+do_test 6.1.2 {
+  db close
+  db2 close
+
+  # checkpoint-on-close is disabled for both leader and follower
+  # connections
+  file exists test.db-wal
+  file exists test2.db-wal
+
+  # the content of the WAL is replicated to the follower
+  # connection
+  #
+  set size1 [file size test.db-wal]
+  set size2 [file size test2.db-wal]
+
+  expr {$size1 > 0 && $size1 == $size2 }
+} {1}
+do_test 6.1.3 {
+  # the replicated database contains the expected data
+  sqlite3 db ./test2.db
+  execsql { SELECT n FROM test }
+} {1}
+
+# Test that rolling back a transaction reverts the changes in the
+# follower database as well.
+#
+do_test 6.2.1 {
+  reset_db
+  reset_db2
+  sqlite3_wal db
+  sqlite3_wal db2
+  sqlite3_wal_replication_leader db main
+  sqlite3_wal_replication_follower db2 main
+
+  # Reduce the cache size, so the write transaction below will
+  # have to flush pages and the test replication implementation
+  # will call sqlite3_replication_undo upon rollback.
+  execsql { PRAGMA cache_size = 1}
+
+  execsql {
+    CREATE TABLE test (a TEXT);
+    BEGIN;
+    INSERT INTO test VALUES(randomblob(4000));
+    ROLLBACK;
+  }
+} {}
+do_test 6.2.2 {
+  db close
+  db2 close
+
+  # checkpoint-on-close is disabled for both leader and follower
+  # connections
+  file exists test.db-wal
+  file exists test2.db-wal
+
+  # the content of the WAL is replicated to the follower
+  # connection
+  #
+  set size1 [file size test.db-wal]
+  set size2 [file size test2.db-wal]
+
+  expr {$size1 > 0 && $size1 == $size2 }
+} {1}
+do_test 6.2.3 {
+  # the replicated database was rolled back as well
+  sqlite3 db ./test2.db
+  execsql { SELECT COUNT(a) FROM TEST }
+} {0}
+
+# Test that if the xBegin or xFrame method returns a replication error,
+# then the transaction fails.
+#
+foreach { i method error } {
+1 xBegin  NOT_LEADER
+2 xBegin  LEADERSHIP_LOST
+3 xFrames NOT_LEADER
+4 xFrames LEADERSHIP_LOST
+} {
+  do_test 6.3.$i {
+    reset_db
+    sqlite3_wal db
+    sqlite3_wal_replication_leader db main
+    sqlite3_wal_replication_error $method $error
+    list [catch {db eval {CREATE TABLE test (n INT)}} msg] $msg
+  } {1 {disk I/O error}}
+}
+
+# Test that if the pager fails to begin a WAL write transaction,
+# the xAbort method is fired.
+#
+do_test 6.4.1 {
+  reset_db
+  sqlite3_wal db
+  execsql {
+    CREATE TABLE test (n INT);
+  }
+  sqlite3_wal_replication_leader db main
+  sqlite3 db2 ./test.db
+  db2 eval {
+    BEGIN;
+    INSERT INTO test VALUES(1);
+  }
+
+  # Trying to start a write transaction now fails with
+  # SQLITE_BUSY, and should trigger the xAbort hook.
+  list [catch {db eval {
+    BEGIN;
+    INSERT INTO test VALUES(2);
+  }} msg] $msg
+} {1 {database is locked}}
+do_test 6.4.2 {
+  db eval { ROLLBACK }
+  db2 eval { COMMIT; }
+
+  # Re-trying the failed insert succeeds, as the xAbort
+  # method has reset the state of the global replication.
+  execsql {
+    BEGIN;
+    INSERT INTO test VALUES(2);
+    COMMIT;
+  }
+} {}
+
+# Test that if the xUndo method returns a replication error, the
+# rollback still succeeds.
+#
+foreach { i method error } {
+1 xUndo  NOT_LEADER
+2 xUndo  LEADERSHIP_LOST
+} {
+  do_test 6.5.$i {
+    reset_db
+    sqlite3_wal db
+    sqlite3_wal_replication_leader db main
+    sqlite3_wal_replication_error $method $error
+    execsql {
+      BEGIN;
+      CREATE TABLE test (n INT);
+      ROLLBACK;
+    }
+  } {}
+}
+
+# Test that read transactions don't trigger any WAL replication method.
+#
+do_test 6.7 {
+  reset_db
+  sqlite3_wal db
+  execsql {
+    CREATE TABLE test (n INT);
+    INSERT INTO test(n) VALUES(1);
+  }
+  sqlite3_wal_replication_leader db main
+  sqlite3_wal_replication_error xBegin NOT_LEADER
+  execsql {
+    SELECT n FROM test;
+  }
+} {1}
+
+# Test that the WAL write lock is never acquired if the xBegin replication
+# method fails with SQLITE_IOERR_LEADERSHIP_LOST, and the transaction is
+# automatically rolled back as it normally happens whenever sqlite3PagerBegin
+# returns SQLITE_IOERR.
+#
+do_test 6.8.1 {
+  reset_db
+  sqlite3_wal db
+  execsql {
+    CREATE TABLE test (n INT);
+  }
+  sqlite3_wal_replication_leader db main
+  sqlite3_wal_replication_error xBegin LEADERSHIP_LOST 1
+  list [catch {db eval {
+    BEGIN;
+    INSERT INTO test VALUES(1);
+  }} msg] $msg
+} {1 {disk I/O error}}
+do_test 6.8.2 {
+  # No need to rollback here.
+  execsql {
+    BEGIN;
+    INSERT INTO test VALUES(1);
+    COMMIT;
+  }
+  execsql {
+    SELECT n FROM test;
+  }
+} {1}
+
+# Test that if the xFrames method fails, a new transaction can be executed
+# afterwise.
+#
+do_test 6.9.1 {
+  reset_db
+  sqlite3_wal db
+  execsql {
+    CREATE TABLE test (n INT);
+  }
+  sqlite3_wal_replication_leader db main
+  sqlite3_wal_replication_error xFrames LEADERSHIP_LOST 1
+  list [catch {db eval {
+    BEGIN;
+    INSERT INTO test VALUES(1);
+    COMMIT;
+  }} msg] $msg
+} {1 {disk I/O error}}
+do_test 6.9.2 {
+  execsql {
+    BEGIN;
+    INSERT INTO test VALUES(1);
+    COMMIT;
+  }
+  execsql {
+    SELECT n FROM test;
+  }
+} {1}
+
+# Test that if the xFrames method fails in the context of a pagerStress call, a
+# new transaction can be executed afterwise.
+#
+do_test 6.10.1 {
+  reset_db
+  sqlite3_wal db
+  execsql {
+    CREATE TABLE test (a TEXT);
+  }
+
+  # Reduce the cache size, so the write transaction below will
+  # have to flush pages and call xFrames before the transaction
+  # is committed.
+  execsql { PRAGMA cache_size = 1}
+
+  sqlite3_wal_replication_leader db main
+  sqlite3_wal_replication_error xFrames LEADERSHIP_LOST 1
+
+  # The insert will fail due to the pcache failing to spill dirty pages, and
+  # the transaction is automatically rolled back.
+  list [catch {db eval {
+    BEGIN;
+    INSERT INTO test VALUES(randomblob(4000));
+  }} msg] $msg
+} {1 {disk I/O error}}
+do_test 6.10.2 {
+  execsql {
+    BEGIN;
+    INSERT INTO test VALUES('x');
+    COMMIT;
+  }
+  execsql {
+    SELECT a FROM test;
+  }
+} {x}
+
+# Test that if the xFrames receives information about the most recently written
+# WAL frame associated with a dirty page.
+#
+do_test 6.11.1 {
+  reset_db
+  sqlite3_wal db
+  sqlite3_wal_replication_leader db main
+
+  execsql { CREATE TABLE test (a TEXT) }
+
+  # Exactly two brand new frames were written, so trying to get info about a
+  # third frame fails.
+  list [catch {sqlite3_wal_replication_frame_info 2} msg] $msg
+} {1 {no such frame}}
+do_test 6.11.2 {
+  # Page 1 was written for the first time to the WAL, so the frame's iPrev is 0.
+  sqlite3_wal_replication_frame_info 1
+} {1024 1 0}
+do_test 6.11.3 {
+  # Page 2 was written for the first time to the WAL, so the frame's iPrev is 0.
+  sqlite3_wal_replication_frame_info 0
+} {1024 2 0}
+do_test 6.11.4 {
+  execsql { INSERT INTO test VALUES('x') }
+  # Page 2 has been modified, and it was already present in the WAL as frame 2.
+  sqlite3_wal_replication_frame_info 0
+} {1024 2 2}
+do_test 6.11.5 {
+  execsql { INSERT INTO test VALUES(randomblob(2000)) }
+  # Page 2 has been modified again, and it was already present in the WAL as
+  # frame 3.
+  sqlite3_wal_replication_frame_info 1
+} {1024 2 3}
+do_test 6.11.6 {
+  # Page 3 has been added anew, so it was not present in the WAL.
+  sqlite3_wal_replication_frame_info 0
+} {1024 3 0}
+do_test 6.11.7 {
+  # The WAL has now 6 frames.
+ set size [expr 32 + 6 * (24 + 1024) ]
+  expr {[file size test.db-wal] == $size }
+} {1}
+do_test 6.11.8 {
+  # All those 6 frames were handled by xFrames.
+  list [catch {sqlite3_wal_replication_frame_info 6} msg] $msg
+} {1 {no such frame}}
+do_test 6.11.9 {
+  # Perform a full checkpoint.
+  execsql { PRAGMA wal_checkpoint }
+} {0 6 6}
+do_test 6.11.10 {
+  execsql { DELETE FROM test WHERE a='x' }
+  # Page 2 was modified, but this time iPrev is 0 because the WAL contained no
+  # frame after the checkpoint.
+  sqlite3_wal_replication_frame_info 0
+} {1024 2 0}
+
+#-------------------------------------------------------------------------
+# The following block of tests - walreplication-7.* - focus on testing the
+# implementation of the sqlite3_wal_replication_checkpoint() interface.
+
+# Test checkpointing with connections in follower WAL replication mode.
+#
+do_test 7.1.1 {
+  reset_db
+  sqlite3_wal db
+  execsql {
+    CREATE TABLE test (n INT);
+  }
+  list [catch {sqlite3_wal_replication_checkpoint db main} msg] $msg
+} {1 SQLITE_ERROR}
+do_test 7.1.2 {
+  sqlite3_wal_replication_follower db main
+  sqlite3_wal_replication_checkpoint db main
+
+  file size ./test.db-wal
+} {0}
+
+reset_db
+sqlite3_wal db
+sqlite3_wal_replication_leader db main
+finish_test

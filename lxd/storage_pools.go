@@ -21,6 +21,20 @@ import (
 // Lock to prevent concurent storage pools creation
 var storagePoolCreateLock sync.Mutex
 
+var storagePoolsCmd = Command{
+	name: "storage-pools",
+	get:  storagePoolsGet,
+	post: storagePoolsPost,
+}
+
+var storagePoolCmd = Command{
+	name:   "storage-pools/{name}",
+	get:    storagePoolGet,
+	put:    storagePoolPut,
+	patch:  storagePoolPatch,
+	delete: storagePoolDelete,
+}
+
 // /1.0/storage-pools
 // List all storage pools.
 func storagePoolsGet(d *Daemon, r *http.Request) Response {
@@ -249,8 +263,6 @@ func storagePoolsPostCluster(d *Daemon, req api.StoragePoolsPost) error {
 	return notifyErr
 }
 
-var storagePoolsCmd = Command{name: "storage-pools", get: storagePoolsGet, post: storagePoolsPost}
-
 // /1.0/storage-pools/{name}
 // Get a single storage pool.
 func storagePoolGet(d *Daemon, r *http.Request) Response {
@@ -377,7 +389,7 @@ func storagePoolPatch(d *Daemon, r *http.Request) Response {
 
 	// Get the existing network
 	_, dbInfo, err := d.cluster.StoragePoolGet(poolName)
-	if dbInfo != nil {
+	if err != nil {
 		return SmartError(err)
 	}
 
@@ -499,7 +511,7 @@ func storagePoolDelete(d *Daemon, r *http.Request) Response {
 
 	poolID, err := d.cluster.StoragePoolGetID(poolName)
 	if err != nil {
-		return NotFound
+		return NotFound(err)
 	}
 
 	// If this is not an internal cluster request, check if the storage
@@ -545,6 +557,23 @@ func storagePoolDelete(d *Daemon, r *http.Request) Response {
 		return EmptySyncResponse
 	}
 
+	volumeNames, err := d.cluster.StoragePoolVolumesGetNames(poolID)
+	if err != nil {
+		return InternalError(err)
+	}
+
+	for _, volume := range volumeNames {
+		_, imgInfo, err := d.cluster.ImageGet(volume, false, false)
+		if err != nil {
+			return InternalError(err)
+		}
+
+		err = doDeleteImageFromPool(d.State(), imgInfo.Fingerprint, poolName)
+		if err != nil {
+			return InternalError(err)
+		}
+	}
+
 	err = s.StoragePoolDelete()
 	if err != nil {
 		return InternalError(err)
@@ -587,13 +616,22 @@ func storagePoolDelete(d *Daemon, r *http.Request) Response {
 }
 
 func storagePoolDeleteCheckPreconditions(cluster *db.Cluster, poolName string, poolID int64) Response {
-	volumeCount, err := cluster.StoragePoolVolumesGetNames(poolID)
+	volumeNames, err := cluster.StoragePoolVolumesGetNames(poolID)
 	if err != nil {
 		return InternalError(err)
 	}
 
-	if volumeCount > 0 {
-		return BadRequest(fmt.Errorf("storage pool \"%s\" has volumes attached to it", poolName))
+	if len(volumeNames) > 0 {
+		volumes, err := cluster.StoragePoolVolumesGet(poolID, supportedVolumeTypes)
+		if err != nil {
+			return InternalError(err)
+		}
+
+		for _, volume := range volumes {
+			if volume.Type != "image" {
+				return BadRequest(fmt.Errorf("storage pool \"%s\" has volumes attached to it", poolName))
+			}
+		}
 	}
 
 	// Check if the storage pool is still referenced in any profiles.
@@ -608,5 +646,3 @@ func storagePoolDeleteCheckPreconditions(cluster *db.Cluster, poolName string, p
 
 	return nil
 }
-
-var storagePoolCmd = Command{name: "storage-pools/{name}", get: storagePoolGet, put: storagePoolPut, patch: storagePoolPatch, delete: storagePoolDelete}

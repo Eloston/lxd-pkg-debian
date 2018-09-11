@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
+	"gopkg.in/macaroon-bakery.v2/httpbakery"
 	"gopkg.in/macaroon-bakery.v2/httpbakery/form"
 
 	"github.com/lxc/lxd/client"
@@ -276,14 +277,30 @@ func (c *cmdGlobal) PreRun(cmd *cobra.Command, args []string) error {
 			return err
 		}
 
-		fmt.Fprintf(os.Stderr, i18n.G("If this is your first time running LXD on this machine, you should also run: lxd init")+"\n")
-		fmt.Fprintf(os.Stderr, i18n.G("To start your first container, try: lxc launch ubuntu:16.04")+"\n\n")
+		// Attempt to connect to the local server
+		runInit := true
+		d, err := lxd.ConnectLXDUnix("", nil)
+		if err == nil {
+			info, _, err := d.GetServer()
+			if err == nil && info.Environment.Storage != "" {
+				runInit = false
+			}
+		}
+
+		if runInit {
+			fmt.Fprintf(os.Stderr, i18n.G("If this is your first time running LXD on this machine, you should also run: lxd init")+"\n")
+		}
+
+		fmt.Fprintf(os.Stderr, i18n.G("To start your first container, try: lxc launch ubuntu:18.04")+"\n\n")
 	}
 
 	// Only setup macaroons if a config path exists (so the jar can be saved)
 	if shared.PathExists(c.confPath) {
 		// Add interactor for external authentication
-		c.conf.SetAuthInteractor(form.Interactor{Filler: schemaform.IOFiller{}})
+		c.conf.SetAuthInteractor([]httpbakery.Interactor{
+			form.Interactor{Filler: schemaform.IOFiller{}},
+			httpbakery.WebBrowserInteractor{},
+		})
 	}
 
 	// Set the user agent

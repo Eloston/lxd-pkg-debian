@@ -40,6 +40,54 @@ import (
 	log "github.com/lxc/lxd/shared/log15"
 )
 
+var imagesCmd = Command{
+	name:         "images",
+	post:         imagesPost,
+	untrustedGet: true,
+	get:          imagesGet,
+}
+
+var imageCmd = Command{
+	name:         "images/{fingerprint}",
+	untrustedGet: true,
+	get:          imageGet,
+	put:          imagePut,
+	delete:       imageDelete,
+	patch:        imagePatch,
+}
+
+var imageExportCmd = Command{
+	name:         "images/{fingerprint}/export",
+	untrustedGet: true,
+	get:          imageExport,
+}
+
+var imageSecretCmd = Command{
+	name: "images/{fingerprint}/secret",
+	post: imageSecret,
+}
+
+var imageRefreshCmd = Command{
+	name: "images/{fingerprint}/refresh",
+	post: imageRefresh,
+}
+
+var aliasesCmd = Command{
+	name: "images/aliases",
+	post: aliasesPost,
+	get:  aliasesGet,
+}
+
+var aliasCmd = Command{
+	name:         "images/aliases/{name:.*}",
+	untrustedGet: true,
+	get:          aliasGet,
+	delete:       aliasDelete,
+	put:          aliasPut,
+	post:         aliasPost,
+	patch:        aliasPatch,
+}
+
 /* We only want a single publish running at any one time.
    The CPU and I/O load of publish is such that running multiple ones in
    parallel takes longer than running them serially.
@@ -537,7 +585,7 @@ func getImgPostInfo(d *Daemon, r *http.Request, builddir string, post *os.File) 
 // database and hence has already a storage volume in at least one storage pool.
 func imageCreateInPool(d *Daemon, info *api.Image, storagePool string) error {
 	if storagePool == "" {
-		return fmt.Errorf("No storage pool specified.")
+		return fmt.Errorf("No storage pool specified")
 	}
 
 	// Initialize a new storage interface.
@@ -723,7 +771,7 @@ func getImageMetadata(fname string) (*api.ImageMetadata, error) {
 	}
 
 	if metadata.CreationDate == 0 {
-		return nil, fmt.Errorf("Missing creation date.")
+		return nil, fmt.Errorf("Missing creation date")
 	}
 
 	return &metadata, nil
@@ -769,8 +817,6 @@ func imagesGet(d *Daemon, r *http.Request) Response {
 	}
 	return SyncResponse(true, result)
 }
-
-var imagesCmd = Command{name: "images", post: imagesPost, untrustedGet: true, get: imagesGet}
 
 func autoUpdateImagesTask(d *Daemon) (task.Func, task.Schedule) {
 	f := func(ctx context.Context) {
@@ -997,6 +1043,40 @@ func pruneExpiredImagesTask(d *Daemon) (task.Func, task.Schedule) {
 	return f, schedule
 }
 
+func pruneLeftoverImages(d *Daemon) {
+	logger.Infof("Pruning leftover image files")
+
+	// Get all images
+	images, err := d.cluster.ImagesGet(false)
+	if err != nil {
+		logger.Error("Unable to retrieve the list of images", log.Ctx{"err": err})
+		return
+	}
+
+	// Look at what's in the images directory
+	entries, err := ioutil.ReadDir(shared.VarPath("images"))
+	if err != nil {
+		logger.Error("Unable to list the images directory", log.Ctx{"err": err})
+		return
+	}
+
+	// Check and delete leftovers
+	for _, entry := range entries {
+		fp := strings.Split(entry.Name(), ".")[0]
+		if !shared.StringInSlice(fp, images) {
+			err = os.RemoveAll(shared.VarPath("images", entry.Name()))
+			if err != nil {
+				logger.Error("Unable to remove leftover image", log.Ctx{"err": err, "file": entry.Name()})
+				continue
+			}
+
+			logger.Debugf("Removed leftover image file: %s", entry.Name())
+		}
+	}
+
+	logger.Infof("Done pruning leftover image files")
+}
+
 func pruneExpiredImages(ctx context.Context, d *Daemon) {
 	logger.Infof("Pruning expired images")
 
@@ -1040,7 +1120,7 @@ func pruneExpiredImages(ctx context.Context, d *Daemon) {
 		for _, pool := range poolNames {
 			err := doDeleteImageFromPool(d.State(), fp, pool)
 			if err != nil {
-				logger.Debugf("Error deleting image %s from storage pool %: %s", fp, pool, err)
+				logger.Debugf("Error deleting image %s from storage pool %s: %s", fp, pool, err)
 				continue
 			}
 		}
@@ -1130,20 +1210,53 @@ func imageDelete(d *Daemon, r *http.Request) Response {
 			}
 		}
 
-		// Remove the rootfs file for the image.
-		fname = shared.VarPath("images", imgInfo.Fingerprint) + ".rootfs"
-		if shared.PathExists(fname) {
-			err = os.Remove(fname)
-			if err != nil {
-				logger.Debugf("Error deleting image file %s: %s", fname, err)
-			}
+		imageDeleteFromDisk(imgInfo.Fingerprint)
+
+		err = d.cluster.ImageDelete(imgID)
+		if err != nil {
+			return errors.Wrap(err, "Error deleting image info from the database")
 		}
 
-		// Remove the database entry for the image.
-		return d.cluster.ImageDelete(imgID)
+		// Notify the other nodes about the removed image.
+		notifier, err := cluster.NewNotifier(d.State(), d.endpoints.NetworkCert(), cluster.NotifyAlive)
+		if err != nil {
+			// This isn't fatal.
+			logger.Warnf("Error notifying other nodes about image removal: %v", err)
+			return nil
+		}
+
+		err = notifier(func(client lxd.ContainerServer) error {
+			op, err := client.DeleteImage(imgInfo.Fingerprint)
+			if err != nil {
+				return errors.Wrap(err, "Failed to request to delete image from peer node")
+			}
+
+			err = op.Wait()
+			if err != nil {
+				return errors.Wrap(err, "Failed to delete image from peer node")
+			}
+
+			return nil
+		})
+		if err != nil {
+			// This isn't fatal.
+			logger.Warnf("Failed to notify other nodes about removed image: %v", err)
+			return nil
+		}
+
+		return nil
+	}
+
+	deleteFromDisk := func() error {
+		imageDeleteFromDisk(fingerprint)
+		return nil
 	}
 
 	rmimg := func(op *operation) error {
+		if isClusterNotification(r) {
+			return deleteFromDisk()
+		}
+
 		return deleteFromAllPools()
 	}
 
@@ -1156,6 +1269,27 @@ func imageDelete(d *Daemon, r *http.Request) Response {
 	}
 
 	return OperationResponse(op)
+}
+
+// Helper to delete an image file from the local images directory.
+func imageDeleteFromDisk(fingerprint string) {
+	// Remove main image file.
+	fname := shared.VarPath("images", fingerprint)
+	if shared.PathExists(fname) {
+		err := os.Remove(fname)
+		if err != nil {
+			logger.Debugf("Error deleting image file %s: %s", fname, err)
+		}
+	}
+
+	// Remove the rootfs file for the image.
+	fname = shared.VarPath("images", fingerprint) + ".rootfs"
+	if shared.PathExists(fname) {
+		err := os.Remove(fname)
+		if err != nil {
+			logger.Debugf("Error deleting image file %s: %s", fname, err)
+		}
+	}
 }
 
 func doImageGet(db *db.Cluster, fingerprint string, public bool) (*api.Image, Response) {
@@ -1208,7 +1342,7 @@ func imageGet(d *Daemon, r *http.Request) Response {
 	}
 
 	if !info.Public && public && !imageValidSecret(info.Fingerprint, secret) {
-		return NotFound
+		return NotFound(fmt.Errorf("Image '%s' not found", info.Fingerprint))
 	}
 
 	etag := []interface{}{info.Public, info.AutoUpdate, info.Properties}
@@ -1309,8 +1443,6 @@ func imagePatch(d *Daemon, r *http.Request) Response {
 	return EmptySyncResponse
 }
 
-var imageCmd = Command{name: "images/{fingerprint}", untrustedGet: true, get: imageGet, put: imagePut, delete: imageDelete, patch: imagePatch}
-
 func aliasesPost(d *Daemon, r *http.Request) Response {
 	req := api.ImageAliasesPost{}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1324,7 +1456,7 @@ func aliasesPost(d *Daemon, r *http.Request) Response {
 	// This is just to see if the alias name already exists.
 	_, _, err := d.cluster.ImageAliasGet(req.Name, true)
 	if err == nil {
-		return Conflict
+		return Conflict(fmt.Errorf("Alias '%s' already exists", req.Name))
 	}
 
 	id, _, err := d.cluster.ImageGet(req.Target, false, false)
@@ -1495,7 +1627,7 @@ func aliasPost(d *Daemon, r *http.Request) Response {
 	// Check that the name isn't already in use
 	id, _, _ := d.cluster.ImageAliasGet(req.Name, true)
 	if id > 0 {
-		return Conflict
+		return Conflict(fmt.Errorf("Alias '%s' already in use", req.Name))
 	}
 
 	id, _, err := d.cluster.ImageAliasGet(name, true)
@@ -1523,7 +1655,7 @@ func imageExport(d *Daemon, r *http.Request) Response {
 	}
 
 	if !imgInfo.Public && public && !imageValidSecret(imgInfo.Fingerprint, secret) {
-		return NotFound
+		return NotFound(fmt.Errorf("Image '%s' not found", fingerprint))
 	}
 
 	// Check if the image is only available on another node.
@@ -1683,11 +1815,3 @@ func imageRefresh(d *Daemon, r *http.Request) Response {
 	return OperationResponse(op)
 
 }
-
-var imagesExportCmd = Command{name: "images/{fingerprint}/export", untrustedGet: true, get: imageExport}
-var imagesSecretCmd = Command{name: "images/{fingerprint}/secret", post: imageSecret}
-var imagesRefreshCmd = Command{name: "images/{fingerprint}/refresh", post: imageRefresh}
-
-var aliasesCmd = Command{name: "images/aliases", post: aliasesPost, get: aliasesGet}
-
-var aliasCmd = Command{name: "images/aliases/{name:.*}", untrustedGet: true, get: aliasGet, delete: aliasDelete, put: aliasPut, post: aliasPost, patch: aliasPatch}

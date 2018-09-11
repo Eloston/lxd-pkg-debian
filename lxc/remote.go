@@ -88,7 +88,7 @@ func (c *cmdRemoteAdd) Command() *cobra.Command {
 	cmd.Flags().BoolVar(&c.flagAcceptCert, "accept-certificate", false, i18n.G("Accept certificate"))
 	cmd.Flags().StringVar(&c.flagPassword, "password", "", i18n.G("Remote admin password")+"``")
 	cmd.Flags().StringVar(&c.flagProtocol, "protocol", "", i18n.G("Server protocol (lxd or simplestreams)")+"``")
-	cmd.Flags().StringVar(&c.flagAuthType, "auth-type", "", i18n.G("Server authentication type (tls or macaroons)")+"``")
+	cmd.Flags().StringVar(&c.flagAuthType, "auth-type", "", i18n.G("Server authentication type (tls or candid)")+"``")
 	cmd.Flags().BoolVar(&c.flagPublic, "public", false, i18n.G("Public image server"))
 
 	return cmd
@@ -256,7 +256,7 @@ func (c *cmdRemoteAdd) Run(cmd *cobra.Command, args []string) error {
 				return err
 			}
 
-			if len(line) < 1 || line[0] != 'y' && line[0] != 'Y' {
+			if len(line) < 1 || strings.ToLower(string(line[0])) != i18n.G("y") {
 				return fmt.Errorf(i18n.G("Server certificate NACKed by user"))
 			}
 		}
@@ -294,7 +294,7 @@ func (c *cmdRemoteAdd) Run(cmd *cobra.Command, args []string) error {
 		return conf.SaveConfig(c.global.confPath)
 	}
 
-	if c.flagAuthType == "macaroons" {
+	if c.flagAuthType == "candid" {
 		d.(lxd.ContainerServer).RequireAuthenticated(false)
 	}
 
@@ -615,7 +615,7 @@ func (c *cmdRemoteSetDefault) Run(cmd *cobra.Command, args []string) error {
 	// Set the default remote
 	_, ok := conf.Remotes[args[0]]
 	if !ok {
-		return fmt.Errorf(i18n.G("Remote %s doesn't exist"), args[1])
+		return fmt.Errorf(i18n.G("Remote %s doesn't exist"), args[0])
 	}
 
 	conf.DefaultRemote = args[0]

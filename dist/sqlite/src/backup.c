@@ -189,18 +189,23 @@ sqlite3_backup *sqlite3_backup_init(
     p->iNext = 1;
     p->isAttached = 0;
 
-#if defined(SQLITE_ENABLE_REPLICATION) && !defined(SQLITE_OMIT_WAL)
+#if defined(SQLITE_ENABLE_WAL_REPLICATION) && !defined(SQLITE_OMIT_WAL)
     if( p->pSrc ){
+      /* Check that the connection is not in follower WAL replication mode */
       Pager *pPager = sqlite3BtreePager(p->pSrc);
-      int replicationMode;
-      replicationMode = sqlite3PagerReplicationModeGet(pPager);
-      if( replicationMode==SQLITE_REPLICATION_FOLLOWER ){
-        /* Can't perform any operation while in replication follower mode */
-        sqlite3Error(pDestDb, SQLITE_ERROR);
-        p->pSrc = 0;
+      if (sqlite3PagerGetJournalMode(pPager) == PAGER_JOURNALMODE_WAL) {
+        int rc;
+        int bEnabled;
+        sqlite3_wal_replication *pReplication;
+        rc = sqlite3PagerWalReplicationGet(pPager, &bEnabled, &pReplication);
+        assert( rc==SQLITE_OK );
+        if( bEnabled && !pReplication ){
+          sqlite3Error(pDestDb, SQLITE_ERROR);
+          p->pSrc = 0;
+        }
       }
     }
-#endif
+#endif /* SQLITE_ENABLE_WAL_REPLICATION && !SQLITE_OMIT_WAL */
 
     if( 0==p->pSrc || 0==p->pDest 
      || checkReadTransaction(pDestDb, p->pDest)!=SQLITE_OK 

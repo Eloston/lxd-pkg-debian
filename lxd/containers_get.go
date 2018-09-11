@@ -10,7 +10,6 @@ import (
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/db/query"
-	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
@@ -40,6 +39,12 @@ func containersGet(d *Daemon, r *http.Request) Response {
 }
 
 func doContainersGet(d *Daemon, r *http.Request) (interface{}, error) {
+	recursion := util.IsRecursionRequest(r)
+	resultString := []string{}
+	resultList := []*api.Container{}
+	resultMu := sync.Mutex{}
+
+	// Get the list and location of all containers
 	var result map[string][]string // Containers by node address
 	var nodes map[string]string    // Node names by container
 	err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
@@ -61,10 +66,18 @@ func doContainersGet(d *Daemon, r *http.Request) (interface{}, error) {
 		return []string{}, err
 	}
 
-	recursion := util.IsRecursionRequest(r)
-	resultString := []string{}
-	resultList := []*api.Container{}
-	resultMu := sync.Mutex{}
+	// Get the local containers
+	nodeCts := map[string]container{}
+	if recursion {
+		cts, err := containerLoadNodeAll(d.State())
+		if err != nil {
+			return nil, err
+		}
+
+		for _, ct := range cts {
+			nodeCts[ct.Name()] = ct
+		}
+	}
 
 	resultAppend := func(name string, c api.Container, err error) {
 		if err != nil {
@@ -80,6 +93,7 @@ func doContainersGet(d *Daemon, r *http.Request) (interface{}, error) {
 		resultMu.Unlock()
 	}
 
+	wg := sync.WaitGroup{}
 	for address, containers := range result {
 		// If this is an internal request from another cluster node,
 		// ignore containers from other nodes, and return only the ones
@@ -100,7 +114,9 @@ func doContainersGet(d *Daemon, r *http.Request) (interface{}, error) {
 		// For recursion requests we need to fetch the state of remote
 		// containers from their respective nodes.
 		if recursion && address != "" && !isClusterNotification(r) {
-			func(address string, containers []string) {
+			wg.Add(1)
+			go func(address string, containers []string) {
+				defer wg.Done()
 				cert := d.endpoints.NetworkCert()
 
 				cs, err := doContainersGetFromNode(address, cert)
@@ -127,14 +143,15 @@ func doContainersGet(d *Daemon, r *http.Request) (interface{}, error) {
 				continue
 			}
 
-			c, err := doContainerGet(d.State(), container)
+			c, _, err := nodeCts[container].Render()
 			if err != nil {
 				resultAppend(container, api.Container{}, err)
 			} else {
-				resultAppend(container, *c, err)
+				resultAppend(container, *c.(*api.Container), err)
 			}
 		}
 	}
+	wg.Wait()
 
 	if !recursion {
 		return resultString, nil
@@ -146,20 +163,6 @@ func doContainersGet(d *Daemon, r *http.Request) (interface{}, error) {
 	})
 
 	return resultList, nil
-}
-
-func doContainerGet(s *state.State, cname string) (*api.Container, error) {
-	c, err := containerLoadByName(s, cname)
-	if err != nil {
-		return nil, err
-	}
-
-	cts, _, err := c.Render()
-	if err != nil {
-		return nil, err
-	}
-
-	return cts.(*api.Container), nil
 }
 
 // Fetch information about the containers on the given remote node, using the

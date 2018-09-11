@@ -50,7 +50,7 @@ func setupProxyProcInfo(c container, device map[string]string) (*proxyProcInfo, 
 		listenPid = containerPid
 		connectPid = lxdPid
 	} else {
-		return nil, fmt.Errorf("Invalid binding side given. Must be \"host\" or \"container\".")
+		return nil, fmt.Errorf("Invalid binding side given. Must be \"host\" or \"container\"")
 	}
 
 	p := &proxyProcInfo{
@@ -91,7 +91,7 @@ func killProxyProc(pidPath string) error {
 	}
 
 	// Parse the pid
-	pidInt, _ := strconv.Atoi(pidString)
+	pidInt, err := strconv.Atoi(pidString)
 	if err != nil {
 		return err
 	}

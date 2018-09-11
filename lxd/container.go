@@ -52,7 +52,7 @@ func containerValidName(name string) error {
 	}
 
 	if !shared.ValidHostname(name) {
-		return fmt.Errorf("Container name isn't a valid hostname.")
+		return fmt.Errorf("Container name isn't a valid hostname")
 	}
 
 	return nil
@@ -240,6 +240,21 @@ func containerValidDeviceConfigKey(t, k string) bool {
 	}
 }
 
+func allowedUnprivilegedOnlyMap(rawIdmap string) error {
+	rawMaps, err := parseRawIdmap(rawIdmap)
+	if err != nil {
+		return err
+	}
+
+	for _, ent := range rawMaps {
+		if ent.Hostid == 0 {
+			return fmt.Errorf("Cannot map root user into container as LXD was configured to only allow unprivileged containers")
+		}
+	}
+
+	return nil
+}
+
 func containerValidConfig(sysOS *sys.OS, config map[string]string, profile bool, expanded bool) error {
 	if config == nil {
 		return nil
@@ -247,11 +262,11 @@ func containerValidConfig(sysOS *sys.OS, config map[string]string, profile bool,
 
 	for k, v := range config {
 		if profile && strings.HasPrefix(k, "volatile.") {
-			return fmt.Errorf("Volatile keys can only be set on containers.")
+			return fmt.Errorf("Volatile keys can only be set on containers")
 		}
 
 		if profile && strings.HasPrefix(k, "image.") {
-			return fmt.Errorf("Image keys can only be set on containers.")
+			return fmt.Errorf("Image keys can only be set on containers")
 		}
 
 		err := containerValidConfigKey(sysOS, k, v)
@@ -275,13 +290,16 @@ func containerValidConfig(sysOS *sys.OS, config map[string]string, profile bool,
 	}
 
 	if expanded && (config["security.privileged"] == "" || !shared.IsTrue(config["security.privileged"])) && sysOS.IdmapSet == nil {
-		return fmt.Errorf("LXD doesn't have a uid/gid allocation. In this mode, only privileged containers are supported.")
+		return fmt.Errorf("LXD doesn't have a uid/gid allocation. In this mode, only privileged containers are supported")
 	}
 
 	unprivOnly := os.Getenv("LXD_UNPRIVILEGED_ONLY")
 	if shared.IsTrue(unprivOnly) {
 		if config["raw.idmap"] != "" {
-			return fmt.Errorf("raw.idmap can't be set as LXD was configured to only allow unprivileged containers")
+			err := allowedUnprivilegedOnlyMap(config["raw.idmap"])
+			if err != nil {
+				return err
+			}
 		}
 
 		if shared.IsTrue(config["security.privileged"]) {
@@ -343,43 +361,43 @@ func containerValidDevices(db *db.Cluster, devices types.Devices, profile bool, 
 			if !expanded && !shared.StringInSlice(m["path"], diskDevicePaths) {
 				diskDevicePaths = append(diskDevicePaths, m["path"])
 			} else if !expanded {
-				return fmt.Errorf("More than one disk device uses the same path: %s.", m["path"])
+				return fmt.Errorf("More than one disk device uses the same path: %s", m["path"])
 			}
 
 			if m["path"] == "" {
-				return fmt.Errorf("Disk entry is missing the required \"path\" property.")
+				return fmt.Errorf("Disk entry is missing the required \"path\" property")
 			}
 
 			if m["source"] == "" && m["path"] != "/" {
-				return fmt.Errorf("Disk entry is missing the required \"source\" property.")
+				return fmt.Errorf("Disk entry is missing the required \"source\" property")
 			}
 
 			if m["path"] == "/" && m["source"] != "" {
-				return fmt.Errorf("Root disk entry may not have a \"source\" property set.")
+				return fmt.Errorf("Root disk entry may not have a \"source\" property set")
 			}
 
 			if m["size"] != "" && m["path"] != "/" {
-				return fmt.Errorf("Only the root disk may have a size quota.")
+				return fmt.Errorf("Only the root disk may have a size quota")
 			}
 
 			if (m["path"] == "/" || !shared.IsDir(m["source"])) && m["recursive"] != "" {
-				return fmt.Errorf("The recursive option is only supported for additional bind-mounted paths.")
+				return fmt.Errorf("The recursive option is only supported for additional bind-mounted paths")
 			}
 
 			if m["pool"] != "" {
 				if filepath.IsAbs(m["source"]) {
-					return fmt.Errorf("Storage volumes cannot be specified as absolute paths.")
+					return fmt.Errorf("Storage volumes cannot be specified as absolute paths")
 				}
 
 				_, err := db.StoragePoolGetID(m["pool"])
 				if err != nil {
-					return fmt.Errorf("The \"%s\" storage pool doesn't exist.", m["pool"])
+					return fmt.Errorf("The \"%s\" storage pool doesn't exist", m["pool"])
 				}
 			}
 
 		} else if shared.StringInSlice(m["type"], []string{"unix-char", "unix-block"}) {
 			if m["source"] == "" && m["path"] == "" {
-				return fmt.Errorf("Unix device entry is missing the required \"source\" or \"path\" property.")
+				return fmt.Errorf("Unix device entry is missing the required \"source\" or \"path\" property")
 			}
 
 			if (m["required"] == "" || shared.IsTrue(m["required"])) && (m["major"] == "" || m["minor"] == "") {
@@ -388,7 +406,7 @@ func containerValidDevices(db *db.Cluster, devices types.Devices, profile bool, 
 					srcPath = m["path"]
 				}
 				if !shared.PathExists(srcPath) {
-					return fmt.Errorf("The device path doesn't exist on the host and major/minor wasn't specified.")
+					return fmt.Errorf("The device path doesn't exist on the host and major/minor wasn't specified")
 				}
 
 				dType, _, _, err := deviceGetAttributes(srcPath)
@@ -397,27 +415,36 @@ func containerValidDevices(db *db.Cluster, devices types.Devices, profile bool, 
 				}
 
 				if m["type"] == "unix-char" && dType != "c" {
-					return fmt.Errorf("Path specified for unix-char device is a block device.")
+					return fmt.Errorf("Path specified for unix-char device is a block device")
 				}
 
 				if m["type"] == "unix-block" && dType != "b" {
-					return fmt.Errorf("Path specified for unix-block device is a character device.")
+					return fmt.Errorf("Path specified for unix-block device is a character device")
 				}
 			}
 		} else if m["type"] == "usb" {
 			if m["vendorid"] == "" {
-				return fmt.Errorf("Missing vendorid for USB device.")
+				return fmt.Errorf("Missing vendorid for USB device")
 			}
 		} else if m["type"] == "gpu" {
-			// Probably no checks needed, since we allow users to
-			// pass in all GPUs.
+			if m["pci"] != "" && !shared.PathExists(fmt.Sprintf("/sys/bus/pci/devices/%s", m["pci"])) {
+				return fmt.Errorf("Invalid PCI address (no device found): %s", m["pci"])
+			}
+
+			if m["pci"] != "" && (m["id"] != "" || m["productid"] != "" || m["vendorid"] != "") {
+				return fmt.Errorf("Cannot use id, productid or vendorid when pci is set")
+			}
+
+			if m["id"] != "" && (m["pci"] != "" || m["productid"] != "" || m["vendorid"] != "") {
+				return fmt.Errorf("Cannot use pci, productid or vendorid when id is set")
+			}
 		} else if m["type"] == "proxy" {
 			if m["listen"] == "" {
-				return fmt.Errorf("Proxy device entry is missing the required \"listen\" property.")
+				return fmt.Errorf("Proxy device entry is missing the required \"listen\" property")
 			}
 
 			if m["connect"] == "" {
-				return fmt.Errorf("Proxy device entry is missing the required \"connect\" property.")
+				return fmt.Errorf("Proxy device entry is missing the required \"connect\" property")
 			}
 		} else if m["type"] == "none" {
 			continue
@@ -670,6 +697,16 @@ func containerCreateAsCopy(s *state.State, args db.ContainerArgs, sourceContaine
 		return nil, err
 	}
 
+	// At this point we have already figured out the parent
+	// container's root disk device so we can simply
+	// retrieve it from the expanded devices.
+	parentStoragePool := ""
+	parentExpandedDevices := ct.ExpandedDevices()
+	parentLocalRootDiskDeviceKey, parentLocalRootDiskDevice, _ := shared.GetRootDiskDevice(parentExpandedDevices)
+	if parentLocalRootDiskDeviceKey != "" {
+		parentStoragePool = parentLocalRootDiskDevice["pool"]
+	}
+
 	csList := []*container{}
 	if !containerOnly {
 		snapshots, err := sourceContainer.Snapshots()
@@ -680,13 +717,33 @@ func containerCreateAsCopy(s *state.State, args db.ContainerArgs, sourceContaine
 
 		csList = make([]*container, len(snapshots))
 		for i, snap := range snapshots {
+			// Ensure that snapshot and parent container have the
+			// same storage pool in their local root disk device.
+			// If the root disk device for the snapshot comes from a
+			// profile on the new instance as well we don't need to
+			// do anything.
+			snapDevices := snap.LocalDevices()
+			if snapDevices != nil {
+				snapLocalRootDiskDeviceKey, _, _ := shared.GetRootDiskDevice(snapDevices)
+				if snapLocalRootDiskDeviceKey != "" {
+					snapDevices[snapLocalRootDiskDeviceKey]["pool"] = parentStoragePool
+				} else {
+					snapDevices["root"] = map[string]string{
+						"type": "disk",
+						"path": "/",
+						"pool": parentStoragePool,
+					}
+				}
+			}
+
 			fields := strings.SplitN(snap.Name(), shared.SnapshotDelimiter, 2)
 			newSnapName := fmt.Sprintf("%s/%s", ct.Name(), fields[1])
 			csArgs := db.ContainerArgs{
 				Architecture: snap.Architecture(),
 				Config:       snap.LocalConfig(),
 				Ctype:        db.CTypeSnapshot,
-				Devices:      snap.LocalDevices(),
+				Devices:      snapDevices,
+				Description:  snap.Description(),
 				Ephemeral:    snap.IsEphemeral(),
 				Name:         newSnapName,
 				Profiles:     snap.Profiles(),
@@ -737,12 +794,12 @@ func containerCreateAsSnapshot(s *state.State, args db.ContainerArgs, sourceCont
 	// Deal with state
 	if args.Stateful {
 		if !sourceContainer.IsRunning() {
-			return nil, fmt.Errorf("Unable to create a stateful snapshot. The container isn't running.")
+			return nil, fmt.Errorf("Unable to create a stateful snapshot. The container isn't running")
 		}
 
 		_, err := exec.LookPath("criu")
 		if err != nil {
-			return nil, fmt.Errorf("Unable to create a stateful snapshot. CRIU isn't installed.")
+			return nil, fmt.Errorf("Unable to create a stateful snapshot. CRIU isn't installed")
 		}
 
 		stateDir := sourceContainer.StatePath()
@@ -943,7 +1000,7 @@ func containerConfigureInternal(c container) error {
 	storage := c.Storage()
 	if rootDiskDevice["size"] != "" {
 		storageTypeName := storage.GetStorageTypeName()
-		if storageTypeName == "lvm" && c.IsRunning() {
+		if (storageTypeName == "lvm" || storageTypeName == "ceph") && c.IsRunning() {
 			err = c.ConfigKeySet("volatile.apply_quota", rootDiskDevice["size"])
 			if err != nil {
 				return err
@@ -990,5 +1047,85 @@ func containerLoadByName(s *state.State, name string) (container, error) {
 		return nil, err
 	}
 
-	return containerLXCLoad(s, args)
+	return containerLXCLoad(s, args, nil)
+}
+
+func containerLoadAll(s *state.State) ([]container, error) {
+	// Get all the container arguments
+	var cts []db.ContainerArgs
+	err := s.Cluster.Transaction(func(tx *db.ClusterTx) error {
+		var err error
+		cts, err = tx.ContainerArgsList()
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return containerLoadAllInternal(cts, s)
+}
+
+func containerLoadNodeAll(s *state.State) ([]container, error) {
+	// Get all the container arguments
+	var cts []db.ContainerArgs
+	err := s.Cluster.Transaction(func(tx *db.ClusterTx) error {
+		var err error
+		cts, err = tx.ContainerArgsNodeList()
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return containerLoadAllInternal(cts, s)
+}
+
+func containerLoadAllInternal(cts []db.ContainerArgs, s *state.State) ([]container, error) {
+	// Figure out what profiles are in use
+	profiles := map[string]api.Profile{}
+	for _, cArgs := range cts {
+		for _, profile := range cArgs.Profiles {
+			_, ok := profiles[profile]
+			if !ok {
+				profiles[profile] = api.Profile{}
+			}
+		}
+	}
+
+	// Get the profile data
+	for name := range profiles {
+		_, profile, err := s.Cluster.ProfileGet(name)
+		if err != nil {
+			return nil, err
+		}
+
+		profiles[name] = *profile
+	}
+
+	// Load the container structs
+	containers := []container{}
+	for _, args := range cts {
+		// Figure out the container's profiles
+		cProfiles := []api.Profile{}
+		for _, name := range args.Profiles {
+			cProfiles = append(cProfiles, profiles[name])
+		}
+
+		ct, err := containerLXCLoad(s, args, cProfiles)
+		if err != nil {
+			return nil, err
+		}
+
+		containers = append(containers, ct)
+	}
+
+	return containers, nil
 }

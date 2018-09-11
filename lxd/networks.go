@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/gorilla/mux"
 	log "github.com/lxc/lxd/shared/log15"
+	"github.com/pkg/errors"
 
 	lxd "github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/cluster"
@@ -348,6 +350,11 @@ func networkGet(d *Daemon, r *http.Request) Response {
 }
 
 func doNetworkGet(d *Daemon, name string) (api.Network, error) {
+	// Ignore veth pairs (for performance reasons)
+	if strings.HasPrefix(name, "veth") {
+		return api.Network{}, os.ErrNotExist
+	}
+
 	// Get some information
 	osInfo, _ := net.InterfaceByName(name)
 	_, dbInfo, _ := d.cluster.NetworkGet(name)
@@ -362,23 +369,6 @@ func doNetworkGet(d *Daemon, name string) (api.Network, error) {
 	n.Name = name
 	n.UsedBy = []string{}
 	n.Config = map[string]string{}
-
-	// Look for containers using the interface
-	cts, err := d.cluster.ContainersList(db.CTypeRegular)
-	if err != nil {
-		return api.Network{}, err
-	}
-
-	for _, ct := range cts {
-		c, err := containerLoadByName(d.State(), ct)
-		if err != nil {
-			return api.Network{}, err
-		}
-
-		if networkIsInUse(c, n.Name) {
-			n.UsedBy = append(n.UsedBy, fmt.Sprintf("/%s/containers/%s", version.APIVersion, ct))
-		}
-	}
 
 	// Set the device type as needed
 	if osInfo != nil && shared.IsLoopback(osInfo) {
@@ -403,6 +393,20 @@ func doNetworkGet(d *Daemon, name string) (api.Network, error) {
 			n.Type = "bridge"
 		} else {
 			n.Type = "unknown"
+		}
+	}
+
+	// Look for containers using the interface
+	if n.Type != "loopback" {
+		cts, err := containerLoadAll(d.State())
+		if err != nil {
+			return api.Network{}, err
+		}
+
+		for _, c := range cts {
+			if networkIsInUse(c, n.Name) {
+				n.UsedBy = append(n.UsedBy, fmt.Sprintf("/%s/containers/%s", version.APIVersion, c.Name()))
+			}
 		}
 	}
 
@@ -435,7 +439,7 @@ func networkDelete(d *Daemon, r *http.Request) Response {
 	// Get the existing network
 	n, err := networkLoadByName(state, name)
 	if err != nil {
-		return NotFound
+		return NotFound(err)
 	}
 
 	withDatabase := true
@@ -503,7 +507,7 @@ func networkPost(d *Daemon, r *http.Request) Response {
 	// Get the existing network
 	n, err := networkLoadByName(state, name)
 	if err != nil {
-		return NotFound
+		return NotFound(err)
 	}
 
 	// Sanity checks
@@ -523,7 +527,7 @@ func networkPost(d *Daemon, r *http.Request) Response {
 	}
 
 	if shared.StringInSlice(req.Name, networks) {
-		return Conflict
+		return Conflict(fmt.Errorf("Network '%s' already exists", req.Name))
 	}
 
 	// Rename it
@@ -565,7 +569,7 @@ func networkPatch(d *Daemon, r *http.Request) Response {
 
 	// Get the existing network
 	_, dbInfo, err := d.cluster.NetworkGet(name)
-	if dbInfo != nil {
+	if err != nil {
 		return SmartError(err)
 	}
 
@@ -614,7 +618,7 @@ func doNetworkUpdate(d *Daemon, name string, oldConfig map[string]string, req ap
 	// Load the network
 	n, err := networkLoadByName(d.State(), name)
 	if err != nil {
-		return NotFound
+		return NotFound(err)
 	}
 
 	err = n.Update(req)
@@ -639,7 +643,7 @@ func networkLeasesGet(d *Daemon, r *http.Request) Response {
 
 	// Validate that we do have leases for it
 	if !n.Managed || n.Type != "bridge" {
-		return NotFound
+		return NotFound(errors.New("Leases not found"))
 	}
 
 	if !shared.PathExists(leaseFile) {
@@ -655,19 +659,13 @@ func networkLeasesGet(d *Daemon, r *http.Request) Response {
 	leases := []api.NetworkLease{}
 
 	// Get all the containers
-	containers, err := d.cluster.ContainersList(db.CTypeRegular)
+	containers, err := containerLoadAll(d.State())
 	if err != nil {
 		return SmartError(err)
 	}
 
 	// Get static leases
-	for _, cName := range containers {
-		// Load the container
-		c, err := containerLoadByName(d.State(), cName)
-		if err != nil {
-			continue
-		}
-
+	for _, c := range containers {
 		// Go through all its devices (including profiles
 		for k, d := range c.ExpandedDevices() {
 			// Skip uninteresting entries
@@ -684,7 +682,7 @@ func networkLeasesGet(d *Daemon, r *http.Request) Response {
 			// Add the lease
 			if d["ipv4.address"] != "" {
 				leases = append(leases, api.NetworkLease{
-					Hostname: cName,
+					Hostname: c.Name(),
 					Address:  d["ipv4.address"],
 					Hwaddr:   d["hwaddr"],
 					Type:     "static",
@@ -693,7 +691,7 @@ func networkLeasesGet(d *Daemon, r *http.Request) Response {
 
 			if d["ipv6.address"] != "" {
 				leases = append(leases, api.NetworkLease{
-					Hostname: cName,
+					Hostname: c.Name(),
 					Address:  d["ipv6.address"],
 					Hwaddr:   d["hwaddr"],
 					Type:     "static",
@@ -807,7 +805,6 @@ func networkShutdown(s *state.State) error {
 
 type network struct {
 	// Properties
-	db          *db.Node
 	state       *state.State
 	id          int64
 	name        string
@@ -827,17 +824,12 @@ func (n *network) IsRunning() bool {
 
 func (n *network) IsUsed() bool {
 	// Look for containers using the interface
-	cts, err := n.state.Cluster.ContainersList(db.CTypeRegular)
+	cts, err := containerLoadAll(n.state)
 	if err != nil {
 		return true
 	}
 
-	for _, ct := range cts {
-		c, err := containerLoadByName(n.state, ct)
-		if err != nil {
-			return true
-		}
-
+	for _, c := range cts {
 		if networkIsInUse(c, n.name) {
 			return true
 		}
@@ -929,7 +921,12 @@ func (n *network) Start() error {
 	// Create the bridge interface
 	if !n.IsRunning() {
 		if n.config["bridge.driver"] == "openvswitch" {
-			_, err := shared.RunCommand("ovs-vsctl", "add-br", n.name)
+			_, err := exec.LookPath("ovs-vsctl")
+			if err != nil {
+				return fmt.Errorf("Open vSwitch isn't installed on this system")
+			}
+
+			_, err = shared.RunCommand("ovs-vsctl", "add-br", n.name)
 			if err != nil {
 				return err
 			}
@@ -1091,7 +1088,9 @@ func (n *network) Start() error {
 		}
 
 		// Attempt a workaround for broken DHCP clients
-		networkIptablesPrepend("ipv4", n.name, "mangle", "POSTROUTING", "-o", n.name, "-p", "udp", "--dport", "68", "-j", "CHECKSUM", "--checksum-fill")
+		if n.config["ipv4.firewall"] == "" || shared.IsTrue(n.config["ipv4.firewall"]) {
+			networkIptablesPrepend("ipv4", n.name, "mangle", "POSTROUTING", "-o", n.name, "-p", "udp", "--dport", "68", "-j", "CHECKSUM", "--checksum-fill")
+		}
 
 		// Allow forwarding
 		if n.config["bridge.mode"] == "fan" || n.config["ipv4.routing"] == "" || shared.IsTrue(n.config["ipv4.routing"]) {
@@ -1243,10 +1242,10 @@ func (n *network) Start() error {
 		if (n.config["ipv6.dhcp"] == "" || shared.IsTrue(n.config["ipv6.dhcp"])) && (n.config["ipv6.firewall"] == "" || shared.IsTrue(n.config["ipv6.firewall"])) {
 			// Setup basic iptables overrides for DHCP/DNS
 			rules := [][]string{
-				{"ipv6", n.name, "", "INPUT", "-i", n.name, "-p", "udp", "--dport", "546", "-j", "ACCEPT"},
+				{"ipv6", n.name, "", "INPUT", "-i", n.name, "-p", "udp", "--dport", "547", "-j", "ACCEPT"},
 				{"ipv6", n.name, "", "INPUT", "-i", n.name, "-p", "udp", "--dport", "53", "-j", "ACCEPT"},
 				{"ipv6", n.name, "", "INPUT", "-i", n.name, "-p", "tcp", "--dport", "53", "-j", "ACCEPT"},
-				{"ipv6", n.name, "", "OUTPUT", "-o", n.name, "-p", "udp", "--sport", "546", "-j", "ACCEPT"},
+				{"ipv6", n.name, "", "OUTPUT", "-o", n.name, "-p", "udp", "--sport", "547", "-j", "ACCEPT"},
 				{"ipv6", n.name, "", "OUTPUT", "-o", n.name, "-p", "udp", "--sport", "53", "-j", "ACCEPT"},
 				{"ipv6", n.name, "", "OUTPUT", "-o", n.name, "-p", "tcp", "--sport", "53", "-j", "ACCEPT"}}
 
@@ -1268,13 +1267,14 @@ func (n *network) Start() error {
 			}
 
 			if shared.IsTrue(n.config["ipv6.dhcp.stateful"]) {
+				subnetSize, _ := subnet.Mask.Size()
 				if n.config["ipv6.dhcp.ranges"] != "" {
 					for _, dhcpRange := range strings.Split(n.config["ipv6.dhcp.ranges"], ",") {
 						dhcpRange = strings.TrimSpace(dhcpRange)
-						dnsmasqCmd = append(dnsmasqCmd, []string{"--dhcp-range", fmt.Sprintf("%s,%s", strings.Replace(dhcpRange, "-", ",", -1), expiry)}...)
+						dnsmasqCmd = append(dnsmasqCmd, []string{"--dhcp-range", fmt.Sprintf("%s,%d,%s", strings.Replace(dhcpRange, "-", ",", -1), subnetSize, expiry)}...)
 					}
 				} else {
-					dnsmasqCmd = append(dnsmasqCmd, []string{"--dhcp-range", fmt.Sprintf("%s,%s,%s", networkGetIP(subnet, 2), networkGetIP(subnet, -1), expiry)}...)
+					dnsmasqCmd = append(dnsmasqCmd, []string{"--dhcp-range", fmt.Sprintf("%s,%s,%d,%s", networkGetIP(subnet, 2), networkGetIP(subnet, -1), subnetSize, expiry)}...)
 				}
 			} else {
 				dnsmasqCmd = append(dnsmasqCmd, []string{"--dhcp-range", fmt.Sprintf("::,constructor:%s,ra-stateless,ra-names", n.name)}...)
@@ -1394,6 +1394,40 @@ func (n *network) Start() error {
 		addr := strings.Split(fanAddress, "/")
 		if n.config["fan.type"] == "ipip" {
 			fanAddress = fmt.Sprintf("%s/24", addr[0])
+		}
+
+		// Update the MTU based on overlay device (if available)
+		content, err := ioutil.ReadFile(fmt.Sprintf("/sys/class/net/%s/mtu", devName))
+		if err == nil {
+			// Parse value
+			fanMtuInt, err := strconv.ParseInt(strings.TrimSpace(string(content)), 10, 32)
+			if err != nil {
+				return err
+			}
+
+			// Apply overhead
+			if n.config["fan.type"] == "ipip" {
+				fanMtuInt = fanMtuInt - 20
+			} else {
+				fanMtuInt = fanMtuInt - 50
+			}
+
+			// Apply changes
+			fanMtu := fmt.Sprintf("%d", fanMtuInt)
+			if fanMtu != mtu {
+				mtu = fanMtu
+				if n.config["bridge.driver"] != "openvswitch" {
+					_, err = shared.RunCommand("ip", "link", "set", "dev", fmt.Sprintf("%s-mtu", n.name), "mtu", mtu)
+					if err != nil {
+						return err
+					}
+				}
+
+				_, err = shared.RunCommand("ip", "link", "set", "dev", n.name, "mtu", mtu)
+				if err != nil {
+					return err
+				}
+			}
 		}
 
 		// Parse the host subnet
@@ -1598,7 +1632,7 @@ func (n *network) Start() error {
 		// Check for dnsmasq
 		_, err := exec.LookPath("dnsmasq")
 		if err != nil {
-			return fmt.Errorf("dnsmasq is required for LXD managed bridges.")
+			return fmt.Errorf("dnsmasq is required for LXD managed bridges")
 		}
 
 		// Start dnsmasq (occasionally races, try a few times)
@@ -1708,8 +1742,15 @@ func (n *network) Update(newNetwork api.NetworkPut) error {
 	undoChanges := true
 	defer func() {
 		if undoChanges {
+			// Revert changes to the struct
 			n.config = oldConfig
 			n.description = oldDescription
+
+			// Update the database
+			n.state.Cluster.NetworkUpdate(n.name, n.description, n.config)
+
+			// Reset any change that was made to the bridge
+			n.Start()
 		}
 	}()
 

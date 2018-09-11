@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"github.com/CanonicalLtd/go-dqlite"
 	"github.com/gorilla/mux"
 	lxd "github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/cluster"
@@ -26,6 +27,33 @@ var clusterCmd = Command{
 	name: "cluster",
 	get:  clusterGet,
 	put:  clusterPut,
+}
+
+var clusterNodesCmd = Command{
+	name: "cluster/members",
+	get:  clusterNodesGet,
+}
+
+var clusterNodeCmd = Command{
+	name:   "cluster/members/{name}",
+	get:    clusterNodeGet,
+	post:   clusterNodePost,
+	delete: clusterNodeDelete,
+}
+
+var internalClusterAcceptCmd = Command{
+	name: "cluster/accept",
+	post: internalClusterPostAccept,
+}
+
+var internalClusterRebalanceCmd = Command{
+	name: "cluster/rebalance",
+	post: internalClusterPostRebalance,
+}
+
+var internalClusterPromoteCmd = Command{
+	name: "cluster/promote",
+	post: internalClusterPostPromote,
 }
 
 // Return information about the cluster.
@@ -318,7 +346,12 @@ func clusterPutDisable(d *Daemon) Response {
 	if err != nil {
 		return SmartError(err)
 	}
-	d.cluster, err = db.OpenCluster("db.bin", d.gateway.Dialer(), address, "/unused/db/dir")
+	store := d.gateway.ServerStore()
+	d.cluster, err = db.OpenCluster(
+		"db.bin", store, address, "/unused/db/dir",
+		dqlite.WithDialFunc(d.gateway.DialFunc()),
+		dqlite.WithContext(d.gateway.Context()),
+	)
 	if err != nil {
 		return SmartError(err)
 	}
@@ -359,11 +392,6 @@ func clusterAcceptMember(
 	return info, nil
 }
 
-var clusterNodesCmd = Command{
-	name: "cluster/members",
-	get:  clusterNodesGet,
-}
-
 func clusterNodesGet(d *Daemon, r *http.Request) Response {
 	recursion := util.IsRecursionRequest(r)
 
@@ -387,13 +415,6 @@ func clusterNodesGet(d *Daemon, r *http.Request) Response {
 	return SyncResponse(true, result)
 }
 
-var clusterNodeCmd = Command{
-	name:   "cluster/members/{name}",
-	get:    clusterNodeGet,
-	post:   clusterNodePost,
-	delete: clusterNodeDelete,
-}
-
 func clusterNodeGet(d *Daemon, r *http.Request) Response {
 	name := mux.Vars(r)["name"]
 
@@ -408,7 +429,7 @@ func clusterNodeGet(d *Daemon, r *http.Request) Response {
 		}
 	}
 
-	return NotFound
+	return NotFound(fmt.Errorf("Node '%s' not found", name))
 }
 
 func clusterNodePost(d *Daemon, r *http.Request) Response {
@@ -530,8 +551,6 @@ func tryClusterRebalance(d *Daemon) error {
 	return nil
 }
 
-var internalClusterAcceptCmd = Command{name: "cluster/accept", post: internalClusterPostAccept}
-
 func internalClusterPostAccept(d *Daemon, r *http.Request) Response {
 	req := internalClusterPostAcceptRequest{}
 
@@ -614,8 +633,6 @@ type internalRaftNode struct {
 	Address string `json:"address" yaml:"address"`
 }
 
-var internalClusterRebalanceCmd = Command{name: "cluster/rebalance", post: internalClusterPostRebalance}
-
 // Used to update the cluster after a database node has been removed, and
 // possibly promote another one as database node.
 func internalClusterPostRebalance(d *Daemon, r *http.Request) Response {
@@ -671,8 +688,6 @@ func internalClusterPostRebalance(d *Daemon, r *http.Request) Response {
 
 	return SyncResponse(true, nil)
 }
-
-var internalClusterPromoteCmd = Command{name: "cluster/promote", post: internalClusterPostPromote}
 
 // Used to promote the local non-database node to be a database one.
 func internalClusterPostPromote(d *Daemon, r *http.Request) Response {

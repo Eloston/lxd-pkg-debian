@@ -89,6 +89,12 @@ func networkGetInterfaces(cluster *db.Cluster) ([]string, error) {
 	}
 
 	for _, iface := range ifaces {
+		// Ignore veth pairs (for performance reasons)
+		if strings.HasPrefix(iface.Name, "veth") {
+			continue
+		}
+
+		// Append to the list
 		if !shared.StringInSlice(iface.Name, networks) {
 			networks = append(networks, iface.Name)
 		}
@@ -462,6 +468,11 @@ func networkDefaultGatewaySubnetV4() (*net.IPNet, string, error) {
 }
 
 func networkValidName(value string) error {
+	// Not a veth-liked name
+	if strings.HasPrefix(value, "veth") {
+		return fmt.Errorf("Interface name cannot be prefix with veth")
+	}
+
 	// Validate the length
 	if len(value) < 2 {
 		return fmt.Errorf("Interface name is too short (minimum 2 characters)")
@@ -746,12 +757,6 @@ func networkUpdateStatic(s *state.State, networkName string) error {
 	networkStaticLock.Lock()
 	defer networkStaticLock.Unlock()
 
-	// Get all the containers
-	containers, err := s.Cluster.ContainersList(db.CTypeRegular)
-	if err != nil {
-		return err
-	}
-
 	// Get all the networks
 	var networks []string
 	if networkName == "" {
@@ -764,15 +769,15 @@ func networkUpdateStatic(s *state.State, networkName string) error {
 		networks = []string{networkName}
 	}
 
+	// Get all the containers
+	containers, err := containerLoadNodeAll(s)
+	if err != nil {
+		return err
+	}
+
 	// Build a list of dhcp host entries
 	entries := map[string][][]string{}
-	for _, cName := range containers {
-		// Load the container
-		c, err := containerLoadByName(s, cName)
-		if err != nil {
-			continue
-		}
-
+	for _, c := range containers {
 		// Go through all its devices (including profiles
 		for k, d := range c.ExpandedDevices() {
 			// Skip uninteresting entries
@@ -792,7 +797,7 @@ func networkUpdateStatic(s *state.State, networkName string) error {
 				entries[d["parent"]] = [][]string{}
 			}
 
-			entries[d["parent"]] = append(entries[d["parent"]], []string{d["hwaddr"], cName, d["ipv4.address"], d["ipv6.address"]})
+			entries[d["parent"]] = append(entries[d["parent"]], []string{d["hwaddr"], c.Name(), d["ipv4.address"], d["ipv6.address"]})
 		}
 	}
 
@@ -933,7 +938,7 @@ func networkGetMacSlice(hwaddr string) []string {
 	return buf
 }
 
-func networkClearLease(s *state.State, network string, hwaddr string) error {
+func networkClearLease(s *state.State, name string, network string, hwaddr string) error {
 	leaseFile := shared.VarPath("networks", network, "dnsmasq.leases")
 
 	// Check that we are in fact running a dnsmasq for the network
@@ -965,6 +970,7 @@ func networkClearLease(s *state.State, network string, hwaddr string) error {
 		return err
 	}
 
+	knownMac := networkGetMacSlice(hwaddr)
 	for _, lease := range strings.Split(string(leases), "\n") {
 		if lease == "" {
 			continue
@@ -972,12 +978,16 @@ func networkClearLease(s *state.State, network string, hwaddr string) error {
 
 		fields := strings.Fields(lease)
 		if len(fields) > 2 {
-			leaseMac := networkGetMacSlice(fields[1])
-			leaseMacStr := strings.Join(leaseMac, ":")
-			knownMac := networkGetMacSlice(hwaddr)
-			knownMacStr := strings.Join(
-				knownMac[len(knownMac)-len(leaseMac):], ":")
-			if knownMacStr == leaseMacStr {
+			if strings.Contains(fields[1], ":") {
+				leaseMac := networkGetMacSlice(fields[1])
+				leaseMacStr := strings.Join(leaseMac, ":")
+
+				knownMacStr := strings.Join(knownMac[len(knownMac)-len(leaseMac):], ":")
+				if knownMacStr == leaseMacStr {
+					continue
+				}
+			} else if len(fields) > 3 && fields[3] == name {
+				// Mostly IPv6 leases which don't contain a MAC address...
 				continue
 			}
 		}

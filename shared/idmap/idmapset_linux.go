@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/logger"
 )
 
 type IdRange struct {
@@ -124,7 +125,7 @@ func (e *IdmapEntry) Usable() error {
 		}
 
 		if !valid {
-			return fmt.Errorf("The '%s' map can't work in the current user namespace.", e.ToLxcString())
+			return fmt.Errorf("The '%s' map can't work in the current user namespace", e.ToLxcString())
 		}
 	}
 
@@ -143,7 +144,7 @@ func (e *IdmapEntry) Usable() error {
 		}
 
 		if !valid {
-			return fmt.Errorf("The '%s' map can't work in the current user namespace.", e.ToLxcString())
+			return fmt.Errorf("The '%s' map can't work in the current user namespace", e.ToLxcString())
 		}
 	}
 
@@ -203,7 +204,7 @@ func (e *IdmapEntry) parse(s string) error {
 func (e *IdmapEntry) shift_into_ns(id int64) (int64, error) {
 	if id < e.Nsid || id >= e.Nsid+e.Maprange {
 		// this mapping doesn't apply
-		return 0, fmt.Errorf("ID mapping doesn't apply.")
+		return 0, fmt.Errorf("ID mapping doesn't apply")
 	}
 
 	return id - e.Nsid + e.Hostid, nil
@@ -216,7 +217,7 @@ func (e *IdmapEntry) shift_into_ns(id int64) (int64, error) {
 func (e *IdmapEntry) shift_from_ns(id int64) (int64, error) {
 	if id < e.Hostid || id >= e.Hostid+e.Maprange {
 		// this mapping doesn't apply
-		return 0, fmt.Errorf("ID mapping doesn't apply.")
+		return 0, fmt.Errorf("ID mapping doesn't apply")
 	}
 
 	return id - e.Hostid + e.Nsid, nil
@@ -467,7 +468,15 @@ func (m IdmapSet) ShiftFromNs(uid int64, gid int64) (int64, int64) {
 	return m.doShiftIntoNs(uid, gid, "out")
 }
 
-func (set *IdmapSet) doUidshiftIntoContainer(dir string, testmode bool, how string) error {
+func (set *IdmapSet) doUidshiftIntoContainer(dir string, testmode bool, how string, skipper func(dir string, absPath string, fi os.FileInfo) bool) error {
+	v3Caps := true
+	if how == "in" {
+		if !supportsV3Fcaps(dir) {
+			logger.Debugf("System doesn't support unprivileged file capabilities")
+			v3Caps = false
+		}
+	}
+
 	// Expand any symlink before the final path component
 	tmp := filepath.Dir(dir)
 	tmp, err := filepath.EvalSymlinks(tmp)
@@ -481,6 +490,10 @@ func (set *IdmapSet) doUidshiftIntoContainer(dir string, testmode bool, how stri
 	convert := func(path string, fi os.FileInfo, err error) (e error) {
 		if err != nil {
 			return err
+		}
+
+		if skipper != nil && skipper(dir, path, fi) {
+			return filepath.SkipDir
 		}
 
 		intUid, intGid, _, _, inode, nlink, err := shared.GetFileStat(path)
@@ -501,6 +514,7 @@ func (set *IdmapSet) doUidshiftIntoContainer(dir string, testmode bool, how stri
 
 		uid := int64(intUid)
 		gid := int64(intGid)
+		caps := []byte{}
 
 		var newuid, newgid int64
 		switch how {
@@ -513,16 +527,44 @@ func (set *IdmapSet) doUidshiftIntoContainer(dir string, testmode bool, how stri
 		if testmode {
 			fmt.Printf("I would shift %q to %d %d\n", path, newuid, newgid)
 		} else {
+			// Dump capabilities
+			if fi.Mode()&os.ModeSymlink == 0 {
+				caps, err = GetCaps(path)
+				if err != nil {
+					return err
+				}
+			}
+
+			// Shift owner
 			err = ShiftOwner(dir, path, int(newuid), int(newgid))
 			if err != nil {
 				return err
 			}
 
-			err = ShiftACL(path, func(uid int64, gid int64) (int64, int64) { return set.doShiftIntoNs(uid, gid, how) })
-			if err != nil {
-				return err
+			if fi.Mode()&os.ModeSymlink == 0 {
+				// Shift POSIX ACLs
+				err = ShiftACL(path, func(uid int64, gid int64) (int64, int64) { return set.doShiftIntoNs(uid, gid, how) })
+				if err != nil {
+					return err
+				}
+
+				// Shift capabilities
+				if len(caps) != 0 {
+					rootUid := int64(0)
+					if how == "in" {
+						rootUid, _ = set.ShiftIntoNs(0, 0)
+					}
+
+					if how != "in" || v3Caps {
+						err = SetCaps(path, caps, rootUid)
+						if err != nil {
+							logger.Warnf("Unable to set file capabilities on %s", path)
+						}
+					}
+				}
 			}
 		}
+
 		return nil
 	}
 
@@ -534,23 +576,23 @@ func (set *IdmapSet) doUidshiftIntoContainer(dir string, testmode bool, how stri
 }
 
 func (set *IdmapSet) UidshiftIntoContainer(dir string, testmode bool) error {
-	return set.doUidshiftIntoContainer(dir, testmode, "in")
+	return set.doUidshiftIntoContainer(dir, testmode, "in", nil)
 }
 
 func (set *IdmapSet) UidshiftFromContainer(dir string, testmode bool) error {
-	return set.doUidshiftIntoContainer(dir, testmode, "out")
+	return set.doUidshiftIntoContainer(dir, testmode, "out", nil)
 }
 
-func (set *IdmapSet) ShiftRootfs(p string) error {
-	return set.doUidshiftIntoContainer(p, false, "in")
+func (set *IdmapSet) ShiftRootfs(p string, skipper func(dir string, absPath string, fi os.FileInfo) bool) error {
+	return set.doUidshiftIntoContainer(p, false, "in", skipper)
 }
 
-func (set *IdmapSet) UnshiftRootfs(p string) error {
-	return set.doUidshiftIntoContainer(p, false, "out")
+func (set *IdmapSet) UnshiftRootfs(p string, skipper func(dir string, absPath string, fi os.FileInfo) bool) error {
+	return set.doUidshiftIntoContainer(p, false, "out", skipper)
 }
 
 func (set *IdmapSet) ShiftFile(p string) error {
-	return set.ShiftRootfs(p)
+	return set.ShiftRootfs(p, nil)
 }
 
 /*
@@ -597,7 +639,7 @@ func getFromShadow(fname string, username string) ([][]int64, error) {
 	}
 
 	if len(entries) == 0 {
-		return nil, fmt.Errorf("User %q has no %ss.", username, path.Base(fname))
+		return nil, fmt.Errorf("User %q has no %ss", username, path.Base(fname))
 	}
 
 	return entries, nil
@@ -660,7 +702,7 @@ func getFromProc(fname string) ([][]int64, error) {
 /*
  * Create a new default idmap
  */
-func DefaultIdmapSet(username string) (*IdmapSet, error) {
+func DefaultIdmapSet(rootfs string, username string) (*IdmapSet, error) {
 	idmapset := new(IdmapSet)
 
 	if username == "" {
@@ -672,9 +714,12 @@ func DefaultIdmapSet(username string) (*IdmapSet, error) {
 		username = currentUser.Username
 	}
 
-	if shared.PathExists("/etc/subuid") && shared.PathExists("/etc/subgid") {
+	// Check if shadow's uidmap tools are installed
+	subuidPath := path.Join(rootfs, "/etc/subuid")
+	subgidPath := path.Join(rootfs, "/etc/subgid")
+	if shared.PathExists(subuidPath) && shared.PathExists(subgidPath) {
 		// Parse the shadow uidmap
-		entries, err := getFromShadow("/etc/subuid", username)
+		entries, err := getFromShadow(subuidPath, username)
 		if err != nil {
 			return nil, err
 		}
@@ -693,7 +738,7 @@ func DefaultIdmapSet(username string) (*IdmapSet, error) {
 		}
 
 		// Parse the shadow gidmap
-		entries, err = getFromShadow("/etc/subgid", username)
+		entries, err = getFromShadow(subgidPath, username)
 		if err != nil {
 			return nil, err
 		}

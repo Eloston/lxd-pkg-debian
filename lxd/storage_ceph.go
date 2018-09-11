@@ -25,6 +25,8 @@ type storageCeph struct {
 	storageShared
 }
 
+var cephVersion = ""
+
 func (s *storageCeph) StorageCoreInit() error {
 	s.sType = storageTypeCeph
 	typeName, err := storageTypeToString(s.sType)
@@ -33,13 +35,18 @@ func (s *storageCeph) StorageCoreInit() error {
 	}
 	s.sTypeName = typeName
 
+	if cephVersion != "" {
+		s.sTypeVersion = cephVersion
+		return nil
+	}
+
 	msg, err := shared.RunCommand("rbd", "--version")
 	if err != nil {
 		return fmt.Errorf("Error getting CEPH version: %s", err)
 	}
 	s.sTypeVersion = strings.TrimSpace(msg)
+	cephVersion = s.sTypeVersion
 
-	logger.Debugf("Initializing a CEPH driver")
 	return nil
 }
 
@@ -129,13 +136,10 @@ func (s *storageCeph) StoragePoolCreate() error {
 			s.ClusterName, "osd", "pool", "create", s.OSDPoolName,
 			s.PGNum)
 		if err != nil {
-			logger.Errorf(`Failed to create CEPH osd storage pool `+
-				`"%s" in cluster "%s": %s`, s.OSDPoolName,
-				s.ClusterName, msg)
+			logger.Errorf(`Failed to create CEPH osd storage pool "%s" in cluster "%s": %s`, s.OSDPoolName, s.ClusterName, msg)
 			return err
 		}
-		logger.Debugf(`Created CEPH osd storage pool "%s" in cluster `+
-			`"%s"`, s.OSDPoolName, s.ClusterName)
+		logger.Debugf(`Created CEPH osd storage pool "%s" in cluster "%s"`, s.OSDPoolName, s.ClusterName)
 
 		defer func() {
 			if !revert {
@@ -145,9 +149,7 @@ func (s *storageCeph) StoragePoolCreate() error {
 			err := cephOSDPoolDestroy(s.ClusterName, s.OSDPoolName,
 				s.UserName)
 			if err != nil {
-				logger.Warnf(`Failed to delete ceph storage `+
-					`pool "%s" in cluster "%s": %s`,
-					s.OSDPoolName, s.ClusterName, err)
+				logger.Warnf(`Failed to delete ceph storage pool "%s" in cluster "%s": %s`, s.OSDPoolName, s.ClusterName, err)
 			}
 		}()
 
@@ -160,22 +162,14 @@ func (s *storageCeph) StoragePoolCreate() error {
 			"--cluster", s.ClusterName, "osd", "pool", "get",
 			s.OSDPoolName, "pg_num")
 		if err != nil {
-			logger.Errorf(`Failed to retrieve number of placement `+
-				`groups for CEPH osd storage pool "%s" in `+
-				`cluster "%s": %s`, s.OSDPoolName,
-				s.ClusterName, msg)
+			logger.Errorf(`Failed to retrieve number of placement groups for CEPH osd storage pool "%s" in cluster "%s": %s`, s.OSDPoolName, s.ClusterName, msg)
 			return err
 		}
-		logger.Debugf(`Retrieved number of placement groups or CEPH `+
-			`osd storage pool "%s" in cluster "%s"`, s.OSDPoolName,
-			s.ClusterName)
+		logger.Debugf(`Retrieved number of placement groups or CEPH osd storage pool "%s" in cluster "%s"`, s.OSDPoolName, s.ClusterName)
 
 		idx := strings.Index(msg, "pg_num:")
 		if idx == -1 {
-			logger.Errorf(`Failed to parse number of placement `+
-				`groups for CEPH osd storage pool "%s" in `+
-				`cluster "%s": %s`, s.OSDPoolName,
-				s.ClusterName, msg)
+			logger.Errorf(`Failed to parse number of placement groups for CEPH osd storage pool "%s" in cluster "%s": %s`, s.OSDPoolName, s.ClusterName, msg)
 		}
 
 		msg = msg[(idx + len("pg_num:")):]
@@ -209,13 +203,10 @@ func (s *storageCeph) StoragePoolCreate() error {
 	poolMntPoint := getStoragePoolMountPoint(s.pool.Name)
 	err := os.MkdirAll(poolMntPoint, 0711)
 	if err != nil {
-		logger.Errorf(`Failed to create mountpoint "%s" for ceph `+
-			`storage pool "%s" in cluster "%s": %s`, poolMntPoint,
-			s.OSDPoolName, s.ClusterName, err)
+		logger.Errorf(`Failed to create mountpoint "%s" for ceph storage pool "%s" in cluster "%s": %s`, poolMntPoint, s.OSDPoolName, s.ClusterName, err)
 		return err
 	}
-	logger.Debugf(`Created mountpoint "%s" for ceph storage pool "%s" in `+
-		`cluster "%s"`, poolMntPoint, s.OSDPoolName, s.ClusterName)
+	logger.Debugf(`Created mountpoint "%s" for ceph storage pool "%s" in cluster "%s"`, poolMntPoint, s.OSDPoolName, s.ClusterName)
 
 	defer func() {
 		if !revert {
@@ -224,9 +215,7 @@ func (s *storageCeph) StoragePoolCreate() error {
 
 		err := os.Remove(poolMntPoint)
 		if err != nil {
-			logger.Errorf(`Failed to delete mountpoint "%s" for `+
-				`ceph storage pool "%s" in cluster "%s": %s`,
-				poolMntPoint, s.OSDPoolName, s.ClusterName, err)
+			logger.Errorf(`Failed to delete mountpoint "%s" for ceph storage pool "%s" in cluster "%s": %s`, poolMntPoint, s.OSDPoolName, s.ClusterName, err)
 		}
 	}()
 
@@ -241,13 +230,10 @@ func (s *storageCeph) StoragePoolCreate() error {
 		err = cephRBDVolumeCreate(s.ClusterName, s.OSDPoolName,
 			s.OSDPoolName, "lxd", "0", s.UserName)
 		if err != nil {
-			logger.Errorf(`Failed to create RBD storage volume `+
-				`"%s" on storage pool "%s": %s`, s.pool.Name,
-				s.pool.Name, err)
+			logger.Errorf(`Failed to create RBD storage volume "%s" on storage pool "%s": %s`, s.pool.Name, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Created RBD storage volume "%s" on storage `+
-			`pool "%s"`, s.pool.Name, s.pool.Name)
+		logger.Debugf(`Created RBD storage volume "%s" on storage pool "%s"`, s.pool.Name, s.pool.Name)
 	} else {
 		msg := fmt.Sprintf(`CEPH OSD storage pool "%s" in cluster `+
 			`"%s" seems to be in use by another LXD instace`,
@@ -277,25 +263,20 @@ func (s *storageCeph) StoragePoolDelete() error {
 	// test if pool exists
 	poolExists := cephOSDPoolExists(s.ClusterName, s.OSDPoolName, s.UserName)
 	if !poolExists {
-		logger.Warnf(`CEPH osd storage pool "%s" does not exist `+
-			`in cluster "%s"`, s.OSDPoolName, s.ClusterName)
+		logger.Warnf(`CEPH osd storage pool "%s" does not exist in cluster "%s"`, s.OSDPoolName, s.ClusterName)
 	}
 
 	// Check whether we own the pool and only remove in this case.
 	if s.pool.Config["volatile.pool.pristine"] != "" &&
 		shared.IsTrue(s.pool.Config["volatile.pool.pristine"]) {
-		logger.Debugf(`Detected that this LXD instance is the owner `+
-			`of the CEPH osd storage pool "%s" in cluster "%s"`,
-			s.OSDPoolName, s.ClusterName)
+		logger.Debugf(`Detected that this LXD instance is the owner of the CEPH osd storage pool "%s" in cluster "%s"`, s.OSDPoolName, s.ClusterName)
 
 		// Delete the osd pool.
 		if poolExists {
 			err := cephOSDPoolDestroy(s.ClusterName, s.OSDPoolName,
 				s.UserName)
 			if err != nil {
-				logger.Errorf(`Failed to delete CEPH OSD storage pool `+
-					`"%s" in cluster "%s": %s`, s.pool.Name,
-					s.ClusterName, err)
+				logger.Errorf(`Failed to delete CEPH OSD storage pool "%s" in cluster "%s": %s`, s.pool.Name, s.ClusterName, err)
 				return err
 			}
 		}
@@ -308,13 +289,10 @@ func (s *storageCeph) StoragePoolDelete() error {
 	if shared.PathExists(poolMntPoint) {
 		err := os.RemoveAll(poolMntPoint)
 		if err != nil {
-			logger.Errorf(`Failed to delete mountpoint "%s" for CEPH osd `+
-				`storage pool "%s" in cluster "%s": %s`, poolMntPoint,
-				s.OSDPoolName, s.ClusterName, err)
+			logger.Errorf(`Failed to delete mountpoint "%s" for CEPH osd storage pool "%s" in cluster "%s": %s`, poolMntPoint, s.OSDPoolName, s.ClusterName, err)
 			return err
 		}
-		logger.Debugf(`Deleted mountpoint "%s" for CEPH osd storage pool "%s" `+
-			`in cluster "%s"`, poolMntPoint, s.OSDPoolName, s.ClusterName)
+		logger.Debugf(`Deleted mountpoint "%s" for CEPH osd storage pool "%s" in cluster "%s"`, poolMntPoint, s.OSDPoolName, s.ClusterName)
 	}
 
 	logger.Infof(`Deleted CEPH OSD storage pool "%s" in cluster "%s"`,
@@ -361,20 +339,16 @@ func (s *storageCeph) StoragePoolVolumeCreate() error {
 	// get size
 	RBDSize, err := s.getRBDSize()
 	if err != nil {
-		logger.Errorf(`Failed to retrieve size of RBD storage volume `+
-			`"%s" on storage pool "%s": %s`, s.volume.Name,
-			s.pool.Name, err)
+		logger.Errorf(`Failed to retrieve size of RBD storage volume "%s" on storage pool "%s": %s`, s.volume.Name, s.pool.Name, err)
 		return err
 	}
-	logger.Debugf(`Retrieved size "%s" of RBD storage volume "%s" on `+
-		`storage pool "%s"`, RBDSize, s.volume.Name, s.pool.Name)
+	logger.Debugf(`Retrieved size "%s" of RBD storage volume "%s" on storage pool "%s"`, RBDSize, s.volume.Name, s.pool.Name)
 
 	// create volume
 	err = cephRBDVolumeCreate(s.ClusterName, s.OSDPoolName, s.volume.Name,
 		storagePoolVolumeTypeNameCustom, RBDSize, s.UserName)
 	if err != nil {
-		logger.Errorf(`Failed to create RBD storage volume "%s" on `+
-			`storage pool "%s": %s`, s.volume.Name, s.pool.Name, err)
+		logger.Errorf(`Failed to create RBD storage volume "%s" on storage pool "%s": %s`, s.volume.Name, s.pool.Name, err)
 		return err
 	}
 	logger.Debugf(`Created RBD storage volume "%s" on storage pool "%s"`,
@@ -388,17 +362,14 @@ func (s *storageCeph) StoragePoolVolumeCreate() error {
 		err := cephRBDVolumeDelete(s.ClusterName, s.OSDPoolName,
 			s.volume.Name, storagePoolVolumeTypeNameCustom, s.UserName)
 		if err != nil {
-			logger.Warnf(`Failed to delete RBD storage volume `+
-				`"%s" on storage pool "%s": %s`, s.volume.Name,
-				s.pool.Name, err)
+			logger.Warnf(`Failed to delete RBD storage volume "%s" on storage pool "%s": %s`, s.volume.Name, s.pool.Name, err)
 		}
 	}()
 
 	RBDDevPath, err := cephRBDVolumeMap(s.ClusterName, s.OSDPoolName,
 		s.volume.Name, storagePoolVolumeTypeNameCustom, s.UserName)
 	if err != nil {
-		logger.Errorf(`Failed to map RBD storage volume for "%s" on `+
-			`storage pool "%s": %s`, s.volume.Name, s.pool.Name, err)
+		logger.Errorf(`Failed to map RBD storage volume for "%s" on storage pool "%s": %s`, s.volume.Name, s.pool.Name, err)
 		return err
 	}
 	logger.Debugf(`Mapped RBD storage volume for "%s" on storage pool "%s"`,
@@ -413,41 +384,28 @@ func (s *storageCeph) StoragePoolVolumeCreate() error {
 			s.volume.Name, storagePoolVolumeTypeNameCustom,
 			s.UserName, true)
 		if err != nil {
-			logger.Warnf(`Failed to unmap RBD storage volume `+
-				`"%s" on storage pool "%s": %s`, s.volume.Name,
-				s.pool.Name, err)
+			logger.Warnf(`Failed to unmap RBD storage volume "%s" on storage pool "%s": %s`, s.volume.Name, s.pool.Name, err)
 		}
 	}()
 
 	// get filesystem
 	RBDFilesystem := s.getRBDFilesystem()
-	logger.Debugf(`Retrieved filesystem type "%s" of RBD storage volume `+
-		`"%s" on storage pool "%s"`, RBDFilesystem, s.volume.Name,
-		s.pool.Name)
+	logger.Debugf(`Retrieved filesystem type "%s" of RBD storage volume "%s" on storage pool "%s"`, RBDFilesystem, s.volume.Name, s.pool.Name)
 
 	msg, err := makeFSType(RBDDevPath, RBDFilesystem, nil)
 	if err != nil {
-		logger.Errorf(`Failed to create filesystem type "%s" on `+
-			`device path "%s" for RBD storage volume "%s" on `+
-			`storage pool "%s": %s`, RBDFilesystem, RBDDevPath,
-			s.volume.Name, s.pool.Name, msg)
+		logger.Errorf(`Failed to create filesystem type "%s" on device path "%s" for RBD storage volume "%s" on storage pool "%s": %s`, RBDFilesystem, RBDDevPath, s.volume.Name, s.pool.Name, msg)
 		return err
 	}
-	logger.Debugf(`Created filesystem type "%s" on device path "%s" for `+
-		`RBD storage volume "%s" on storage pool "%s"`, RBDFilesystem,
-		RBDDevPath, s.volume.Name, s.pool.Name)
+	logger.Debugf(`Created filesystem type "%s" on device path "%s" for RBD storage volume "%s" on storage pool "%s"`, RBDFilesystem, RBDDevPath, s.volume.Name, s.pool.Name)
 
 	volumeMntPoint := getStoragePoolVolumeMountPoint(s.pool.Name, s.volume.Name)
 	err = os.MkdirAll(volumeMntPoint, 0711)
 	if err != nil {
-		logger.Errorf(`Failed to create mountpoint "%s" for RBD `+
-			`storage volume "%s" on storage pool "%s": %s"`,
-			volumeMntPoint, s.volume.Name, s.pool.Name, err)
+		logger.Errorf(`Failed to create mountpoint "%s" for RBD storage volume "%s" on storage pool "%s": %s"`, volumeMntPoint, s.volume.Name, s.pool.Name, err)
 		return err
 	}
-	logger.Debugf(`Created mountpoint "%s" for RBD storage volume "%s" `+
-		`on storage pool "%s"`, volumeMntPoint, s.volume.Name,
-		s.pool.Name)
+	logger.Debugf(`Created mountpoint "%s" for RBD storage volume "%s" on storage pool "%s"`, volumeMntPoint, s.volume.Name, s.pool.Name)
 
 	defer func() {
 		if !revert {
@@ -456,13 +414,11 @@ func (s *storageCeph) StoragePoolVolumeCreate() error {
 
 		err := os.Remove(volumeMntPoint)
 		if err != nil {
-			logger.Warnf(`Failed to delete mountpoint "%s" for RBD `+
-				`storage volume "%s" on storage pool "%s": %s"`,
-				volumeMntPoint, s.volume.Name, s.pool.Name, err)
+			logger.Warnf(`Failed to delete mountpoint "%s" for RBD storage volume "%s" on storage pool "%s": %s"`, volumeMntPoint, s.volume.Name, s.pool.Name, err)
 		}
 	}()
 
-	// apply quota
+	// Apply quota
 	if s.volume.Config["size"] != "" {
 		size, err := shared.ParseByteSizeString(s.volume.Config["size"])
 		if err != nil {
@@ -491,12 +447,9 @@ func (s *storageCeph) StoragePoolVolumeDelete() error {
 	if shared.IsMountPoint(volumeMntPoint) {
 		err := tryUnmount(volumeMntPoint, syscall.MNT_DETACH)
 		if err != nil {
-			logger.Errorf(`Failed to unmount RBD storage volume `+
-				`"%s" on storage pool "%s": %s`, s.volume.Name,
-				s.pool.Name, err)
+			logger.Errorf(`Failed to unmount RBD storage volume "%s" on storage pool "%s": %s`, s.volume.Name, s.pool.Name, err)
 		}
-		logger.Debugf(`Unmounted RBD storage volume "%s" on storage `+
-			`pool "%s"`, s.volume.Name, s.pool.Name)
+		logger.Debugf(`Unmounted RBD storage volume "%s" on storage pool "%s"`, s.volume.Name, s.pool.Name)
 	}
 
 	rbdVolumeExists := cephRBDVolumeExists(s.ClusterName, s.OSDPoolName,
@@ -519,24 +472,17 @@ func (s *storageCeph) StoragePoolVolumeDelete() error {
 		storagePoolVolumeTypeCustom,
 		s.poolID)
 	if err != nil {
-		logger.Errorf(`Failed to delete database entry for RBD `+
-			`storage volume "%s" on storage pool "%s"`,
-			s.volume.Name, s.pool.Name)
+		logger.Errorf(`Failed to delete database entry for RBD storage volume "%s" on storage pool "%s"`, s.volume.Name, s.pool.Name)
 	}
-	logger.Debugf(`Deleted database entry for RBD storage volume "%s" on `+
-		`storage pool "%s"`, s.volume.Name, s.pool.Name)
+	logger.Debugf(`Deleted database entry for RBD storage volume "%s" on storage pool "%s"`, s.volume.Name, s.pool.Name)
 
 	if shared.PathExists(volumeMntPoint) {
 		err = os.Remove(volumeMntPoint)
 		if err != nil {
-			logger.Errorf(`Failed to delete mountpoint "%s" for RBD `+
-				`storage volume "%s" on storage pool "%s": %s"`,
-				volumeMntPoint, s.volume.Name, s.pool.Name, err)
+			logger.Errorf(`Failed to delete mountpoint "%s" for RBD storage volume "%s" on storage pool "%s": %s"`, volumeMntPoint, s.volume.Name, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Deleted mountpoint "%s" for RBD storage volume "%s" `+
-			`on storage pool "%s"`, volumeMntPoint, s.volume.Name,
-			s.pool.Name)
+		logger.Debugf(`Deleted mountpoint "%s" for RBD storage volume "%s" on storage pool "%s"`, volumeMntPoint, s.volume.Name, s.pool.Name)
 	}
 
 	logger.Debugf(`Deleted RBD storage volume "%s" on storage pool "%s"`,
@@ -556,14 +502,11 @@ func (s *storageCeph) StoragePoolVolumeMount() (bool, error) {
 	if waitChannel, ok := lxdStorageOngoingOperationMap[customMountLockID]; ok {
 		lxdStorageMapLock.Unlock()
 		if _, ok := <-waitChannel; ok {
-			logger.Warnf(`Received value over semaphore. This ` +
-				`should not have happened`)
+			logger.Warnf(`Received value over semaphore. This should not have happened`)
 		}
 		// Give the benefit of the doubt and assume that the other
 		// thread actually succeeded in mounting the storage volume.
-		logger.Debugf(`RBD storage volume "%s" on storage pool "%s" `+
-			`appears to be already mounted`, s.volume.Name,
-			s.pool.Name)
+		logger.Debugf(`RBD storage volume "%s" on storage pool "%s" appears to be already mounted`, s.volume.Name, s.pool.Name)
 		return false, nil
 	}
 
@@ -596,9 +539,7 @@ func (s *storageCeph) StoragePoolVolumeMount() (bool, error) {
 	lxdStorageMapLock.Unlock()
 
 	if customerr != nil || ret < 0 {
-		logger.Errorf(`Failed to mount RBD storage volume "%s" on `+
-			`storage pool "%s": %s`, s.volume.Name, s.pool.Name,
-			customerr)
+		logger.Errorf(`Failed to mount RBD storage volume "%s" on storage pool "%s": %s`, s.volume.Name, s.pool.Name, customerr)
 		return false, customerr
 	}
 
@@ -618,14 +559,11 @@ func (s *storageCeph) StoragePoolVolumeUmount() (bool, error) {
 	if waitChannel, ok := lxdStorageOngoingOperationMap[customMountLockID]; ok {
 		lxdStorageMapLock.Unlock()
 		if _, ok := <-waitChannel; ok {
-			logger.Warnf(`Received value over semaphore. This ` +
-				`should not have happened`)
+			logger.Warnf(`Received value over semaphore. This should not have happened`)
 		}
 		// Give the benefit of the doubt and assume that the other
 		// thread actually succeeded in unmounting the storage volume.
-		logger.Debugf(`RBD storage volume "%s" on storage pool "%s" `+
-			`appears to be already unmounted`, s.volume.Name,
-			s.pool.Name)
+		logger.Debugf(`RBD storage volume "%s" on storage pool "%s" appears to be already unmounted`, s.volume.Name, s.pool.Name)
 		return false, nil
 	}
 
@@ -637,9 +575,7 @@ func (s *storageCeph) StoragePoolVolumeUmount() (bool, error) {
 	if shared.IsMountPoint(volumeMntPoint) {
 		customerr = tryUnmount(volumeMntPoint, syscall.MNT_DETACH)
 		ourUmount = true
-		logger.Debugf(`Path "%s" is a mountpoint for RBD storage `+
-			`volume "%s" on storage pool "%s"`, volumeMntPoint,
-			s.volume.Name, s.pool.Name)
+		logger.Debugf(`Path "%s" is a mountpoint for RBD storage volume "%s" on storage pool "%s"`, volumeMntPoint, s.volume.Name, s.pool.Name)
 	}
 
 	lxdStorageMapLock.Lock()
@@ -650,9 +586,7 @@ func (s *storageCeph) StoragePoolVolumeUmount() (bool, error) {
 	lxdStorageMapLock.Unlock()
 
 	if customerr != nil {
-		logger.Errorf(`Failed to unmount RBD storage volume "%s" on `+
-			`storage pool "%s": %s`, s.volume.Name, s.pool.Name,
-			customerr)
+		logger.Errorf(`Failed to unmount RBD storage volume "%s" on storage pool "%s": %s`, s.volume.Name, s.pool.Name, customerr)
 		return false, customerr
 	}
 
@@ -721,8 +655,7 @@ func (s *storageCeph) StoragePoolVolumeRename(newName string) error {
 		s.volume.Name, storagePoolVolumeTypeNameCustom,
 		s.UserName, true)
 	if err != nil {
-		logger.Errorf(`Failed to unmap RBD storage volume for `+`container "%s" on storage pool "%s": %s`,
-			s.volume.Name, s.pool.Name, err)
+		logger.Errorf(`Failed to unmap RBD storage volume for container "%s" on storage pool "%s": %s`, s.volume.Name, s.pool.Name, err)
 		return err
 	}
 	logger.Debugf(`Unmapped RBD storage volume for container "%s" on storage pool "%s"`,
@@ -783,19 +716,16 @@ func (s *storageCeph) StoragePoolUpdate(writable *api.StoragePoolPut, changedCon
 }
 
 func (s *storageCeph) ContainerStorageReady(name string) bool {
-	logger.Debugf(`Checking if RBD storage volume for container "%s" `+
-		`on storage pool "%s" is ready`, name, s.pool.Name)
+	logger.Debugf(`Checking if RBD storage volume for container "%s" on storage pool "%s" is ready`, name, s.pool.Name)
 
 	ok := cephRBDVolumeExists(s.ClusterName, s.OSDPoolName, name,
 		storagePoolVolumeTypeNameContainer, s.UserName)
 	if !ok {
-		logger.Debugf(`RBD storage volume for container "%s" `+
-			`on storage pool "%s" does not exist`, name, s.pool.Name)
+		logger.Debugf(`RBD storage volume for container "%s" on storage pool "%s" does not exist`, name, s.pool.Name)
 		return false
 	}
 
-	logger.Debugf(`RBD storage volume for container "%s" `+
-		`on storage pool "%s" is ready`, name, s.pool.Name)
+	logger.Debugf(`RBD storage volume for container "%s" on storage pool "%s" is ready`, name, s.pool.Name)
 	return true
 }
 
@@ -808,21 +738,18 @@ func (s *storageCeph) ContainerCreate(container container) error {
 
 	err = container.TemplateApply("create")
 	if err != nil {
-		logger.Errorf(`Failed to apply create template for container `+
-			`"%s": %s`, containerName, err)
+		logger.Errorf(`Failed to apply create template for container "%s": %s`, containerName, err)
 		return err
 	}
 	logger.Debugf(`Applied create template for container "%s"`,
 		containerName)
 
-	logger.Debugf(`Created RBD storage volume for container "%s" on `+
-		`storage pool "%s"`, containerName, s.pool.Name)
+	logger.Debugf(`Created RBD storage volume for container "%s" on storage pool "%s"`, containerName, s.pool.Name)
 	return nil
 }
 
 func (s *storageCeph) ContainerCreateFromImage(container container, fingerprint string) error {
-	logger.Debugf(`Creating RBD storage volume for container "%s" on `+
-		`storage pool "%s"`, s.volume.Name, s.pool.Name)
+	logger.Debugf(`Creating RBD storage volume for container "%s" on storage pool "%s"`, s.volume.Name, s.pool.Name)
 
 	revert := true
 
@@ -836,8 +763,7 @@ func (s *storageCeph) ContainerCreateFromImage(container container, fingerprint 
 	if waitChannel, ok := lxdStorageOngoingOperationMap[imageStoragePoolLockID]; ok {
 		lxdStorageMapLock.Unlock()
 		if _, ok := <-waitChannel; ok {
-			logger.Warnf(`Received value over semaphore. This ` +
-				`should not have happened`)
+			logger.Warnf(`Received value over semaphore. This should not have happened`)
 		}
 	} else {
 		lxdStorageOngoingOperationMap[imageStoragePoolLockID] = make(chan bool)
@@ -882,8 +808,7 @@ func (s *storageCeph) ContainerCreateFromImage(container container, fingerprint 
 		storagePoolVolumeTypeNameImage, "readonly", s.OSDPoolName,
 		containerName, storagePoolVolumeTypeNameContainer, s.UserName)
 	if err != nil {
-		logger.Errorf(`Failed to clone new RBD storage volume for `+
-			`container "%s": %s`, containerName, err)
+		logger.Errorf(`Failed to clone new RBD storage volume for container "%s": %s`, containerName, err)
 		return err
 	}
 	logger.Debugf(`Cloned new RBD storage volume for container "%s"`,
@@ -898,16 +823,14 @@ func (s *storageCeph) ContainerCreateFromImage(container container, fingerprint 
 			containerName, storagePoolVolumeTypeNameContainer,
 			s.UserName)
 		if err != nil {
-			logger.Warnf(`Failed to delete RBD storage volume `+
-				`for container "%s": %s`, containerName, err)
+			logger.Warnf(`Failed to delete RBD storage volume for container "%s": %s`, containerName, err)
 		}
 	}()
 
 	RBDDevPath, err := cephRBDVolumeMap(s.ClusterName, s.OSDPoolName,
 		containerName, storagePoolVolumeTypeNameContainer, s.UserName)
 	if err != nil {
-		logger.Errorf(`Failed to map RBD storage volume for container `+
-			`"%s"`, containerName)
+		logger.Errorf(`Failed to map RBD storage volume for container "%s"`, containerName)
 		return err
 	}
 	logger.Debugf(`Mapped RBD storage volume for container "%s"`,
@@ -922,8 +845,7 @@ func (s *storageCeph) ContainerCreateFromImage(container container, fingerprint 
 			containerName, storagePoolVolumeTypeNameContainer,
 			s.UserName, true)
 		if err != nil {
-			logger.Warnf(`Failed to unmap RBD storage volume `+
-				`for container "%s": %s`, containerName, err)
+			logger.Warnf(`Failed to unmap RBD storage volume for container "%s": %s`, containerName, err)
 		}
 	}()
 
@@ -940,13 +862,10 @@ func (s *storageCeph) ContainerCreateFromImage(container container, fingerprint 
 	err = createContainerMountpoint(containerPoolVolumeMntPoint,
 		containerPath, privileged)
 	if err != nil {
-		logger.Errorf(`Failed to create mountpoint "%s" for container `+
-			`"%s" for RBD storage volume: %s`,
-			containerPoolVolumeMntPoint, containerName, err)
+		logger.Errorf(`Failed to create mountpoint "%s" for container "%s" for RBD storage volume: %s`, containerPoolVolumeMntPoint, containerName, err)
 		return err
 	}
-	logger.Debugf(`Created mountpoint "%s" for container "%s" for RBD `+
-		`storage volume`, containerPoolVolumeMntPoint, containerName)
+	logger.Debugf(`Created mountpoint "%s" for container "%s" for RBD storage volume`, containerPoolVolumeMntPoint, containerName)
 
 	defer func() {
 		if !revert {
@@ -955,12 +874,32 @@ func (s *storageCeph) ContainerCreateFromImage(container container, fingerprint 
 
 		err := os.Remove(containerPoolVolumeMntPoint)
 		if err != nil {
-			logger.Warnf(`Failed to delete mountpoint "%s" for `+
-				`container "%s" for RBD storage volume: %s`,
-				containerPoolVolumeMntPoint, containerName, err)
+			logger.Warnf(`Failed to delete mountpoint "%s" for container "%s" for RBD storage volume: %s`, containerPoolVolumeMntPoint, containerName, err)
 		}
 	}()
 
+	// Apply quota
+	_, imageVol, err := s.s.Cluster.StoragePoolNodeVolumeGetType(fingerprint, db.StoragePoolVolumeTypeImage, s.poolID)
+	if err != nil {
+		return err
+	}
+
+	if s.volume.Config["size"] != "" && imageVol.Config["size"] != s.volume.Config["size"] {
+		size, err := shared.ParseByteSizeString(s.volume.Config["size"])
+		if err != nil {
+			return err
+		}
+
+		newSize := s.volume.Config["size"]
+		s.volume.Config["size"] = imageVol.Config["size"]
+		err = s.StorageEntitySetQuota(storagePoolVolumeTypeContainer, size, container)
+		if err != nil {
+			return err
+		}
+		s.volume.Config["size"] = newSize
+	}
+
+	// Shift if needed
 	ourMount, err := s.ContainerMount(container)
 	if err != nil {
 		return err
@@ -970,50 +909,37 @@ func (s *storageCeph) ContainerCreateFromImage(container container, fingerprint 
 	}
 
 	if !privileged {
-		err := s.shiftRootfs(container)
+		err := s.shiftRootfs(container, nil)
 		if err != nil {
-			logger.Errorf(`Failed to shift rootfs for container `+
-				`"%s": %s`, containerName, err)
+			logger.Errorf(`Failed to shift rootfs for container "%s": %s`, containerName, err)
 			return err
 		}
 		logger.Debugf(`Shifted rootfs for container "%s"`, containerName)
 
 		err = os.Chmod(containerPoolVolumeMntPoint, 0711)
 		if err != nil {
-			logger.Errorf(`Failed change mountpoint "%s" `+
-				`permissions to 0711 for container "%s" for `+
-				`RBD storage volume: %s`,
-				containerPoolVolumeMntPoint, containerName, err)
+			logger.Errorf(`Failed change mountpoint "%s" permissions to 0711 for container "%s" for RBD storage volume: %s`, containerPoolVolumeMntPoint, containerName, err)
 			return err
 		}
-		logger.Debugf(`Changed mountpoint "%s" permissions to 0711 for `+
-			`container "%s" for RBD storage volume`,
-			containerPoolVolumeMntPoint, containerName)
+		logger.Debugf(`Changed mountpoint "%s" permissions to 0711 for container "%s" for RBD storage volume`, containerPoolVolumeMntPoint, containerName)
 	} else {
 		err := os.Chmod(containerPoolVolumeMntPoint, 0700)
 		if err != nil {
-			logger.Errorf(`Failed change mountpoint "%s" `+
-				`permissions to 0700 for container "%s" for `+
-				`RBD storage volume: %s`,
-				containerPoolVolumeMntPoint, containerName, err)
+			logger.Errorf(`Failed change mountpoint "%s" permissions to 0700 for container "%s" for RBD storage volume: %s`, containerPoolVolumeMntPoint, containerName, err)
 			return err
 		}
-		logger.Debugf(`Changed mountpoint "%s" permissions to 0700 `+
-			`for container "%s" for RBD storage volume`,
-			containerPoolVolumeMntPoint, containerName)
+		logger.Debugf(`Changed mountpoint "%s" permissions to 0700 for container "%s" for RBD storage volume`, containerPoolVolumeMntPoint, containerName)
 	}
 
 	err = container.TemplateApply("create")
 	if err != nil {
-		logger.Errorf(`Failed to apply create template for container `+
-			`"%s": %s`, containerName, err)
+		logger.Errorf(`Failed to apply create template for container "%s": %s`, containerName, err)
 		return err
 	}
 	logger.Debugf(`Applied create template for container "%s"`,
 		containerName)
 
-	logger.Debugf(`Created RBD storage volume for container "%s" on `+
-		`storage pool "%s"`, s.volume.Name, s.pool.Name)
+	logger.Debugf(`Created RBD storage volume for container "%s" on storage pool "%s"`, s.volume.Name, s.pool.Name)
 
 	revert = false
 
@@ -1026,8 +952,7 @@ func (s *storageCeph) ContainerCanRestore(container container, sourceContainer c
 
 func (s *storageCeph) ContainerDelete(container container) error {
 	containerName := container.Name()
-	logger.Debugf(`Deleting RBD storage volume for container "%s" on `+
-		`storage pool "%s"`, containerName, s.pool.Name)
+	logger.Debugf(`Deleting RBD storage volume for container "%s" on storage pool "%s"`, containerName, s.pool.Name)
 
 	// umount
 	containerPath := container.Path()
@@ -1057,33 +982,27 @@ func (s *storageCeph) ContainerDelete(container container) error {
 	err := deleteContainerMountpoint(containerMntPoint, containerPath,
 		s.GetStorageTypeName())
 	if err != nil {
-		logger.Errorf(`Failed to delete mountpoint %s for RBD storage `+
-			`volume of container "%s" for RBD storage volume on `+
-			`storage pool "%s": %s`, containerMntPoint,
+		logger.Errorf(`Failed to delete mountpoint %s for RBD storage volume of container "%s" for RBD storage volume on storage pool "%s": %s`, containerMntPoint,
 			containerName, s.pool.Name, err)
 		return err
 	}
-	logger.Debugf(`Deleted mountpoint %s for RBD storage volume of `+
-		`container "%s" for RBD storage volume on storage pool "%s"`,
-		containerMntPoint, containerName, s.pool.Name)
+	logger.Debugf(`Deleted mountpoint %s for RBD storage volume of container "%s" for RBD storage volume on storage pool "%s"`, containerMntPoint, containerName, s.pool.Name)
 
-	logger.Debugf(`Deleted RBD storage volume for container "%s" on `+
-		`storage pool "%s"`, containerName, s.pool.Name)
+	logger.Debugf(`Deleted RBD storage volume for container "%s" on storage pool "%s"`, containerName, s.pool.Name)
 	return nil
 }
 
 func (s *storageCeph) ContainerCopy(target container, source container,
 	containerOnly bool) error {
 	sourceContainerName := source.Name()
-	logger.Debugf(`Copying RBD container storage %s -> %s`,
+	logger.Debugf(`Copying RBD container storage %s to %s`,
 		sourceContainerName, target.Name())
 
 	revert := true
 
 	ourStart, err := source.StorageStart()
 	if err != nil {
-		logger.Errorf(`Failed to initialize storage for container `+
-			`"%s": %s`, sourceContainerName, err)
+		logger.Errorf(`Failed to initialize storage for container "%s": %s`, sourceContainerName, err)
 		return err
 	}
 	logger.Debugf(`Initialized storage for container "%s"`,
@@ -1101,8 +1020,7 @@ func (s *storageCeph) ContainerCopy(target container, source container,
 
 	snapshots, err := source.Snapshots()
 	if err != nil {
-		logger.Errorf(`Failed to retrieve snapshots of container `+
-			`"%s": %s`, sourceContainerName, err)
+		logger.Errorf(`Failed to retrieve snapshots of container "%s": %s`, sourceContainerName, err)
 		return err
 	}
 	logger.Debugf(`Retrieved snapshots of container "%s"`,
@@ -1119,17 +1037,15 @@ func (s *storageCeph) ContainerCopy(target container, source container,
 			err = s.copyWithoutSnapshotsSparse(target, source)
 		}
 		if err != nil {
-			logger.Errorf(`Failed to copy RBD container storage `+
-				`%s -> %s`, sourceContainerName, target.Name())
+			logger.Errorf(`Failed to copy RBD container storage %s to %s`, sourceContainerName, target.Name())
 			return err
 		}
 
-		logger.Debugf(`Copied RBD container storage %s -> %s`,
+		logger.Debugf(`Copied RBD container storage %s to %s`,
 			sourceContainerName, target.Name())
 		return nil
 	} else {
-		logger.Debugf(`Creating non-sparse copy of RBD storage volume `+
-			`for container "%s" -> "%s" including snapshots`,
+		logger.Debugf(`Creating non-sparse copy of RBD storage volume for container "%s" to "%s" including snapshots`,
 			sourceContainerName, targetContainerName)
 
 		// create mountpoint for container
@@ -1142,15 +1058,10 @@ func (s *storageCeph) ContainerCopy(target container, source container,
 			targetContainerPath,
 			target.IsPrivileged())
 		if err != nil {
-			logger.Errorf(`Failed to create mountpoint "%s" for `+
-				`RBD storage volume "%s" on storage pool `+
-				`"%s": %s"`, targetContainerMountPoint,
-				s.volume.Name, s.pool.Name, err)
+			logger.Errorf(`Failed to create mountpoint "%s" for RBD storage volume "%s" on storage pool "%s": %s"`, targetContainerMountPoint, s.volume.Name, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Created mountpoint "%s" for RBD storage `+
-			`volume "%s" on storage pool "%s"`,
-			targetContainerMountPoint, s.volume.Name, s.pool.Name)
+		logger.Debugf(`Created mountpoint "%s" for RBD storage volume "%s" on storage pool "%s"`, targetContainerMountPoint, s.volume.Name, s.pool.Name)
 
 		defer func() {
 			if !revert {
@@ -1162,11 +1073,7 @@ func (s *storageCeph) ContainerCopy(target container, source container,
 				targetContainerPath,
 				"")
 			if err != nil {
-				logger.Warnf(`Failed to delete mountpoint `+
-					`"%s" for RBD storage volume "%s" on `+
-					`storage pool "%s": %s"`,
-					targetContainerMountPoint,
-					s.volume.Name, s.pool.Name, err)
+				logger.Warnf(`Failed to delete mountpoint "%s" for RBD storage volume "%s" on storage pool "%s": %s"`, targetContainerMountPoint, s.volume.Name, s.pool.Name, err)
 			}
 		}()
 
@@ -1175,9 +1082,7 @@ func (s *storageCeph) ContainerCopy(target container, source container,
 			targetContainerName, storagePoolVolumeTypeNameContainer,
 			"0", s.UserName)
 		if err != nil {
-			logger.Errorf(`Failed to create RBD storage volume "%s" on `+
-				`storage pool "%s": %s`, targetContainerName,
-				s.pool.Name, err)
+			logger.Errorf(`Failed to create RBD storage volume "%s" on storage pool "%s": %s`, targetContainerName, s.pool.Name, err)
 			return err
 		}
 		logger.Debugf(`Created RBD storage volume "%s" on storage pool "%s"`,
@@ -1192,9 +1097,7 @@ func (s *storageCeph) ContainerCopy(target container, source container,
 				targetContainerName,
 				storagePoolVolumeTypeNameContainer, s.UserName)
 			if err != nil {
-				logger.Warnf(`Failed to delete RBD storage `+
-					`volume "%s" on storage pool "%s": %s`,
-					targetContainerName, s.pool.Name, err)
+				logger.Warnf(`Failed to delete RBD storage volume "%s" on storage pool "%s": %s`, targetContainerName, s.pool.Name, err)
 			}
 		}()
 
@@ -1225,12 +1128,11 @@ func (s *storageCeph) ContainerCopy(target container, source container,
 				targetVolumeName,
 				prev)
 			if err != nil {
-				logger.Errorf(`Failed to copy RBD container `+
-					`storage %s -> %s`, sourceVolumeName,
+				logger.Errorf(`Failed to copy RBD container storage %s to %s`, sourceVolumeName,
 					targetVolumeName)
 				return err
 			}
-			logger.Debugf(`Copied RBD container storage %s -> %s`,
+			logger.Debugf(`Copied RBD container storage %s to %s`,
 				sourceVolumeName, targetVolumeName)
 
 			defer func() {
@@ -1243,10 +1145,7 @@ func (s *storageCeph) ContainerCopy(target container, source container,
 					storagePoolVolumeTypeNameContainer,
 					snapOnlyName, s.UserName)
 				if err != nil {
-					logger.Warnf(`Failed to delete RBD `+
-						`container storage for `+
-						`snapshot "%s" of container "%s"`,
-						snapOnlyName, targetContainerName)
+					logger.Warnf(`Failed to delete RBD container storage for snapshot "%s" of container "%s"`, snapOnlyName, targetContainerName)
 				}
 			}()
 
@@ -1273,23 +1172,10 @@ func (s *storageCeph) ContainerCopy(target container, source container,
 				snapshotMntPointSymlinkTarget,
 				snapshotMntPointSymlink)
 			if err != nil {
-				logger.Errorf(`Failed to create mountpoint `+
-					`"%s", snapshot symlink target "%s", `+
-					`snapshot mountpoint symlink"%s" for `+
-					`RBD storage volume "%s" on storage `+
-					`pool "%s": %s`, containersPath,
-					snapshotMntPointSymlinkTarget,
-					snapshotMntPointSymlink, s.volume.Name,
-					s.pool.Name, err)
+				logger.Errorf(`Failed to create mountpoint "%s", snapshot symlink target "%s", snapshot mountpoint symlink"%s" for RBD storage volume "%s" on storage pool "%s": %s`, containersPath, snapshotMntPointSymlinkTarget, snapshotMntPointSymlink, s.volume.Name, s.pool.Name, err)
 				return err
 			}
-			logger.Debugf(`Created mountpoint "%s", snapshot `+
-				`symlink target "%s", snapshot mountpoint `+
-				`symlink"%s" for RBD storage volume "%s" on `+
-				`storage pool "%s"`, containersPath,
-				snapshotMntPointSymlinkTarget,
-				snapshotMntPointSymlink, s.volume.Name,
-				s.pool.Name)
+			logger.Debugf(`Created mountpoint "%s", snapshot symlink target "%s", snapshot mountpoint symlink"%s" for RBD storage volume "%s" on storage pool "%s"`, containersPath, snapshotMntPointSymlinkTarget, snapshotMntPointSymlink, s.volume.Name, s.pool.Name)
 
 			defer func() {
 				if !revert {
@@ -1301,16 +1187,7 @@ func (s *storageCeph) ContainerCopy(target container, source container,
 					snapshotMntPointSymlinkTarget,
 					snapshotMntPointSymlink)
 				if err != nil {
-					logger.Warnf(`Failed to delete `+
-						`mountpoint "%s", snapshot `+
-						`symlink target "%s", `+
-						`snapshot mountpoint `+
-						`symlink "%s" for RBD storage `+
-						`volume "%s" on storage pool `+
-						`"%s": %s`, containersPath,
-						snapshotMntPointSymlinkTarget,
-						snapshotMntPointSymlink,
-						s.volume.Name, s.pool.Name, err)
+					logger.Warnf(`Failed to delete mountpoint "%s", snapshot symlink target "%s", snapshot mountpoint symlink "%s" for RBD storage volume "%s" on storage pool "%s": %s`, containersPath, snapshotMntPointSymlinkTarget, snapshotMntPointSymlink, s.volume.Name, s.pool.Name, err)
 				}
 			}()
 		}
@@ -1325,12 +1202,10 @@ func (s *storageCeph) ContainerCopy(target container, source container,
 			targetVolumeName,
 			lastSnap)
 		if err != nil {
-			logger.Errorf(`Failed to copy RBD container storage `+
-				`%s -> %s`, sourceVolumeName, targetVolumeName)
+			logger.Errorf(`Failed to copy RBD container storage %s to %s`, sourceVolumeName, targetVolumeName)
 			return err
 		}
-		logger.Debugf(`Copied RBD container storage %s -> %s`,
-			sourceVolumeName, targetVolumeName)
+		logger.Debugf(`Copied RBD container storage %s to %s`, sourceVolumeName, targetVolumeName)
 
 		// Note, we don't need to register another cleanup function for
 		// the actual container's storage volume since we already
@@ -1341,16 +1216,12 @@ func (s *storageCeph) ContainerCopy(target container, source container,
 			targetContainerName, storagePoolVolumeTypeNameContainer,
 			s.UserName)
 		if err != nil {
-			logger.Errorf(`Failed to map RBD storage volume for `+
-				`container "%s" on storage pool "%s": %s`,
-				targetContainerName, s.pool.Name, err)
+			logger.Errorf(`Failed to map RBD storage volume for container "%s" on storage pool "%s": %s`, targetContainerName, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Mapped RBD storage volume for container "%s" `+
-			`on storage pool "%s"`, targetContainerName, s.pool.Name)
+		logger.Debugf(`Mapped RBD storage volume for container "%s" on storage pool "%s"`, targetContainerName, s.pool.Name)
 
-		logger.Debugf(`Created non-sparse copy of RBD storage volume `+
-			`for container "%s" -> "%s" including snapshots`,
+		logger.Debugf(`Created non-sparse copy of RBD storage volume for container "%s" to "%s" including snapshots`,
 			sourceContainerName, targetContainerName)
 	}
 
@@ -1369,14 +1240,12 @@ func (s *storageCeph) ContainerCopy(target container, source container,
 
 	err = target.TemplateApply("copy")
 	if err != nil {
-		logger.Errorf(`Failed to apply copy template for container `+
-			`"%s": %s`, target.Name(), err)
+		logger.Errorf(`Failed to apply copy template for container "%s": %s`, target.Name(), err)
 		return err
 	}
 	logger.Debugf(`Applied copy template for container "%s"`, target.Name())
 
-	logger.Debugf(`Copied RBD container storage %s -> %s`,
-		sourceContainerName, target.Name())
+	logger.Debugf(`Copied RBD container storage %s to %s`, sourceContainerName, target.Name())
 
 	revert = false
 
@@ -1384,19 +1253,19 @@ func (s *storageCeph) ContainerCopy(target container, source container,
 }
 
 func (s *storageCeph) ContainerMount(c container) (bool, error) {
-	logger.Debugf("Mounting RBD storage volume for container \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
+	logger.Debugf("Mounting RBD storage volume for container \"%s\" on storage pool \"%s\"", s.volume.Name, s.pool.Name)
 
 	ourMount, err := s.doContainerMount(c.Name())
 	if err != nil {
 		return false, err
 	}
 
-	logger.Debugf("Mounted RBD storage volume for container \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
+	logger.Debugf("Mounted RBD storage volume for container \"%s\" on storage pool \"%s\"", s.volume.Name, s.pool.Name)
 	return ourMount, nil
 }
 
 func (s *storageCeph) ContainerUmount(name string, path string) (bool, error) {
-	logger.Debugf("Unmounting RBD storage volume for container \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
+	logger.Debugf("Unmounting RBD storage volume for container \"%s\" on storage pool \"%s\"", s.volume.Name, s.pool.Name)
 
 	containerMntPoint := getContainerMountPoint(s.pool.Name, name)
 	if shared.IsSnapshot(name) {
@@ -1408,7 +1277,7 @@ func (s *storageCeph) ContainerUmount(name string, path string) (bool, error) {
 	if waitChannel, ok := lxdStorageOngoingOperationMap[containerUmountLockID]; ok {
 		lxdStorageMapLock.Unlock()
 		if _, ok := <-waitChannel; ok {
-			logger.Warnf("Received value over semaphore. This should not have happened.")
+			logger.Warnf("Received value over semaphore, this should not have happened")
 		}
 		// Give the benefit of the doubt and assume that the other
 		// thread actually succeeded in unmounting the storage volume.
@@ -1438,7 +1307,7 @@ func (s *storageCeph) ContainerUmount(name string, path string) (bool, error) {
 		return false, mounterr
 	}
 
-	logger.Debugf("Unmounted RBD storage volume for container \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
+	logger.Debugf("Unmounted RBD storage volume for container \"%s\" on storage pool \"%s\"", s.volume.Name, s.pool.Name)
 	return ourUmount, nil
 }
 
@@ -1448,8 +1317,7 @@ func (s *storageCeph) ContainerRename(c container, newName string) error {
 
 	revert := true
 
-	logger.Debugf(`Renaming RBD storage volume for container "%s" from `+
-		`"%s" to "%s"`, oldName, oldName, newName)
+	logger.Debugf(`Renaming RBD storage volume for container "%s" from "%s" to "%s"`, oldName, oldName, newName)
 
 	// unmount
 	_, err := s.ContainerUmount(oldName, containerPath)
@@ -1461,13 +1329,10 @@ func (s *storageCeph) ContainerRename(c container, newName string) error {
 	err = cephRBDVolumeUnmap(s.ClusterName, s.OSDPoolName, oldName,
 		storagePoolVolumeTypeNameContainer, s.UserName, true)
 	if err != nil {
-		logger.Errorf(`Failed to unmap RBD storage volume for `+
-			`container "%s" on storage pool "%s": %s`, oldName,
-			s.pool.Name, err)
+		logger.Errorf(`Failed to unmap RBD storage volume for container "%s" on storage pool "%s": %s`, oldName, s.pool.Name, err)
 		return err
 	}
-	logger.Debugf(`Unmapped RBD storage volume for container "%s" on `+
-		`storage pool "%s"`, oldName, s.pool.Name)
+	logger.Debugf(`Unmapped RBD storage volume for container "%s" on storage pool "%s"`, oldName, s.pool.Name)
 
 	defer func() {
 		if !revert {
@@ -1477,21 +1342,17 @@ func (s *storageCeph) ContainerRename(c container, newName string) error {
 		_, err := cephRBDVolumeMap(s.ClusterName, s.OSDPoolName,
 			oldName, storagePoolVolumeTypeNameContainer, s.UserName)
 		if err != nil {
-			logger.Warnf(`Failed to Map RBD storage volume `+
-				`for container "%s": %s`, oldName, err)
+			logger.Warnf(`Failed to Map RBD storage volume for container "%s": %s`, oldName, err)
 		}
 	}()
 
 	err = cephRBDVolumeRename(s.ClusterName, s.OSDPoolName,
 		storagePoolVolumeTypeNameContainer, oldName, newName, s.UserName)
 	if err != nil {
-		logger.Errorf(`Failed to rename RBD storage volume for `+
-			`container "%s" on storage pool "%s": %s`,
-			oldName, s.pool.Name, err)
+		logger.Errorf(`Failed to rename RBD storage volume for container "%s" on storage pool "%s": %s`, oldName, s.pool.Name, err)
 		return err
 	}
-	logger.Debugf(`Renamed RBD storage volume for container "%s" on `+
-		`storage pool "%s"`, oldName, s.pool.Name)
+	logger.Debugf(`Renamed RBD storage volume for container "%s" on storage pool "%s"`, oldName, s.pool.Name)
 
 	defer func() {
 		if !revert {
@@ -1502,9 +1363,7 @@ func (s *storageCeph) ContainerRename(c container, newName string) error {
 			storagePoolVolumeTypeNameContainer, newName, oldName,
 			s.UserName)
 		if err != nil {
-			logger.Warnf(`Failed to rename RBD storage volume for `+
-				`container "%s" on storage pool "%s": %s`,
-				newName, s.pool.Name, err)
+			logger.Warnf(`Failed to rename RBD storage volume for container "%s" on storage pool "%s": %s`, newName, s.pool.Name, err)
 		}
 	}()
 
@@ -1512,13 +1371,10 @@ func (s *storageCeph) ContainerRename(c container, newName string) error {
 	_, err = cephRBDVolumeMap(s.ClusterName, s.OSDPoolName, newName,
 		storagePoolVolumeTypeNameContainer, s.UserName)
 	if err != nil {
-		logger.Errorf(`Failed to map RBD storage volume for `+
-			`container "%s" on storage pool "%s": %s`, newName,
-			s.pool.Name, err)
+		logger.Errorf(`Failed to map RBD storage volume for container "%s" on storage pool "%s": %s`, newName, s.pool.Name, err)
 		return err
 	}
-	logger.Debugf(`Mapped RBD storage volume for container "%s" on `+
-		`storage pool "%s"`, newName, s.pool.Name)
+	logger.Debugf(`Mapped RBD storage volume for container "%s" on storage pool "%s"`, newName, s.pool.Name)
 
 	defer func() {
 		if !revert {
@@ -1528,8 +1384,7 @@ func (s *storageCeph) ContainerRename(c container, newName string) error {
 		err := cephRBDVolumeUnmap(s.ClusterName, s.OSDPoolName, newName,
 			storagePoolVolumeTypeNameContainer, s.UserName, true)
 		if err != nil {
-			logger.Warnf(`Failed to unmap RBD storage volume `+
-				`for container "%s": %s`, newName, err)
+			logger.Warnf(`Failed to unmap RBD storage volume for container "%s": %s`, newName, err)
 		}
 	}()
 
@@ -1601,8 +1456,7 @@ func (s *storageCeph) ContainerRename(c container, newName string) error {
 		}
 	}
 
-	logger.Debugf(`Renamed RBD storage volume for container "%s" from `+
-		`"%s" to "%s"`, oldName, oldName, newName)
+	logger.Debugf(`Renamed RBD storage volume for container "%s" from "%s" to "%s"`, oldName, oldName, newName)
 
 	revert = false
 
@@ -1613,14 +1467,13 @@ func (s *storageCeph) ContainerRestore(target container, source container) error
 	sourceName := source.Name()
 	targetName := target.Name()
 
-	logger.Debugf(`Restoring RBD storage volume for container "%s" from `+
-		`%s to %s`, targetName, sourceName, targetName)
+	logger.Debugf(`Restoring RBD storage volume for container "%s" from %s to %s`, targetName, sourceName, targetName)
 
 	ourStorageStop, err := source.StorageStop()
 	if err != nil {
 		return err
 	}
-	if ourStorageStop {
+	if !ourStorageStop {
 		defer source.StorageStart()
 	}
 
@@ -1628,7 +1481,7 @@ func (s *storageCeph) ContainerRestore(target container, source container) error
 	if err != nil {
 		return err
 	}
-	if ourStorageStop {
+	if !ourStorageStop {
 		defer target.StorageStart()
 	}
 
@@ -1638,14 +1491,11 @@ func (s *storageCeph) ContainerRestore(target container, source container) error
 		sourceContainerOnlyName, storagePoolVolumeTypeNameContainer,
 		prefixedSourceSnapOnlyName, s.UserName)
 	if err != nil {
-		logger.Errorf(`Failed to restore RBD storage volume for `+
-			`container "%s" from "%s": %s`,
-			targetName, sourceName, err)
+		logger.Errorf(`Failed to restore RBD storage volume for container "%s" from "%s": %s`, targetName, sourceName, err)
 		return err
 	}
 
-	logger.Debugf(`Restored RBD storage volume for container "%s" from `+
-		`%s to %s`, targetName, sourceName, targetName)
+	logger.Debugf(`Restored RBD storage volume for container "%s" from %s to %s`, targetName, sourceName, targetName)
 	return nil
 }
 
@@ -1654,24 +1504,26 @@ func (s *storageCeph) ContainerGetUsage(container container) (int64, error) {
 }
 
 func (s *storageCeph) ContainerSnapshotCreate(snapshotContainer container, sourceContainer container) error {
-	// This is costly but we need to ensure that all cached data has
-	// been committed to disk. If we don't then the rbd snapshot of
-	// the underlying filesystem can be inconsistent or - worst case
-	// - empty.
-	syscall.Sync()
 	containerMntPoint := getContainerMountPoint(s.pool.Name, sourceContainer.Name())
-	msg, fsFreezeErr := shared.TryRunCommand("fsfreeze", "--freeze", containerMntPoint)
-	logger.Debugf("Trying to freeze the filesystem: %s: %s", msg, fsFreezeErr)
-	if fsFreezeErr == nil {
-		defer shared.TryRunCommand("fsfreeze", "--unfreeze", containerMntPoint)
+	if shared.IsMountPoint(containerMntPoint) {
+		// This is costly but we need to ensure that all cached data has
+		// been committed to disk. If we don't then the rbd snapshot of
+		// the underlying filesystem can be inconsistent or - worst case
+		// - empty.
+		syscall.Sync()
+
+		msg, fsFreezeErr := shared.TryRunCommand("fsfreeze", "--freeze", containerMntPoint)
+		logger.Debugf("Trying to freeze the filesystem: %s: %s", msg, fsFreezeErr)
+		if fsFreezeErr == nil {
+			defer shared.TryRunCommand("fsfreeze", "--unfreeze", containerMntPoint)
+		}
 	}
 
 	return s.doContainerSnapshotCreate(snapshotContainer.Name(), sourceContainer.Name())
 }
 
 func (s *storageCeph) ContainerSnapshotDelete(snapshotContainer container) error {
-	logger.Debugf(`Deleting RBD storage volume for snapshot "%s" on `+
-		`storage pool "%s"`, s.volume.Name, s.pool.Name)
+	logger.Debugf(`Deleting RBD storage volume for snapshot "%s" on storage pool "%s"`, s.volume.Name, s.pool.Name)
 
 	snapshotContainerName := snapshotContainer.Name()
 	sourceContainerName, sourceContainerSnapOnlyName, _ :=
@@ -1700,18 +1552,10 @@ func (s *storageCeph) ContainerSnapshotDelete(snapshotContainer container) error
 	if shared.PathExists(snapshotContainerMntPoint) {
 		err := os.RemoveAll(snapshotContainerMntPoint)
 		if err != nil {
-			logger.Errorf(`Failed to delete mountpoint "%s" of `+
-				`RBD snapshot "%s" of container "%s" on `+
-				`storage pool "%s": %s`,
-				snapshotContainerMntPoint,
-				sourceContainerSnapOnlyName,
-				sourceContainerName, s.OSDPoolName, err)
+			logger.Errorf(`Failed to delete mountpoint "%s" of RBD snapshot "%s" of container "%s" on storage pool "%s": %s`, snapshotContainerMntPoint, sourceContainerSnapOnlyName, sourceContainerName, s.OSDPoolName, err)
 			return err
 		}
-		logger.Debugf(`Deleted mountpoint "%s" of RBD snapshot "%s" `+
-			`of container "%s" on storage pool "%s"`,
-			snapshotContainerMntPoint, sourceContainerSnapOnlyName,
-			sourceContainerName, s.OSDPoolName)
+		logger.Debugf(`Deleted mountpoint "%s" of RBD snapshot "%s" of container "%s" on storage pool "%s"`, snapshotContainerMntPoint, sourceContainerSnapOnlyName, sourceContainerName, s.OSDPoolName)
 	}
 
 	// check if snapshot directory is empty
@@ -1722,18 +1566,10 @@ func (s *storageCeph) ContainerSnapshotDelete(snapshotContainer container) error
 		// remove snapshot directory for container
 		err := os.Remove(snapshotContainerPath)
 		if err != nil {
-			logger.Errorf(`Failed to delete snapshot directory  `+
-				`"%s" of RBD snapshot "%s" of container "%s" `+
-				`on storage pool "%s": %s`,
-				snapshotContainerPath,
-				sourceContainerSnapOnlyName,
-				sourceContainerName, s.OSDPoolName, err)
+			logger.Errorf(`Failed to delete snapshot directory "%s" of RBD snapshot "%s" of container "%s" on storage pool "%s": %s`, snapshotContainerPath, sourceContainerSnapOnlyName, sourceContainerName, s.OSDPoolName, err)
 			return err
 		}
-		logger.Debugf(`Deleted snapshot directory  "%s" of RBD `+
-			`snapshot "%s" of container "%s" on storage pool "%s"`,
-			snapshotContainerPath, sourceContainerSnapOnlyName,
-			sourceContainerName, s.OSDPoolName)
+		logger.Debugf(`Deleted snapshot directory  "%s" of RBD snapshot "%s" of container "%s" on storage pool "%s"`, snapshotContainerPath, sourceContainerSnapOnlyName, sourceContainerName, s.OSDPoolName)
 
 		// remove the snapshot symlink if possible
 		snapshotSymlink := shared.VarPath("snapshots",
@@ -1741,31 +1577,20 @@ func (s *storageCeph) ContainerSnapshotDelete(snapshotContainer container) error
 		if shared.PathExists(snapshotSymlink) {
 			err := os.Remove(snapshotSymlink)
 			if err != nil {
-				logger.Errorf(`Failed to delete snapshot `+
-					`symlink "%s" of RBD snapshot "%s" of `+
-					`container "%s" on storage pool "%s": %s`,
-					snapshotSymlink,
-					sourceContainerSnapOnlyName,
-					sourceContainerName, s.OSDPoolName, err)
+				logger.Errorf(`Failed to delete snapshot symlink "%s" of RBD snapshot "%s" of container "%s" on storage pool "%s": %s`, snapshotSymlink, sourceContainerSnapOnlyName, sourceContainerName, s.OSDPoolName, err)
 				return err
 			}
-			logger.Debugf(`Deleted snapshot symlink "%s" of RBD `+
-				`snapshot "%s" of container "%s" on storage `+
-				`pool "%s"`, snapshotSymlink,
-				sourceContainerSnapOnlyName,
-				sourceContainerName, s.OSDPoolName)
+			logger.Debugf(`Deleted snapshot symlink "%s" of RBD snapshot "%s" of container "%s" on storage pool "%s"`, snapshotSymlink, sourceContainerSnapOnlyName, sourceContainerName, s.OSDPoolName)
 		}
 	}
 
-	logger.Debugf(`Deleted RBD storage volume for snapshot "%s" on `+
-		`storage pool "%s"`, s.volume.Name, s.pool.Name)
+	logger.Debugf(`Deleted RBD storage volume for snapshot "%s" on storage pool "%s"`, s.volume.Name, s.pool.Name)
 	return nil
 }
 
 func (s *storageCeph) ContainerSnapshotRename(c container, newName string) error {
 	oldName := c.Name()
-	logger.Debugf(`Renaming RBD storage volume for snapshot "%s" from `+
-		`"%s" to "%s"`, oldName, oldName, newName)
+	logger.Debugf(`Renaming RBD storage volume for snapshot "%s" from "%s" to "%s"`, oldName, oldName, newName)
 
 	revert := true
 
@@ -1777,9 +1602,7 @@ func (s *storageCeph) ContainerSnapshotRename(c container, newName string) error
 		containerOnlyName, storagePoolVolumeTypeNameContainer, oldSnapOnlyName,
 		newSnapOnlyName, s.UserName)
 	if err != nil {
-		logger.Errorf(`Failed to rename RBD storage volume for `+
-			`snapshot "%s" from "%s" to "%s": %s`, oldName, oldName,
-			newName, err)
+		logger.Errorf(`Failed to rename RBD storage volume for snapshot "%s" from "%s" to "%s": %s`, oldName, oldName, newName, err)
 		return err
 	}
 
@@ -1792,10 +1615,7 @@ func (s *storageCeph) ContainerSnapshotRename(c container, newName string) error
 			containerOnlyName, storagePoolVolumeTypeNameContainer,
 			newSnapOnlyName, oldSnapOnlyName, s.UserName)
 		if err != nil {
-			logger.Warnf(`Failed to rename RBD storage `+
-				`volume for container "%s" on storage `+
-				`pool "%s": %s`, oldName, s.pool.Name,
-				err)
+			logger.Warnf(`Failed to rename RBD storage volume for container "%s" on storage pool "%s": %s`, oldName, s.pool.Name, err)
 		}
 	}()
 
@@ -1803,17 +1623,12 @@ func (s *storageCeph) ContainerSnapshotRename(c container, newName string) error
 	newSnapshotMntPoint := getSnapshotMountPoint(s.pool.Name, newName)
 	err = os.Rename(oldSnapshotMntPoint, newSnapshotMntPoint)
 	if err != nil {
-		logger.Errorf(`Failed to rename mountpoint for RBD storage `+
-			`volume for snapshot "%s" from "%s" to "%s": %s`,
-			oldName, oldSnapshotMntPoint, newSnapshotMntPoint, err)
+		logger.Errorf(`Failed to rename mountpoint for RBD storage volume for snapshot "%s" from "%s" to "%s": %s`, oldName, oldSnapshotMntPoint, newSnapshotMntPoint, err)
 		return err
 	}
-	logger.Debugf(`Renamed mountpoint for RBD storage volume for `+
-		`snapshot "%s" from "%s" to "%s"`, oldName, oldSnapshotMntPoint,
-		newSnapshotMntPoint)
+	logger.Debugf(`Renamed mountpoint for RBD storage volume for snapshot "%s" from "%s" to "%s"`, oldName, oldSnapshotMntPoint, newSnapshotMntPoint)
 
-	logger.Debugf(`Renamed RBD storage volume for snapshot "%s" from `+
-		`"%s" to "%s"`, oldName, oldName, newName)
+	logger.Debugf(`Renamed RBD storage volume for snapshot "%s" from "%s" to "%s"`, oldName, oldName, newName)
 
 	revert = false
 
@@ -1822,8 +1637,7 @@ func (s *storageCeph) ContainerSnapshotRename(c container, newName string) error
 
 func (s *storageCeph) ContainerSnapshotStart(c container) (bool, error) {
 	containerName := c.Name()
-	logger.Debugf(`Initializing RBD storage volume for snapshot "%s" `+
-		`on storage pool "%s"`, containerName, s.pool.Name)
+	logger.Debugf(`Initializing RBD storage volume for snapshot "%s" on storage pool "%s"`, containerName, s.pool.Name)
 
 	revert := true
 
@@ -1835,13 +1649,10 @@ func (s *storageCeph) ContainerSnapshotStart(c container) (bool, error) {
 		containerOnlyName, storagePoolVolumeTypeNameContainer,
 		prefixedSnapOnlyName, s.UserName)
 	if err != nil {
-		logger.Errorf(`Failed to protect snapshot of RBD storage `+
-			`volume for container "%s" on storage pool "%s": %s`,
-			containerName, s.pool.Name, err)
+		logger.Errorf(`Failed to protect snapshot of RBD storage volume for container "%s" on storage pool "%s": %s`, containerName, s.pool.Name, err)
 		return false, err
 	}
-	logger.Debugf(`Protected snapshot of RBD storage volume for container `+
-		`"%s" on storage pool "%s"`, containerName, s.pool.Name)
+	logger.Debugf(`Protected snapshot of RBD storage volume for container "%s" on storage pool "%s"`, containerName, s.pool.Name)
 
 	defer func() {
 		if !revert {
@@ -1852,9 +1663,7 @@ func (s *storageCeph) ContainerSnapshotStart(c container) (bool, error) {
 			containerOnlyName, storagePoolVolumeTypeNameContainer,
 			prefixedSnapOnlyName, s.UserName)
 		if err != nil {
-			logger.Warnf(`Failed to unprotect snapshot of RBD `+
-				`storage volume for container "%s" on storage `+
-				`pool "%s": %s`, containerName, s.pool.Name, err)
+			logger.Warnf(`Failed to unprotect snapshot of RBD storage volume for container "%s" on storage pool "%s": %s`, containerName, s.pool.Name, err)
 		}
 	}()
 
@@ -1865,13 +1674,10 @@ func (s *storageCeph) ContainerSnapshotStart(c container) (bool, error) {
 		prefixedSnapOnlyName, s.OSDPoolName, cloneName, "snapshots",
 		s.UserName)
 	if err != nil {
-		logger.Errorf(`Failed to create clone of RBD storage volume `+
-			`for container "%s" on storage pool "%s": %s`,
-			containerName, s.pool.Name, err)
+		logger.Errorf(`Failed to create clone of RBD storage volume for container "%s" on storage pool "%s": %s`, containerName, s.pool.Name, err)
 		return false, err
 	}
-	logger.Debugf(`Created clone of RBD storage volume for container "%s" `+
-		`on storage pool "%s"`, containerName, s.pool.Name)
+	logger.Debugf(`Created clone of RBD storage volume for container "%s" on storage pool "%s"`, containerName, s.pool.Name)
 
 	defer func() {
 		if !revert {
@@ -1882,9 +1688,7 @@ func (s *storageCeph) ContainerSnapshotStart(c container) (bool, error) {
 		err = cephRBDVolumeDelete(s.ClusterName, s.OSDPoolName,
 			cloneName, "snapshots", s.UserName)
 		if err != nil {
-			logger.Errorf(`Failed to delete clone of RBD storage `+
-				`volume for container "%s" on storage pool `+
-				`"%s": %s`, containerName, s.pool.Name, err)
+			logger.Errorf(`Failed to delete clone of RBD storage volume for container "%s" on storage pool "%s": %s`, containerName, s.pool.Name, err)
 		}
 	}()
 
@@ -1892,13 +1696,10 @@ func (s *storageCeph) ContainerSnapshotStart(c container) (bool, error) {
 	RBDDevPath, err := cephRBDVolumeMap(s.ClusterName, s.OSDPoolName,
 		cloneName, "snapshots", s.UserName)
 	if err != nil {
-		logger.Errorf(`Failed to map RBD storage volume for `+
-			`container "%s" on storage pool "%s": %s`,
-			containerName, s.pool.Name, err)
+		logger.Errorf(`Failed to map RBD storage volume for container "%s" on storage pool "%s": %s`, containerName, s.pool.Name, err)
 		return false, err
 	}
-	logger.Debugf(`Mapped RBD storage volume for container "%s" on `+
-		`storage pool "%s"`, containerName, s.pool.Name)
+	logger.Debugf(`Mapped RBD storage volume for container "%s" on storage pool "%s"`, containerName, s.pool.Name)
 
 	defer func() {
 		if !revert {
@@ -1908,9 +1709,7 @@ func (s *storageCeph) ContainerSnapshotStart(c container) (bool, error) {
 		err := cephRBDVolumeUnmap(s.ClusterName, s.OSDPoolName,
 			cloneName, "snapshots", s.UserName, true)
 		if err != nil {
-			logger.Warnf(`Failed to unmap RBD storage volume for `+
-				`container "%s" on storage pool "%s": %s`,
-				containerName, s.pool.Name, err)
+			logger.Warnf(`Failed to unmap RBD storage volume for container "%s" on storage pool "%s": %s`, containerName, s.pool.Name, err)
 		}
 	}()
 
@@ -1931,8 +1730,7 @@ func (s *storageCeph) ContainerSnapshotStart(c container) (bool, error) {
 	logger.Debugf("Mounted RBD device %s onto %s", RBDDevPath,
 		containerMntPoint)
 
-	logger.Debugf(`Initialized RBD storage volume for snapshot "%s" on `+
-		`storage pool "%s"`, containerName, s.pool.Name)
+	logger.Debugf(`Initialized RBD storage volume for snapshot "%s" on storage pool "%s"`, containerName, s.pool.Name)
 
 	revert = false
 
@@ -1941,8 +1739,7 @@ func (s *storageCeph) ContainerSnapshotStart(c container) (bool, error) {
 
 func (s *storageCeph) ContainerSnapshotStop(c container) (bool, error) {
 	containerName := c.Name()
-	logger.Debugf(`Stopping RBD storage volume for snapshot "%s" on `+
-		`storage pool "%s"`, containerName, s.pool.Name)
+	logger.Debugf(`Stopping RBD storage volume for snapshot "%s" on storage pool "%s"`, containerName, s.pool.Name)
 
 	containerMntPoint := getSnapshotMountPoint(s.pool.Name, containerName)
 	if shared.IsMountPoint(containerMntPoint) {
@@ -1961,12 +1758,9 @@ func (s *storageCeph) ContainerSnapshotStop(c container) (bool, error) {
 	err := cephRBDVolumeUnmap(s.ClusterName, s.OSDPoolName, cloneName,
 		"snapshots", s.UserName, true)
 	if err != nil {
-		logger.Warnf(`Failed to unmap RBD storage volume for `+
-			`container "%s" on storage pool "%s": %s`,
-			containerName, s.pool.Name, err)
+		logger.Warnf(`Failed to unmap RBD storage volume for container "%s" on storage pool "%s": %s`, containerName, s.pool.Name, err)
 	} else {
-		logger.Debugf(`Unmapped RBD storage volume for container "%s" `+
-			`on storage pool "%s"`, containerName, s.pool.Name)
+		logger.Debugf(`Unmapped RBD storage volume for container "%s" on storage pool "%s"`, containerName, s.pool.Name)
 	}
 
 	rbdVolumeExists := cephRBDVolumeExists(s.ClusterName, s.OSDPoolName,
@@ -1977,32 +1771,25 @@ func (s *storageCeph) ContainerSnapshotStop(c container) (bool, error) {
 		err = cephRBDVolumeDelete(s.ClusterName, s.OSDPoolName, cloneName,
 			"snapshots", s.UserName)
 		if err != nil {
-			logger.Errorf(`Failed to delete clone of RBD storage volume `+
-				`for container "%s" on storage pool "%s": %s`,
-				containerName, s.pool.Name, err)
+			logger.Errorf(`Failed to delete clone of RBD storage volume for container "%s" on storage pool "%s": %s`, containerName, s.pool.Name, err)
 			return false, err
 		}
-		logger.Debugf(`Deleted clone of RBD storage volume for container "%s" `+
-			`on storage pool "%s"`, containerName, s.pool.Name)
+		logger.Debugf(`Deleted clone of RBD storage volume for container "%s" on storage pool "%s"`, containerName, s.pool.Name)
 	}
 
-	logger.Debugf(`Stopped RBD storage volume for snapshot "%s" on `+
-		`storage pool "%s"`, containerName, s.pool.Name)
+	logger.Debugf(`Stopped RBD storage volume for snapshot "%s" on storage pool "%s"`, containerName, s.pool.Name)
 	return true, nil
 }
 
 func (s *storageCeph) ContainerSnapshotCreateEmpty(c container) error {
-	logger.Debugf(`Creating empty RBD storage volume for snapshot "%s" `+
-		`on storage pool "%s" (noop)`, c.Name(), s.pool.Name)
+	logger.Debugf(`Creating empty RBD storage volume for snapshot "%s" on storage pool "%s" (noop)`, c.Name(), s.pool.Name)
 
-	logger.Debugf(`Created empty RBD storage volume for snapshot "%s" `+
-		`on storage pool "%s" (noop)`, c.Name(), s.pool.Name)
+	logger.Debugf(`Created empty RBD storage volume for snapshot "%s" on storage pool "%s" (noop)`, c.Name(), s.pool.Name)
 	return nil
 }
 
 func (s *storageCeph) ImageCreate(fingerprint string) error {
-	logger.Debugf(`Creating RBD storage volume for image "%s" on storage `+
-		`pool "%s"`, fingerprint, s.pool.Name)
+	logger.Debugf(`Creating RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 
 	revert := true
 
@@ -2011,15 +1798,10 @@ func (s *storageCeph) ImageCreate(fingerprint string) error {
 	if !shared.PathExists(imageMntPoint) {
 		err := os.MkdirAll(imageMntPoint, 0700)
 		if err != nil {
-			logger.Errorf(`Failed to create mountpoint "%s" for RBD `+
-				`storage volume for image "%s" on storage `+
-				`pool "%s": %s`, imageMntPoint, fingerprint,
-				s.pool.Name, err)
+			logger.Errorf(`Failed to create mountpoint "%s" for RBD storage volume for image "%s" on storage pool "%s": %s`, imageMntPoint, fingerprint, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Created mountpoint "%s" for RBD storage volume `+
-			`for image "%s" on storage pool "%s"`, imageMntPoint,
-			fingerprint, s.pool.Name)
+		logger.Debugf(`Created mountpoint "%s" for RBD storage volume for image "%s" on storage pool "%s"`, imageMntPoint, fingerprint, s.pool.Name)
 	}
 
 	defer func() {
@@ -2029,10 +1811,7 @@ func (s *storageCeph) ImageCreate(fingerprint string) error {
 
 		err := os.Remove(imageMntPoint)
 		if err != nil {
-			logger.Warnf(`Failed to delete mountpoint "%s" for RBD `+
-				`storage volume for image "%s" on storage `+
-				`pool "%s": %s`, imageMntPoint, fingerprint,
-				s.pool.Name, err)
+			logger.Warnf(`Failed to delete mountpoint "%s" for RBD storage volume for image "%s" on storage pool "%s": %s`, imageMntPoint, fingerprint, s.pool.Name, err)
 		}
 	}()
 
@@ -2042,33 +1821,25 @@ func (s *storageCeph) ImageCreate(fingerprint string) error {
 	ok := cephRBDVolumeExists(s.ClusterName, s.OSDPoolName, fingerprint,
 		prefixedType, s.UserName)
 	if !ok {
-		logger.Debugf(`RBD storage volume for image "%s" on storage `+
-			`pool "%s" does not exist`, fingerprint, s.pool.Name)
+		logger.Debugf(`RBD storage volume for image "%s" on storage pool "%s" does not exist`, fingerprint, s.pool.Name)
 
 		// get size
 		RBDSize, err := s.getRBDSize()
 		if err != nil {
-			logger.Errorf(`Failed to retrieve size of RBD storage `+
-				`volume for image "%s" on storage pool "%s": %s`,
-				fingerprint, s.pool.Name, err)
+			logger.Errorf(`Failed to retrieve size of RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Retrieve size "%s" of RBD storage volume for `+
-			`image "%s" on storage pool "%s"`, RBDSize, fingerprint,
-			s.pool.Name)
+		logger.Debugf(`Retrieve size "%s" of RBD storage volume for image "%s" on storage pool "%s"`, RBDSize, fingerprint, s.pool.Name)
 
 		// create volume
 		err = cephRBDVolumeCreate(s.ClusterName, s.OSDPoolName,
 			fingerprint, storagePoolVolumeTypeNameImage, RBDSize,
 			s.UserName)
 		if err != nil {
-			logger.Errorf(`Failed to create RBD storage volume `+
-				`for image "%s" on storage pool "%s": %s`,
-				fingerprint, s.pool.Name, err)
+			logger.Errorf(`Failed to create RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Created RBD storage volume for image "%s" on `+
-			`storage pool "%s"`, fingerprint, s.pool.Name)
+		logger.Debugf(`Created RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 
 		defer func() {
 			if !revert {
@@ -2079,10 +1850,7 @@ func (s *storageCeph) ImageCreate(fingerprint string) error {
 				fingerprint, storagePoolVolumeTypeNameImage,
 				s.UserName)
 			if err != nil {
-				logger.Warnf(`Failed to delete RBD storage `+
-					`volume for image "%s" on storage `+
-					`pool "%s": %s`, fingerprint,
-					s.pool.Name, err)
+				logger.Warnf(`Failed to delete RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 			}
 		}()
 
@@ -2090,13 +1858,10 @@ func (s *storageCeph) ImageCreate(fingerprint string) error {
 			s.OSDPoolName, fingerprint,
 			storagePoolVolumeTypeNameImage, s.UserName)
 		if err != nil {
-			logger.Errorf(`Failed to map RBD storage volume for `+
-				`image "%s" on storage pool "%s": %s`,
-				fingerprint, s.pool.Name, err)
+			logger.Errorf(`Failed to map RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Mapped RBD storage volume for image "%s" on `+
-			`storage pool "%s"`, fingerprint, s.pool.Name)
+		logger.Debugf(`Mapped RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 
 		defer func() {
 			if !revert {
@@ -2107,10 +1872,7 @@ func (s *storageCeph) ImageCreate(fingerprint string) error {
 				fingerprint, storagePoolVolumeTypeNameImage,
 				s.UserName, true)
 			if err != nil {
-				logger.Warnf(`Failed to unmap RBD storage `+
-					`volume for image "%s" on storage `+
-					`pool "%s": %s`, fingerprint,
-					s.pool.Name, err)
+				logger.Warnf(`Failed to unmap RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 			}
 		}()
 
@@ -2118,15 +1880,11 @@ func (s *storageCeph) ImageCreate(fingerprint string) error {
 		RBDFilesystem := s.getRBDFilesystem()
 		msg, err := makeFSType(RBDDevPath, RBDFilesystem, nil)
 		if err != nil {
-			logger.Errorf(`Failed to create filesystem "%s" for RBD `+
-				`storage volume for image "%s" on storage `+
-				`pool "%s": %s`, RBDFilesystem, fingerprint,
+			logger.Errorf(`Failed to create filesystem "%s" for RBD storage volume for image "%s" on storage pool "%s": %s`, RBDFilesystem, fingerprint,
 				s.pool.Name, msg)
 			return err
 		}
-		logger.Debugf(`Created filesystem "%s" for RBD storage volume `+
-			`for image "%s" on storage pool "%s"`, RBDFilesystem,
-			fingerprint, s.pool.Name)
+		logger.Debugf(`Created filesystem "%s" for RBD storage volume for image "%s" on storage pool "%s"`, RBDFilesystem, fingerprint, s.pool.Name)
 
 		// mount image
 		_, err = s.ImageMount(fingerprint)
@@ -2138,17 +1896,13 @@ func (s *storageCeph) ImageCreate(fingerprint string) error {
 		imagePath := shared.VarPath("images", fingerprint)
 		err = unpackImage(imagePath, imageMntPoint, storageTypeCeph, s.s.OS.RunningInUserNS)
 		if err != nil {
-			logger.Errorf(`Failed to unpack image for RBD storage `+
-				`volume for image "%s" on storage pool "%s": %s`,
-				fingerprint, s.pool.Name, err)
+			logger.Errorf(`Failed to unpack image for RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 
 			// umount image
 			s.ImageUmount(fingerprint)
 			return err
 		}
-		logger.Debugf(`Unpacked image for RBD storage volume for `+
-			`image "%s" on storage pool "%s"`, fingerprint,
-			s.pool.Name)
+		logger.Debugf(`Unpacked image for RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 
 		// umount image
 		s.ImageUmount(fingerprint)
@@ -2158,27 +1912,20 @@ func (s *storageCeph) ImageCreate(fingerprint string) error {
 			fingerprint, storagePoolVolumeTypeNameImage, s.UserName,
 			true)
 		if err != nil {
-			logger.Errorf(`Failed to unmap RBD storage volume for `+
-				`image "%s" on storage pool "%s": %s`,
-				fingerprint, s.pool.Name, err)
+			logger.Errorf(`Failed to unmap RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Unmapped RBD storage volume for image "%s" on `+
-			`storage pool "%s"`, fingerprint, s.pool.Name)
+		logger.Debugf(`Unmapped RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 
 		// make snapshot of volume
 		err = cephRBDSnapshotCreate(s.ClusterName, s.OSDPoolName,
 			fingerprint, storagePoolVolumeTypeNameImage, "readonly",
 			s.UserName)
 		if err != nil {
-			logger.Errorf(`Failed to create snapshot for RBD `+
-				`storage volume for image "%s" on storage `+
-				`pool "%s": %s`, fingerprint, s.pool.Name, err)
+			logger.Errorf(`Failed to create snapshot for RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Created snapshot for RBD storage volume for `+
-			`image "%s" on storage pool "%s"`, fingerprint,
-			s.pool.Name)
+		logger.Debugf(`Created snapshot for RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 
 		defer func() {
 			if !revert {
@@ -2190,10 +1937,7 @@ func (s *storageCeph) ImageCreate(fingerprint string) error {
 				storagePoolVolumeTypeNameImage, "readonly",
 				s.UserName)
 			if err != nil {
-				logger.Warnf(`Failed to delete snapshot for `+
-					`RBD storage volume for image "%s" on `+
-					`storage pool "%s": %s`, fingerprint,
-					s.pool.Name, err)
+				logger.Warnf(`Failed to delete snapshot for RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 			}
 		}()
 
@@ -2202,15 +1946,10 @@ func (s *storageCeph) ImageCreate(fingerprint string) error {
 			fingerprint, storagePoolVolumeTypeNameImage, "readonly",
 			s.UserName)
 		if err != nil {
-			logger.Errorf(`Failed to protect snapshot for RBD `+
-				`storage volume for image "%s" on storage `+
-				`pool "%s": %s`, fingerprint, s.pool.Name,
-				err)
+			logger.Errorf(`Failed to protect snapshot for RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Protected snapshot for RBD storage volume for `+
-			`image "%s" on storage pool "%s"`, fingerprint,
-			s.pool.Name)
+		logger.Debugf(`Protected snapshot for RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 
 		defer func() {
 			if !revert {
@@ -2222,28 +1961,21 @@ func (s *storageCeph) ImageCreate(fingerprint string) error {
 				storagePoolVolumeTypeNameImage, "readonly",
 				s.UserName)
 			if err != nil {
-				logger.Warnf(`Failed to unprotect snapshot for `+
-					`RBD storage volume for image "%s" on `+
-					`storage pool "%s": %s`, fingerprint,
-					s.pool.Name, err)
+				logger.Warnf(`Failed to unprotect snapshot for RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 			}
 		}()
 	} else {
-		logger.Debugf(`RBD storage volume for image "%s" on storage `+
-			`pool "%s" does exist`, fingerprint, s.pool.Name)
+		logger.Debugf(`RBD storage volume for image "%s" on storage pool "%s" does exist`, fingerprint, s.pool.Name)
 
 		// unmark deleted
 		err := cephRBDVolumeUnmarkDeleted(s.ClusterName, s.OSDPoolName,
 			fingerprint, storagePoolVolumeTypeNameImage, s.UserName,
 			s.volume.Config["block.filesystem"], "")
 		if err != nil {
-			logger.Errorf(`Failed to unmark RBD storage volume `+
-				`for image "%s" on storage pool "%s" as
-				zombie: %s`, fingerprint, s.pool.Name, err)
+			logger.Errorf(`Failed to unmark RBD storage volume for image "%s" on storage pool "%s" as zombie: %s`, fingerprint, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Unmarked RBD storage volume for image "%s" on `+
-			`storage pool "%s" as zombie`, fingerprint, s.pool.Name)
+		logger.Debugf(`Unmarked RBD storage volume for image "%s" on storage pool "%s" as zombie`, fingerprint, s.pool.Name)
 
 		defer func() {
 			if !revert {
@@ -2255,26 +1987,19 @@ func (s *storageCeph) ImageCreate(fingerprint string) error {
 				fingerprint, fingerprint, s.UserName,
 				s.volume.Config["block.filesystem"])
 			if err != nil {
-				logger.Warnf(`Failed to mark RBD storage `+
-					`volume for image "%s" on storage `+
-					`pool "%s" as zombie: %s`, fingerprint,
-					s.pool.Name, err)
+				logger.Warnf(`Failed to mark RBD storage volume for image "%s" on storage pool "%s" as zombie: %s`, fingerprint, s.pool.Name, err)
 			}
 		}()
 	}
 
 	err := s.createImageDbPoolVolume(fingerprint)
 	if err != nil {
-		logger.Errorf(`Failed to create database entry for RBD storage `+
-			`volume for image "%s" on storage pool "%s": %s`,
-			fingerprint, s.pool.Name, err)
+		logger.Errorf(`Failed to create database entry for RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 		return err
 	}
-	logger.Debugf(`Createdd database entry for RBD storage volume for `+
-		`image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
+	logger.Debugf(`Createdd database entry for RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 
-	logger.Debugf(`Created RBD storage volume for image "%s" on storage `+
-		`pool "%s"`, fingerprint, s.pool.Name)
+	logger.Debugf(`Created RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 
 	revert = false
 
@@ -2282,8 +2007,7 @@ func (s *storageCeph) ImageCreate(fingerprint string) error {
 }
 
 func (s *storageCeph) ImageDelete(fingerprint string) error {
-	logger.Debugf(`Deleting RBD storage volume for image "%s" on storage `+
-		`pool "%s"`, fingerprint, s.pool.Name)
+	logger.Debugf(`Deleting RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 
 	// try to umount but don't fail
 	s.ImageUmount(fingerprint)
@@ -2294,79 +2018,58 @@ func (s *storageCeph) ImageDelete(fingerprint string) error {
 		s.UserName)
 	if err != nil {
 		if err != db.ErrNoSuchObject {
-			logger.Errorf(`Failed to list clones of RBD storage `+
-				`volume for image "%s" on storage pool "%s":
-				%s`, fingerprint, s.pool.Name, err)
+			logger.Errorf(`Failed to list clones of RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Retrieved no clones of RBD storage volume for `+
-			`image "%s" on storage pool "%s"`, fingerprint,
-			s.pool.Name)
+		logger.Debugf(`Retrieved no clones of RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 
 		// unprotect snapshot
 		err = cephRBDSnapshotUnprotect(s.ClusterName, s.OSDPoolName,
 			fingerprint, storagePoolVolumeTypeNameImage, "readonly",
 			s.UserName)
 		if err != nil {
-			logger.Errorf(`Failed to unprotect snapshot for RBD `+
-				`storage volume for image "%s" on storage `+
-				`pool "%s": %s`, fingerprint, s.pool.Name, err)
+			logger.Errorf(`Failed to unprotect snapshot for RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Unprotected snapshot for RBD storage volume `+
-			`for image "%s" on storage pool "%s"`, fingerprint,
-			s.pool.Name)
+		logger.Debugf(`Unprotected snapshot for RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 
 		// delete snapshots
 		err = cephRBDSnapshotsPurge(s.ClusterName, s.OSDPoolName,
 			fingerprint, storagePoolVolumeTypeNameImage, s.UserName)
 		if err != nil {
-			logger.Errorf(`Failed to delete snapshot for RBD `+
-				`storage volume for image "%s" on storage `+
-				`pool "%s": %s`, fingerprint, s.pool.Name, err)
+			logger.Errorf(`Failed to delete snapshot for RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Deleted snapshot for RBD storage volume for `+
-			`image "%s" on storage pool "%s"`, fingerprint,
-			s.pool.Name)
+		logger.Debugf(`Deleted snapshot for RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 
 		// unmap
 		err = cephRBDVolumeUnmap(s.ClusterName, s.OSDPoolName,
 			fingerprint, storagePoolVolumeTypeNameImage, s.UserName,
 			true)
 		if err != nil {
-			logger.Errorf(`Failed to unmap RBD storage volume for `+
-				`image "%s" on storage pool "%s": %s`,
-				fingerprint, s.pool.Name, err)
+			logger.Errorf(`Failed to unmap RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Unmapped RBD storage volume for image "%s" on `+
-			`storage pool "%s"`, fingerprint, s.pool.Name)
+		logger.Debugf(`Unmapped RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 
 		// delete volume
 		err = cephRBDVolumeDelete(s.ClusterName, s.OSDPoolName,
 			fingerprint, storagePoolVolumeTypeNameImage, s.UserName)
 		if err != nil {
-			logger.Errorf(`Failed to delete RBD storage volume `+
-				`for image "%s" on storage pool "%s": %s`,
-				fingerprint, s.pool.Name, err)
+			logger.Errorf(`Failed to delete RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Deleted RBD storage volume for image "%s" on `+
-			`storage pool "%s"`, fingerprint, s.pool.Name)
+		logger.Debugf(`Deleted RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 	} else {
 		// unmap
 		err = cephRBDVolumeUnmap(s.ClusterName, s.OSDPoolName,
 			fingerprint, storagePoolVolumeTypeNameImage, s.UserName,
 			true)
 		if err != nil {
-			logger.Errorf(`Failed to unmap RBD storage volume for `+
-				`image "%s" on storage pool "%s": %s`,
-				fingerprint, s.pool.Name, err)
+			logger.Errorf(`Failed to unmap RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Unmapped RBD storage volume for image "%s" on `+
-			`storage pool "%s"`, fingerprint, s.pool.Name)
+		logger.Debugf(`Unmapped RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 
 		// mark deleted
 		err := cephRBDVolumeMarkDeleted(s.ClusterName, s.OSDPoolName,
@@ -2374,47 +2077,35 @@ func (s *storageCeph) ImageDelete(fingerprint string) error {
 			fingerprint, s.UserName,
 			s.volume.Config["block.filesystem"])
 		if err != nil {
-			logger.Errorf(`Failed to mark RBD storage volume for `+
-				`image "%s" on storage pool "%s" as zombie: %s`,
-				fingerprint, s.pool.Name, err)
+			logger.Errorf(`Failed to mark RBD storage volume for image "%s" on storage pool "%s" as zombie: %s`, fingerprint, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Marked RBD storage volume for image "%s" on `+
-			`storage pool "%s" as zombie`, fingerprint, s.pool.Name)
+		logger.Debugf(`Marked RBD storage volume for image "%s" on storage pool "%s" as zombie`, fingerprint, s.pool.Name)
 	}
 
 	err = s.deleteImageDbPoolVolume(fingerprint)
 	if err != nil {
-		logger.Errorf(`Failed to delete database entry for RBD `+
-			`storage volume for image "%s" on storage pool "%s":
-			%s`, fingerprint, s.pool.Name, err)
+		logger.Errorf(`Failed to delete database entry for RBD storage volume for image "%s" on storage pool "%s": %s`, fingerprint, s.pool.Name, err)
 		return err
 	}
-	logger.Debugf(`Deleted database entry for RBD storage volume for `+
-		`image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
+	logger.Debugf(`Deleted database entry for RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 
 	imageMntPoint := getImageMountPoint(s.pool.Name, fingerprint)
 	if shared.PathExists(imageMntPoint) {
 		err := os.Remove(imageMntPoint)
 		if err != nil {
-			logger.Errorf(`Failed to delete image mountpoint "%s" `+
-				`for RBD storage volume for image "%s" on `+
-				`storage pool "%s": %s`, imageMntPoint,
-				fingerprint, s.pool.Name, err)
+			logger.Errorf(`Failed to delete image mountpoint "%s" for RBD storage volume for image "%s" on storage pool "%s": %s`, imageMntPoint, fingerprint, s.pool.Name, err)
 			return err
 		}
-		logger.Debugf(`Deleted image mountpoint "%s" for RBD storage `+
-			`volume for image "%s" on storage pool "%s"`,
-			imageMntPoint, fingerprint, s.pool.Name)
+		logger.Debugf(`Deleted image mountpoint "%s" for RBD storage volume for image "%s" on storage pool "%s"`, imageMntPoint, fingerprint, s.pool.Name)
 	}
 
-	logger.Debugf(`Deleted RBD storage volume for image "%s" on storage `+
-		`pool "%s"`, fingerprint, s.pool.Name)
+	logger.Debugf(`Deleted RBD storage volume for image "%s" on storage pool "%s"`, fingerprint, s.pool.Name)
 	return nil
 }
 
 func (s *storageCeph) ImageMount(fingerprint string) (bool, error) {
-	logger.Debugf("Mounting RBD storage volume for image \"%s\" on storage pool \"%s\".", fingerprint, s.pool.Name)
+	logger.Debugf("Mounting RBD storage volume for image \"%s\" on storage pool \"%s\"", fingerprint, s.pool.Name)
 
 	imageMntPoint := getImageMountPoint(s.pool.Name, fingerprint)
 	if shared.IsMountPoint(imageMntPoint) {
@@ -2435,16 +2126,15 @@ func (s *storageCeph) ImageMount(fingerprint string) (bool, error) {
 
 	err := tryMount(RBDDevPath, imageMntPoint, RBDFilesystem, mountFlags, mountOptions)
 	if err != nil || ret < 0 {
-		logger.Errorf("%s: %s", errMsg, err)
 		return false, err
 	}
 
-	logger.Debugf("Mounted RBD storage volume for image \"%s\" on storage pool \"%s\".", fingerprint, s.pool.Name)
+	logger.Debugf("Mounted RBD storage volume for image \"%s\" on storage pool \"%s\"", fingerprint, s.pool.Name)
 	return true, nil
 }
 
 func (s *storageCeph) ImageUmount(fingerprint string) (bool, error) {
-	logger.Debugf("Unmounting RBD storage volume for image \"%s\" on storage pool \"%s\".", fingerprint, s.pool.Name)
+	logger.Debugf("Unmounting RBD storage volume for image \"%s\" on storage pool \"%s\"", fingerprint, s.pool.Name)
 
 	imageMntPoint := getImageMountPoint(s.pool.Name, fingerprint)
 	if !shared.IsMountPoint(imageMntPoint) {
@@ -2456,7 +2146,7 @@ func (s *storageCeph) ImageUmount(fingerprint string) (bool, error) {
 		return false, err
 	}
 
-	logger.Debugf("Unmounted RBD storage volume for image \"%s\" on storage pool \"%s\".", fingerprint, s.pool.Name)
+	logger.Debugf("Unmounted RBD storage volume for image \"%s\" on storage pool \"%s\"", fingerprint, s.pool.Name)
 	return true, nil
 }
 
@@ -2479,7 +2169,7 @@ func (s *storageCeph) StorageEntitySetQuota(volumeType int, size int64, data int
 		ctName := c.Name()
 		if c.IsRunning() {
 			msg := fmt.Sprintf(`Cannot resize RBD storage volume `+
-				`for container \"%s\" when it is running`,
+				`for container "%s" when it is running`,
 				ctName)
 			logger.Errorf(msg)
 			return fmt.Errorf(msg)

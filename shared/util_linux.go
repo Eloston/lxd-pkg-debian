@@ -35,6 +35,7 @@ import (
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
 
@@ -149,6 +150,93 @@ again:
 
 	return ret;
 }
+
+int lxc_abstract_unix_send_fds(int fd, int *sendfds, int num_sendfds,
+			       void *data, size_t size)
+{
+	int ret;
+	struct msghdr msg;
+	struct iovec iov;
+	struct cmsghdr *cmsg = NULL;
+	char buf[1] = {0};
+	char *cmsgbuf;
+	size_t cmsgbufsize = CMSG_SPACE(num_sendfds * sizeof(int));
+
+	memset(&msg, 0, sizeof(msg));
+	memset(&iov, 0, sizeof(iov));
+
+	cmsgbuf = malloc(cmsgbufsize);
+	if (!cmsgbuf)
+		return -1;
+
+	msg.msg_control = cmsgbuf;
+	msg.msg_controllen = cmsgbufsize;
+
+	cmsg = CMSG_FIRSTHDR(&msg);
+	cmsg->cmsg_level = SOL_SOCKET;
+	cmsg->cmsg_type = SCM_RIGHTS;
+	cmsg->cmsg_len = CMSG_LEN(num_sendfds * sizeof(int));
+
+	msg.msg_controllen = cmsg->cmsg_len;
+
+	memcpy(CMSG_DATA(cmsg), sendfds, num_sendfds * sizeof(int));
+
+	iov.iov_base = data ? data : buf;
+	iov.iov_len = data ? size : sizeof(buf);
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+
+	ret = sendmsg(fd, &msg, MSG_NOSIGNAL);
+	if (ret < 0)
+		fprintf(stderr, "%s - Failed to send file descriptor\n", strerror(errno));
+	free(cmsgbuf);
+	return ret;
+}
+
+int lxc_abstract_unix_recv_fds(int fd, int *recvfds, int num_recvfds,
+			       void *data, size_t size)
+{
+	int ret;
+	struct msghdr msg;
+	struct iovec iov;
+	struct cmsghdr *cmsg = NULL;
+	char buf[1] = {0};
+	char *cmsgbuf;
+	size_t cmsgbufsize = CMSG_SPACE(num_recvfds * sizeof(int));
+
+	memset(&msg, 0, sizeof(msg));
+	memset(&iov, 0, sizeof(iov));
+
+	cmsgbuf = malloc(cmsgbufsize);
+	if (!cmsgbuf)
+		return -1;
+
+	msg.msg_control = cmsgbuf;
+	msg.msg_controllen = cmsgbufsize;
+
+	iov.iov_base = data ? data : buf;
+	iov.iov_len = data ? size : sizeof(buf);
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+
+	ret = recvmsg(fd, &msg, 0);
+	if (ret <= 0) {
+		fprintf(stderr, "%s - Failed to receive file descriptor\n", strerror(errno));
+		goto out;
+	}
+
+	cmsg = CMSG_FIRSTHDR(&msg);
+
+	memset(recvfds, -1, num_recvfds * sizeof(int));
+	if (cmsg && cmsg->cmsg_len == CMSG_LEN(num_recvfds * sizeof(int)) &&
+	    cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+		memcpy(recvfds, CMSG_DATA(cmsg), num_recvfds * sizeof(int));
+	}
+
+out:
+	free(cmsgbuf);
+	return ret;
+}
 */
 import "C"
 
@@ -172,6 +260,29 @@ func GetPollRevents(fd int, timeout int, flags int) (int, int, error) {
 	}
 
 	return int(ret), int(revents), err
+}
+
+func AbstractUnixSendFd(sockFD int, sendFD int) error {
+	fd := C.int(sendFD)
+	sk_fd := C.int(sockFD)
+	ret := C.lxc_abstract_unix_send_fds(sk_fd, &fd, C.int(1), nil, C.size_t(0))
+	if ret < 0 {
+		return fmt.Errorf("Failed to send file descriptor via abstract unix socket")
+	}
+
+	return nil
+}
+
+func AbstractUnixReceiveFd(sockFD int) (*os.File, error) {
+	fd := C.int(-1)
+	sk_fd := C.int(sockFD)
+	ret := C.lxc_abstract_unix_recv_fds(sk_fd, &fd, C.int(1), nil, C.size_t(0))
+	if ret < 0 {
+		return nil, fmt.Errorf("Failed to receive file descriptor via abstract unix socket")
+	}
+
+	file := os.NewFile(uintptr(fd), "")
+	return file, nil
 }
 
 func OpenPty(uid, gid int64) (master *os.File, slave *os.File, err error) {
@@ -439,7 +550,7 @@ func llistxattr(path string, list []byte) (sz int, err error) {
 // GetAllXattr retrieves all extended attributes associated with a file,
 // directory or symbolic link.
 func GetAllXattr(path string) (xattrs map[string]string, err error) {
-	e1 := fmt.Errorf("Extended attributes changed during retrieval.")
+	e1 := fmt.Errorf("Extended attributes changed during retrieval")
 
 	// Call llistxattr() twice: First, to determine the size of the buffer
 	// we need to allocate to store the extended attributes, second, to
@@ -466,7 +577,7 @@ func GetAllXattr(path string) (xattrs map[string]string, err error) {
 
 	split := strings.Split(string(dest), "\x00")
 	if split == nil {
-		return nil, fmt.Errorf("No valid extended attribute key found.")
+		return nil, fmt.Errorf("No valid extended attribute key found")
 	}
 	// *listxattr functions return a list of  names  as  an unordered array
 	// of null-terminated character strings (attribute names are separated
@@ -684,7 +795,7 @@ func ExecReaderToChannel(r io.Reader, bufferSize int, exited <-chan bool, fd int
 	return ch
 }
 
-var ObjectFound = fmt.Errorf("Found requested object.")
+var ObjectFound = fmt.Errorf("Found requested object")
 
 func LookupUUIDByBlockDevPath(diskDevice string) (string, error) {
 	uuid := ""
@@ -715,11 +826,11 @@ func LookupUUIDByBlockDevPath(diskDevice string) (string, error) {
 
 	err := filepath.Walk("/dev/disk/by-uuid", readUUID)
 	if err != nil && err != ObjectFound {
-		return "", fmt.Errorf("Failed to detect UUID: %s.", err)
+		return "", fmt.Errorf("Failed to detect UUID: %s", err)
 	}
 
 	if uuid == "" {
-		return "", fmt.Errorf("Failed to detect UUID.")
+		return "", fmt.Errorf("Failed to detect UUID")
 	}
 
 	lastSlash := strings.LastIndex(uuid, "/")

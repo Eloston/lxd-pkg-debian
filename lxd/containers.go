@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io/ioutil"
 	"sort"
 	"strconv"
 	"sync"
@@ -106,19 +107,14 @@ func (slice containerAutostartList) Swap(i, j int) {
 
 func containersRestart(s *state.State) error {
 	// Get all the containers
-	result, err := s.Cluster.ContainersList(db.CTypeRegular)
+	result, err := containerLoadNodeAll(s)
 	if err != nil {
 		return err
 	}
 
 	containers := []container{}
 
-	for _, name := range result {
-		c, err := containerLoadByName(s, name)
-		if err != nil {
-			return err
-		}
-
+	for _, c := range result {
 		containers = append(containers, c)
 	}
 
@@ -178,29 +174,42 @@ func (slice containerStopList) Swap(i, j int) {
 func containersShutdown(s *state.State) error {
 	var wg sync.WaitGroup
 
+	dbAvailable := true
+
 	// Get all the containers
-	results, err := s.Cluster.ContainersList(db.CTypeRegular)
+	containers, err := containerLoadNodeAll(s)
 	if err != nil {
-		return err
-	}
+		// Mark database as offline
+		dbAvailable = false
+		containers = []container{}
 
-	containers := []container{}
-
-	for _, name := range results {
-		c, err := containerLoadByName(s, name)
+		// List all containers on disk
+		files, err := ioutil.ReadDir(shared.VarPath("containers"))
 		if err != nil {
 			return err
 		}
 
-		containers = append(containers, c)
+		for _, file := range files {
+			c, err := containerLXCLoad(s, db.ContainerArgs{
+				Name:   file.Name(),
+				Config: make(map[string]string),
+			}, nil)
+			if err != nil {
+				return err
+			}
+
+			containers = append(containers, c)
+		}
 	}
 
 	sort.Sort(containerStopList(containers))
 
-	// Reset all container states
-	err = s.Cluster.ContainersResetState()
-	if err != nil {
-		return err
+	if dbAvailable {
+		// Reset all container states
+		err = s.Cluster.ContainersResetState()
+		if err != nil {
+			return err
+		}
 	}
 
 	var lastPriority int = 0
@@ -253,9 +262,6 @@ func containersShutdown(s *state.State) error {
 }
 
 func containerDeleteSnapshots(s *state.State, cname string) error {
-	logger.Debug("containerDeleteSnapshots",
-		log.Ctx{"container": cname})
-
 	results, err := s.Cluster.ContainerGetSnapshots(cname)
 	if err != nil {
 		return err

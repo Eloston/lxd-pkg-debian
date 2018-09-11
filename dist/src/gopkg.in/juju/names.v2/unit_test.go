@@ -17,6 +17,7 @@ var _ = gc.Suite(&unitSuite{})
 
 func (s *unitSuite) TestUnitTag(c *gc.C) {
 	c.Assert(names.NewUnitTag("wordpress/2").String(), gc.Equals, "unit-wordpress-2")
+	c.Assert(names.NewUnitTag("foo-bar/2").String(), gc.Equals, "unit-foo-bar-2")
 }
 
 var unitNameTests = []struct {
@@ -84,8 +85,11 @@ var parseUnitTagTests = []struct {
 	tag: "",
 	err: names.InvalidTagError("", ""),
 }, {
-	tag:      "unit-dave/0",
+	tag:      "unit-dave-0",
 	expected: names.NewUnitTag("dave/0"),
+}, {
+	tag:      "unit-foo-bar-0",
+	expected: names.NewUnitTag("foo-bar/0"),
 }, {
 	tag: "dave",
 	err: names.InvalidTagError("dave", ""),

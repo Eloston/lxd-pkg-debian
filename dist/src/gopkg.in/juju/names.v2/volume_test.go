@@ -17,23 +17,31 @@ var _ = gc.Suite(&volumeSuite{})
 
 func (s *volumeSuite) TestVolumeTag(c *gc.C) {
 	c.Assert(names.NewVolumeTag("1").String(), gc.Equals, "volume-1")
+	c.Assert(names.NewVolumeTag("0/lxc/0/0").String(), gc.Equals, "volume-0-lxc-0-0")
+	c.Assert(names.NewVolumeTag("1/0").String(), gc.Equals, "volume-1-0")
+	c.Assert(names.NewVolumeTag("some-unit/0/0").String(), gc.Equals, "volume-some-unit-0-0")
 }
 
 func (s *volumeSuite) TestVolumeNameValidity(c *gc.C) {
 	assertVolumeNameValid(c, "0")
+	assertVolumeNameValid(c, "0/0")
 	assertVolumeNameValid(c, "0/lxc/0/0")
 	assertVolumeNameValid(c, "1000")
+	assertVolumeNameValid(c, "some-unit/0/0")
+	assertVolumeNameValid(c, "some-unit/0/1000")
 	assertVolumeNameInvalid(c, "-1")
 	assertVolumeNameInvalid(c, "")
 	assertVolumeNameInvalid(c, "one")
 	assertVolumeNameInvalid(c, "#")
-	assertVolumeNameInvalid(c, "0/0/0") // 0/0 is not a valid machine ID
+	assertVolumeNameInvalid(c, "0/0/0") // 0/0 is not a valid machine or unit ID
 }
 
 func (s *volumeSuite) TestParseVolumeTag(c *gc.C) {
 	assertParseVolumeTag(c, "volume-0", names.NewVolumeTag("0"))
+	assertParseVolumeTag(c, "volume-0-0", names.NewVolumeTag("0/0"))
 	assertParseVolumeTag(c, "volume-88", names.NewVolumeTag("88"))
 	assertParseVolumeTag(c, "volume-0-lxc-0-88", names.NewVolumeTag("0/lxc/0/88"))
+	assertParseVolumeTag(c, "volume-some-unit-0-88", names.NewVolumeTag("some-unit/0/88"))
 	assertParseVolumeTagInvalid(c, "", names.InvalidTagError("", ""))
 	assertParseVolumeTagInvalid(c, "one", names.InvalidTagError("one", ""))
 	assertParseVolumeTagInvalid(c, "volume-", names.InvalidTagError("volume-", names.VolumeTagKind))
@@ -44,6 +52,7 @@ func (s *volumeSuite) TestVolumeMachine(c *gc.C) {
 	assertVolumeMachine(c, "0/0", names.NewMachineTag("0"))
 	assertVolumeMachine(c, "0/lxc/0/0", names.NewMachineTag("0/lxc/0"))
 	assertVolumeNoMachine(c, "0")
+	assertVolumeNoMachine(c, "some-unit/0/0")
 }
 
 func assertVolumeMachine(c *gc.C, id string, expect names.MachineTag) {
@@ -54,6 +63,14 @@ func assertVolumeMachine(c *gc.C, id string, expect names.MachineTag) {
 
 func assertVolumeNoMachine(c *gc.C, id string) {
 	_, ok := names.VolumeMachine(names.NewVolumeTag(id))
+	c.Assert(ok, gc.Equals, false)
+}
+
+func (s *volumeSuite) TestVolumeUnit(c *gc.C) {
+	t, ok := names.VolumeUnit(names.NewVolumeTag("some-unit/0/0"))
+	c.Assert(ok, gc.Equals, true)
+	c.Assert(t, gc.Equals, names.NewUnitTag("some-unit/0"))
+	_, ok = names.VolumeUnit(names.NewVolumeTag("0/0"))
 	c.Assert(ok, gc.Equals, false)
 }
 

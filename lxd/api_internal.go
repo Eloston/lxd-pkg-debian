@@ -39,6 +39,37 @@ var apiInternal = []Command{
 	internalClusterContainerMovedCmd,
 }
 
+var internalShutdownCmd = Command{
+	name: "shutdown",
+	put:  internalShutdown,
+}
+
+var internalReadyCmd = Command{
+	name: "ready",
+	get:  internalWaitReady,
+}
+
+var internalContainerOnStartCmd = Command{
+	name: "containers/{id}/onstart",
+	get:  internalContainerOnStart,
+}
+
+var internalContainerOnStopCmd = Command{
+	name: "containers/{id}/onstop",
+	get:  internalContainerOnStop,
+}
+
+var internalSQLCmd = Command{
+	name: "sql",
+	get:  internalSQLGet,
+	post: internalSQLPost,
+}
+
+var internalContainersCmd = Command{
+	name: "containers",
+	post: internalImport,
+}
+
 func internalWaitReady(d *Daemon, r *http.Request) Response {
 	select {
 	case <-d.readyChan:
@@ -68,7 +99,7 @@ func internalContainerOnStart(d *Daemon, r *http.Request) Response {
 
 	err = c.OnStart()
 	if err != nil {
-		logger.Error("start hook failed", log.Ctx{"container": c.Name(), "err": err})
+		logger.Error("The start hook failed", log.Ctx{"container": c.Name(), "err": err})
 		return SmartError(err)
 	}
 
@@ -93,7 +124,7 @@ func internalContainerOnStop(d *Daemon, r *http.Request) Response {
 
 	err = c.OnStop(target)
 	if err != nil {
-		logger.Error("stop hook failed", log.Ctx{"container": c.Name(), "err": err})
+		logger.Error("The stop hook failed", log.Ctx{"container": c.Name(), "err": err})
 		return SmartError(err)
 	}
 
@@ -181,6 +212,12 @@ func internalSQLPost(d *Daemon, r *http.Request) Response {
 	}
 
 	batch := internalSQLBatch{}
+
+	if req.Query == ".sync" {
+		d.gateway.Sync()
+		return SyncResponse(true, batch)
+	}
+
 	for _, query := range strings.Split(req.Query, ";") {
 		query = strings.TrimLeft(query, " ")
 
@@ -189,48 +226,60 @@ func internalSQLPost(d *Daemon, r *http.Request) Response {
 		}
 
 		result := internalSQLResult{}
+
 		tx, err := db.Begin()
 		if err != nil {
 			return SmartError(err)
 		}
+
 		if strings.HasPrefix(strings.ToUpper(query), "SELECT") {
 			err = internalSQLSelect(tx, query, &result)
 			tx.Rollback()
 		} else {
 			err = internalSQLExec(tx, query, &result)
-			if err == nil {
+			if err != nil {
+				tx.Rollback()
+			} else {
 				err = tx.Commit()
 			}
 		}
 		if err != nil {
 			return SmartError(err)
 		}
+
 		batch.Results = append(batch.Results, result)
 	}
+
 	return SyncResponse(true, batch)
 }
 
 func internalSQLSelect(tx *sql.Tx, query string, result *internalSQLResult) error {
 	result.Type = "select"
+
 	rows, err := tx.Query(query)
 	if err != nil {
-		return errors.Wrap(err, "failed to execute query")
+		return errors.Wrap(err, "Failed to execute query")
 	}
+
 	defer rows.Close()
+
 	result.Columns, err = rows.Columns()
 	if err != nil {
-		return errors.Wrap(err, "failed to fetch colume names")
+		return errors.Wrap(err, "Failed to fetch colume names")
 	}
+
 	for rows.Next() {
 		row := make([]interface{}, len(result.Columns))
 		rowPointers := make([]interface{}, len(result.Columns))
 		for i := range row {
 			rowPointers[i] = &row[i]
 		}
+
 		err := rows.Scan(rowPointers...)
 		if err != nil {
-			return errors.Wrap(err, "failed to scan row")
+			return errors.Wrap(err, "Failed to scan row")
 		}
+
 		for i, column := range row {
 			// Convert bytes to string. This is safe as
 			// long as we don't have any BLOB column type.
@@ -239,12 +288,15 @@ func internalSQLSelect(tx *sql.Tx, query string, result *internalSQLResult) erro
 				row[i] = string(data)
 			}
 		}
+
 		result.Rows = append(result.Rows, row)
 	}
+
 	err = rows.Err()
 	if err != nil {
-		return errors.Wrap(err, "rows error")
+		return errors.Wrap(err, "Got a row error")
 	}
+
 	return nil
 }
 
@@ -252,20 +304,16 @@ func internalSQLExec(tx *sql.Tx, query string, result *internalSQLResult) error 
 	result.Type = "exec"
 	r, err := tx.Exec(query)
 	if err != nil {
-		return errors.Wrapf(err, "failed to exec query")
+		return errors.Wrapf(err, "Failed to exec query")
 	}
+
 	result.RowsAffected, err = r.RowsAffected()
 	if err != nil {
-		return errors.Wrap(err, "failed to fetch affected rows")
+		return errors.Wrap(err, "Failed to fetch affected rows")
 	}
+
 	return nil
 }
-
-var internalShutdownCmd = Command{name: "shutdown", put: internalShutdown}
-var internalReadyCmd = Command{name: "ready", get: internalWaitReady}
-var internalContainerOnStartCmd = Command{name: "containers/{id}/onstart", get: internalContainerOnStart}
-var internalContainerOnStopCmd = Command{name: "containers/{id}/onstop", get: internalContainerOnStop}
-var internalSQLCmd = Command{name: "sql", get: internalSQLGet, post: internalSQLPost}
 
 func slurpBackupFile(path string) (*backupFile, error) {
 	data, err := ioutil.ReadFile(path)
@@ -355,6 +403,13 @@ func internalImport(d *Daemon, r *http.Request) Response {
 	backup, err := slurpBackupFile(backupYamlPath)
 	if err != nil {
 		return SmartError(err)
+	}
+
+	// Update snapshot names to include container name (if needed)
+	for i, snap := range backup.Snapshots {
+		if !strings.Contains(snap.Name, "/") {
+			backup.Snapshots[i].Name = fmt.Sprintf("%s/%s", backup.Container.Name, snap.Name)
+		}
 	}
 
 	// Try to retrieve the storage pool the container supposedly lives on.
@@ -801,10 +856,10 @@ func internalImport(d *Daemon, r *http.Request) Response {
 			BaseImage:    baseImage,
 			Config:       snap.Config,
 			CreationDate: snap.CreationDate,
-			LastUsedDate: snap.LastUsedDate,
 			Ctype:        db.CTypeSnapshot,
 			Devices:      snap.Devices,
 			Ephemeral:    snap.Ephemeral,
+			LastUsedDate: snap.LastUsedDate,
 			Name:         snap.Name,
 			Profiles:     snap.Profiles,
 			Stateful:     snap.Stateful,
@@ -838,10 +893,11 @@ func internalImport(d *Daemon, r *http.Request) Response {
 		BaseImage:    baseImage,
 		Config:       backup.Container.Config,
 		CreationDate: backup.Container.CreatedAt,
-		LastUsedDate: backup.Container.LastUsedAt,
 		Ctype:        db.CTypeRegular,
+		Description:  backup.Container.Description,
 		Devices:      backup.Container.Devices,
 		Ephemeral:    backup.Container.Ephemeral,
+		LastUsedDate: backup.Container.LastUsedAt,
 		Name:         backup.Container.Name,
 		Profiles:     backup.Container.Profiles,
 		Stateful:     backup.Container.Stateful,
@@ -863,5 +919,3 @@ func internalImport(d *Daemon, r *http.Request) Response {
 
 	return EmptySyncResponse
 }
-
-var internalContainersCmd = Command{name: "containers", post: internalImport}

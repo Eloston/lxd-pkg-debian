@@ -51,6 +51,23 @@ func (r *ProtocolLXD) GetContainers() ([]api.Container, error) {
 	return containers, nil
 }
 
+// GetContainersFull returns a list of containers including snapshots, backups and state
+func (r *ProtocolLXD) GetContainersFull() ([]api.ContainerFull, error) {
+	containers := []api.ContainerFull{}
+
+	if !r.HasExtension("container_full") {
+		return nil, fmt.Errorf("The server is missing the required \"container_full\" API extension")
+	}
+
+	// Fetch the raw value
+	_, err := r.queryStruct("GET", "/containers?recursion=2", nil, "", &containers)
+	if err != nil {
+		return nil, err
+	}
+
+	return containers, nil
+}
+
 // GetContainer returns the container entry for the provided name
 func (r *ProtocolLXD) GetContainer(name string) (*api.Container, string, error) {
 	container := api.Container{}
@@ -72,12 +89,7 @@ func (r *ProtocolLXD) CreateContainerFromBackup(args ContainerBackupArgs) (Opera
 	}
 
 	// Send the request
-	path := "/containers"
-	if r.clusterTarget != "" {
-		path += fmt.Sprintf("?target=%s", r.clusterTarget)
-	}
-
-	op, _, err := r.queryOperation("POST", path, args.BackupFile, "")
+	op, _, err := r.queryOperation("POST", "/containers", args.BackupFile, "")
 	if err != nil {
 		return nil, err
 	}
@@ -94,11 +106,7 @@ func (r *ProtocolLXD) CreateContainer(container api.ContainersPost) (Operation, 
 	}
 
 	// Send the request
-	path := "/containers"
-	if r.clusterTarget != "" {
-		path += fmt.Sprintf("?target=%s", r.clusterTarget)
-	}
-	op, _, err := r.queryOperation("POST", path, container, "")
+	op, _, err := r.queryOperation("POST", "/containers", container, "")
 	if err != nil {
 		return nil, err
 	}
@@ -272,8 +280,18 @@ func (r *ProtocolLXD) CopyContainer(source ContainerServer, container api.Contai
 		req.Source.Live = container.StatusCode == api.Running
 	}
 
+	sourceInfo, err := source.GetConnectionInfo()
+	if err != nil {
+		return nil, fmt.Errorf("Failed to get source connection info: %v", err)
+	}
+
+	destInfo, err := r.GetConnectionInfo()
+	if err != nil {
+		return nil, fmt.Errorf("Failed to get source connection info: %v", err)
+	}
+
 	// Optimization for the local copy case
-	if r == source && !r.IsClustered() {
+	if destInfo.URL == sourceInfo.URL && !r.IsClustered() {
 		// Local copy source fields
 		req.Source.Type = "copy"
 		req.Source.Source = container.Name
@@ -581,12 +599,7 @@ func (r *ProtocolLXD) MigrateContainer(name string, container api.ContainerPost)
 	}
 
 	// Send the request
-	path := fmt.Sprintf("/containers/%s", url.QueryEscape(name))
-	if r.clusterTarget != "" {
-		path += fmt.Sprintf("?target=%s", r.clusterTarget)
-	}
-
-	op, _, err := r.queryOperation("POST", path, container, "")
+	op, _, err := r.queryOperation("POST", fmt.Sprintf("/containers/%s", url.QueryEscape(name)), container, "")
 	if err != nil {
 		return nil, err
 	}
@@ -762,7 +775,7 @@ func (r *ProtocolLXD) GetContainerFile(containerName string, path string) (io.Re
 
 	// Check the return value for a cleaner error
 	if resp.StatusCode != http.StatusOK {
-		_, _, err := r.parseResponse(resp)
+		_, _, err := lxdParseResponse(resp)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -861,7 +874,7 @@ func (r *ProtocolLXD) CreateContainerFile(containerName string, path string, arg
 	}
 
 	// Check the return value for a cleaner error
-	_, _, err = r.parseResponse(resp)
+	_, _, err = lxdParseResponse(resp)
 	if err != nil {
 		return err
 	}
@@ -942,12 +955,13 @@ func (r *ProtocolLXD) CreateContainerSnapshot(containerName string, snapshot api
 }
 
 // CopyContainerSnapshot copies a snapshot from a remote server into a new container. Additional options can be passed using ContainerCopyArgs
-func (r *ProtocolLXD) CopyContainerSnapshot(source ContainerServer, snapshot api.ContainerSnapshot, args *ContainerSnapshotCopyArgs) (RemoteOperation, error) {
-	// Base request
-	fields := strings.SplitN(snapshot.Name, shared.SnapshotDelimiter, 2)
-	cName := fields[0]
-	sName := fields[1]
+func (r *ProtocolLXD) CopyContainerSnapshot(source ContainerServer, containerName string, snapshot api.ContainerSnapshot, args *ContainerSnapshotCopyArgs) (RemoteOperation, error) {
+	// Backward compatibility (with broken Name field)
+	fields := strings.Split(snapshot.Name, shared.SnapshotDelimiter)
+	cName := containerName
+	sName := fields[len(fields)-1]
 
+	// Base request
 	req := api.ContainersPost{
 		Name: cName,
 		ContainerPut: api.ContainerPut{
@@ -995,7 +1009,7 @@ func (r *ProtocolLXD) CopyContainerSnapshot(source ContainerServer, snapshot api
 	if r == source && r.clusterTarget == "" {
 		// Local copy source fields
 		req.Source.Type = "copy"
-		req.Source.Source = snapshot.Name
+		req.Source.Source = fmt.Sprintf("%s/%s", cName, sName)
 
 		// Copy the container
 		op, err := r.CreateContainer(req)
@@ -1287,7 +1301,7 @@ func (r *ProtocolLXD) GetContainerLogfile(name string, filename string) (io.Read
 
 	// Check the return value for a cleaner error
 	if resp.StatusCode != http.StatusOK {
-		_, _, err := r.parseResponse(resp)
+		_, _, err := lxdParseResponse(resp)
 		if err != nil {
 			return nil, err
 		}
@@ -1381,7 +1395,7 @@ func (r *ProtocolLXD) GetContainerTemplateFile(containerName string, templateNam
 
 	// Check the return value for a cleaner error
 	if resp.StatusCode != http.StatusOK {
-		_, _, err := r.parseResponse(resp)
+		_, _, err := lxdParseResponse(resp)
 		if err != nil {
 			return nil, err
 		}
@@ -1421,7 +1435,7 @@ func (r *ProtocolLXD) setContainerTemplateFile(containerName string, templateNam
 	resp, err := r.http.Do(req)
 	// Check the return value for a cleaner error
 	if resp.StatusCode != http.StatusOK {
-		_, _, err := r.parseResponse(resp)
+		_, _, err := lxdParseResponse(resp)
 		if err != nil {
 			return err
 		}
@@ -1536,7 +1550,7 @@ func (r *ProtocolLXD) GetContainerConsoleLog(containerName string, args *Contain
 
 	// Check the return value for a cleaner error
 	if resp.StatusCode != http.StatusOK {
-		_, _, err := r.parseResponse(resp)
+		_, _, err := lxdParseResponse(resp)
 		if err != nil {
 			return nil, err
 		}
@@ -1695,7 +1709,7 @@ func (r *ProtocolLXD) GetContainerBackupFile(containerName string, name string, 
 	defer close(doneCh)
 
 	if response.StatusCode != http.StatusOK {
-		_, _, err := r.parseResponse(response)
+		_, _, err := lxdParseResponse(response)
 		if err != nil {
 			return nil, err
 		}

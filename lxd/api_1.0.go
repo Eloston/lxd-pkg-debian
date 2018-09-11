@@ -20,50 +20,58 @@ import (
 	"github.com/pkg/errors"
 )
 
+var api10Cmd = Command{
+	name:         "",
+	untrustedGet: true,
+	get:          api10Get,
+	put:          api10Put,
+	patch:        api10Patch,
+}
+
 var api10 = []Command{
-	containersCmd,
-	containerCmd,
-	containerConsoleCmd,
-	containerStateCmd,
-	containerFileCmd,
-	containerLogsCmd,
-	containerLogCmd,
-	containerSnapshotsCmd,
-	containerSnapshotCmd,
-	containerExecCmd,
-	containerMetadataCmd,
-	containerMetadataTemplatesCmd,
 	aliasCmd,
 	aliasesCmd,
+	api10Cmd,
+	certificateFingerprintCmd,
+	certificatesCmd,
+	clusterCmd,
+	clusterNodeCmd,
+	clusterNodesCmd,
+	containerCmd,
+	containerConsoleCmd,
+	containerExecCmd,
+	containerFileCmd,
+	containerLogCmd,
+	containerLogsCmd,
+	containerMetadataCmd,
+	containerMetadataTemplatesCmd,
+	containersCmd,
+	containerSnapshotCmd,
+	containerSnapshotsCmd,
+	containerStateCmd,
 	eventsCmd,
 	imageCmd,
+	imageExportCmd,
+	imageRefreshCmd,
 	imagesCmd,
-	imagesExportCmd,
-	imagesSecretCmd,
-	imagesRefreshCmd,
-	operationsCmd,
-	operationCmd,
-	operationWait,
-	operationWebsocket,
-	networksCmd,
+	imageSecretCmd,
 	networkCmd,
 	networkLeasesCmd,
-	api10Cmd,
-	certificatesCmd,
-	certificateFingerprintCmd,
-	profilesCmd,
+	networksCmd,
+	operationCmd,
+	operationsCmd,
+	operationWait,
+	operationWebsocket,
 	profileCmd,
+	profilesCmd,
 	serverResourceCmd,
-	storagePoolsCmd,
+	serverResourceCmd,
 	storagePoolCmd,
 	storagePoolResourcesCmd,
+	storagePoolsCmd,
 	storagePoolVolumesCmd,
 	storagePoolVolumesTypeCmd,
 	storagePoolVolumeTypeCmd,
-	serverResourceCmd,
-	clusterCmd,
-	clusterNodesCmd,
-	clusterNodeCmd,
 }
 
 func api10Get(d *Daemon, r *http.Request) Response {
@@ -73,8 +81,8 @@ func api10Get(d *Daemon, r *http.Request) Response {
 		if err != nil {
 			return err
 		}
-		if config.MacaroonEndpoint() != "" {
-			authMethods = append(authMethods, "macaroons")
+		if config.CandidEndpoint() != "" {
+			authMethods = append(authMethods, "candid")
 		}
 		return nil
 	})
@@ -365,7 +373,7 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 			fallthrough
 		case "maas.api.key":
 			maasChanged = true
-		case "core.macaroon.endpoint":
+		case "candid.api.url":
 			err := d.setupExternalAuthentication(value)
 			if err != nil {
 				return err
@@ -401,5 +409,3 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 	}
 	return nil
 }
-
-var api10Cmd = Command{name: "", untrustedGet: true, get: api10Get, put: api10Put, patch: api10Patch}

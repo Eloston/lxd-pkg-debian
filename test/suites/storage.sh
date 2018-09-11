@@ -25,8 +25,15 @@ test_storage() {
   # Test setting description on a storage volume
   lxc storage volume show "$storage_pool" "$storage_volume" | sed 's/^description:.*/description: bar/' | lxc storage volume edit "$storage_pool" "$storage_volume"
   lxc storage volume show "$storage_pool" "$storage_volume" | grep -q 'description: bar'
-  lxc storage volume delete "$storage_pool" "$storage_volume"
 
+  # Validate get/set
+  lxc storage set "$storage_pool" user.abc def
+  [ "$(lxc storage get "$storage_pool" user.abc)" = "def" ]
+
+  lxc storage volume set "$storage_pool" "$storage_volume" user.abc def
+  [ "$(lxc storage volume get "$storage_pool" "$storage_volume" user.abc)" = "def" ]
+
+  lxc storage volume delete "$storage_pool" "$storage_volume"
   lxc storage delete "$storage_pool"
 
   # Test btrfs resize
@@ -38,7 +45,7 @@ test_storage() {
       lxc storage create "$btrfs_storage_pool" "$lxd_backend" volume.block.filesystem=btrfs volume.size=200MB
       lxc storage volume create "$btrfs_storage_pool" "$btrfs_storage_volume"
       lxc storage volume show "$btrfs_storage_pool" "$btrfs_storage_volume"
-      lxc storage volume set "$btrfs_storage_pool" "$btrfs_storage_volume" size 256MB
+      lxc storage volume set "$btrfs_storage_pool" "$btrfs_storage_volume" size 256MiB
       lxc storage volume delete "$btrfs_storage_pool" "$btrfs_storage_volume"
 
       # Test generation of unique UUID.
@@ -793,6 +800,20 @@ test_storage() {
     lxc delete -f quota2
     lxc delete -f quota3
   fi
+
+  # Test removing storage pools only containing image volumes
+  # shellcheck disable=SC2031
+  LXD_DIR="${LXD_DIR}"
+  storage_pool="lxdtest-$(basename "${LXD_DIR}")-pool26"
+  lxc storage create "$storage_pool" "$lxd_backend"
+  lxc init -s "${storage_pool}" testimage c1
+  # The storage pool will not be removed since it has c1 attached to it
+  ! lxc storage delete "${storage_pool}"
+  lxc delete c1
+  # The storage pool will be deleted since the testimage is also attached to
+  # the default pool
+  lxc storage delete "${storage_pool}"
+  lxc image show testimage
 
   # shellcheck disable=SC2031
   LXD_DIR="${LXD_DIR}"

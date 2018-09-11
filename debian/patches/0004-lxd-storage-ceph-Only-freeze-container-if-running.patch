@@ -1,0 +1,46 @@
+From 81b0a2f5bd92de97866326335aab0e4c8887c1c9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?St=C3=A9phane=20Graber?= <stgraber@ubuntu.com>
+Date: Tue, 21 Aug 2018 13:17:51 -0400
+Subject: lxd/storage/ceph: Only freeze container if running
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Stéphane Graber <stgraber@ubuntu.com>
+---
+ lxd/storage_ceph.go | 21 ++++++++++++---------
+ 1 file changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/lxd/storage_ceph.go b/lxd/storage_ceph.go
+index 90f197b5d..a2e8a2d4f 100644
+--- a/lxd/storage_ceph.go
++++ b/lxd/storage_ceph.go
+@@ -1504,16 +1504,19 @@ func (s *storageCeph) ContainerGetUsage(container container) (int64, error) {
+ }
+ 
+ func (s *storageCeph) ContainerSnapshotCreate(snapshotContainer container, sourceContainer container) error {
+-	// This is costly but we need to ensure that all cached data has
+-	// been committed to disk. If we don't then the rbd snapshot of
+-	// the underlying filesystem can be inconsistent or - worst case
+-	// - empty.
+-	syscall.Sync()
+ 	containerMntPoint := getContainerMountPoint(s.pool.Name, sourceContainer.Name())
+-	msg, fsFreezeErr := shared.TryRunCommand("fsfreeze", "--freeze", containerMntPoint)
+-	logger.Debugf("Trying to freeze the filesystem: %s: %s", msg, fsFreezeErr)
+-	if fsFreezeErr == nil {
+-		defer shared.TryRunCommand("fsfreeze", "--unfreeze", containerMntPoint)
++	if shared.IsMountPoint(containerMntPoint) {
++		// This is costly but we need to ensure that all cached data has
++		// been committed to disk. If we don't then the rbd snapshot of
++		// the underlying filesystem can be inconsistent or - worst case
++		// - empty.
++		syscall.Sync()
++
++		msg, fsFreezeErr := shared.TryRunCommand("fsfreeze", "--freeze", containerMntPoint)
++		logger.Debugf("Trying to freeze the filesystem: %s: %s", msg, fsFreezeErr)
++		if fsFreezeErr == nil {
++			defer shared.TryRunCommand("fsfreeze", "--unfreeze", containerMntPoint)
++		}
+ 	}
+ 
+ 	return s.doContainerSnapshotCreate(snapshotContainer.Name(), sourceContainer.Name())

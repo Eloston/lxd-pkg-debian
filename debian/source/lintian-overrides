@@ -1,11 +1,15 @@
 # Required for backports
 lxd source: package-uses-old-debhelper-compat-version 10
+lxd source: unknown-runtime-tests-restriction allow-stderr paragraph starting at line 1
 
 # Go examples from bundled packages
 lxd source: package-does-not-install-examples dist/src/github.com/gorilla/websocket/examples/
 lxd source: package-does-not-install-examples dist/src/gopkg.in/lxc/go-lxc.v2/examples/
-lxd source: package-does-not-install-examples dist/src/google.golang.org/grpc/examples/
-lxd source: package-does-not-install-examples dist/src/golang.org/x/text/cmd/gotext/examples/
 
 # Included in debian/copyright
 lxd source: missing-notice-file-for-apache-license dist/src/gopkg.in/yaml.v2/NOTICE
+
+# Bundled sources
+lxd source: source-contains-empty-directory lxd-3.0.2/dist/dqlite/ac/
+lxd source: source-contains-empty-directory lxd-3.0.2/dist/dqlite/m4/
+lxd source: source-contains-empty-directory lxd-3.0.2/dist/src/github.com/gogo/protobuf/vanity/test/gofast/

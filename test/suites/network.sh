@@ -11,6 +11,15 @@ test_network() {
   lxc network set lxdt$$ ipv4.routing false
   lxc network set lxdt$$ ipv6.routing false
   lxc network set lxdt$$ ipv6.dhcp.stateful true
+
+  # validate unset and patch
+  [ "$(lxc network get lxdt$$ ipv6.dhcp.stateful)" = "true" ]
+  lxc network unset lxdt$$ ipv6.dhcp.stateful
+  [ "$(lxc network get lxdt$$ ipv6.dhcp.stateful)" = "" ]
+  lxc query -X PATCH -d "{\\\"config\\\": {\\\"ipv6.dhcp.stateful\\\": \\\"true\\\"}}" lxd/1.0/networks/lxdt$$
+  [ "$(lxc network get lxdt$$ ipv6.dhcp.stateful)" = "true" ]
+
+  # delete the network
   lxc network delete lxdt$$
 
   # edit network description
@@ -21,9 +30,9 @@ test_network() {
 
   # rename network
   lxc network create lxdt$$
-  lxc network rename lxdt$$ newnet
+  lxc network rename lxdt$$ newnet$$
   lxc network list | grep -qv lxdt$$  # the old name is gone
-  lxc network delete newnet
+  lxc network delete newnet$$
 
   # Unconfigured bridge
   lxc network create lxdt$$ ipv4.address=none ipv6.address=none

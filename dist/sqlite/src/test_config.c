@@ -148,6 +148,12 @@ static void set_options(Tcl_Interp *interp){
   Tcl_SetVar2(interp, "sqlite_options", "hiddencolumns", "0", TCL_GLOBAL_ONLY);
 #endif
 
+#ifdef SQLITE_ENABLE_DESERIALIZE
+  Tcl_SetVar2(interp, "sqlite_options", "deserialize", "1", TCL_GLOBAL_ONLY);
+#else
+  Tcl_SetVar2(interp, "sqlite_options", "deserialize", "0", TCL_GLOBAL_ONLY);
+#endif
+
 #ifdef SQLITE_ENABLE_MEMSYS3
   Tcl_SetVar2(interp, "sqlite_options", "mem3", "1", TCL_GLOBAL_ONLY);
 #else
@@ -501,6 +507,12 @@ Tcl_SetVar2(interp, "sqlite_options", "long_double",
 
 Tcl_SetVar2(interp, "sqlite_options", "mergesort", "1", TCL_GLOBAL_ONLY);
 
+#ifdef SQLITE_ENABLE_NULL_TRIM
+  Tcl_SetVar2(interp, "sqlite_options", "null_trim", "1", TCL_GLOBAL_ONLY);
+#else
+  Tcl_SetVar2(interp, "sqlite_options", "null_trim", "0", TCL_GLOBAL_ONLY);
+#endif
+
 #ifdef SQLITE_OMIT_OR_OPTIMIZATION
   Tcl_SetVar2(interp, "sqlite_options", "or_opt", "0", TCL_GLOBAL_ONLY);
 #else
@@ -750,10 +762,10 @@ Tcl_SetVar2(interp, "sqlite_options", "mergesort", "1", TCL_GLOBAL_ONLY);
   Tcl_SetVar2(interp, "sqlite_options", "uri_00_error", "0", TCL_GLOBAL_ONLY);
 #endif
 
-#if defined(SQLITE_ENABLE_REPLICATION) && !defined(SQLITE_OMIT_WAL)
-  Tcl_SetVar2(interp, "sqlite_options", "replication", "1", TCL_GLOBAL_ONLY);
+#if defined(SQLITE_ENABLE_WAL_REPLICATION) && !defined(SQLITE_OMIT_WAL)
+  Tcl_SetVar2(interp, "sqlite_options", "wal_replication", "1", TCL_GLOBAL_ONLY);
 #else
-  Tcl_SetVar2(interp, "sqlite_options", "replication", "0", TCL_GLOBAL_ONLY);
+  Tcl_SetVar2(interp, "sqlite_options", "wal_replication", "0", TCL_GLOBAL_ONLY);
 #endif
 
 #define LINKVAR(x) { \

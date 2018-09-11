@@ -250,7 +250,7 @@ func (c *Control) shutdownServers() {
 				break
 			}
 		}
-		if hasShutdown {
+		if !hasShutdown {
 			c.shutdownServer(id)
 			ids = append(ids, id)
 		}

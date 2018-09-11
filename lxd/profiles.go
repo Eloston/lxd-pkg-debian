@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/gorilla/mux"
+	"github.com/pkg/errors"
 
 	lxd "github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/cluster"
@@ -21,6 +22,21 @@ import (
 
 	log "github.com/lxc/lxd/shared/log15"
 )
+
+var profilesCmd = Command{
+	name: "profiles",
+	get:  profilesGet,
+	post: profilesPost,
+}
+
+var profileCmd = Command{
+	name:   "profiles/{name}",
+	get:    profileGet,
+	put:    profilePut,
+	delete: profileDelete,
+	post:   profilePost,
+	patch:  profilePatch,
+}
 
 /* This is used for both profiles post and profile put */
 func profilesGet(d *Daemon, r *http.Request) Response {
@@ -99,11 +115,6 @@ func profilesPost(d *Daemon, r *http.Request) Response {
 
 	return SyncResponseLocation(true, nil, fmt.Sprintf("/%s/profiles/%s", version.APIVersion, req.Name))
 }
-
-var profilesCmd = Command{
-	name: "profiles",
-	get:  profilesGet,
-	post: profilesPost}
 
 func doProfileGet(s *state.State, name string) (*api.Profile, error) {
 	_, profile, err := s.Cluster.ProfileGet(name)
@@ -281,6 +292,10 @@ func profilePatch(d *Daemon, r *http.Request) Response {
 func profilePost(d *Daemon, r *http.Request) Response {
 	name := mux.Vars(r)["name"]
 
+	if name == "default" {
+		return Forbidden(errors.New("The 'default' profile cannot be renamed"))
+	}
+
 	req := api.ProfilePost{}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return BadRequest(err)
@@ -294,7 +309,7 @@ func profilePost(d *Daemon, r *http.Request) Response {
 	// Check that the name isn't already in use
 	id, _, _ := d.cluster.ProfileGet(req.Name)
 	if id > 0 {
-		return Conflict
+		return Conflict(fmt.Errorf("Name '%s' already in use", req.Name))
 	}
 
 	if strings.Contains(req.Name, "/") {
@@ -317,6 +332,10 @@ func profilePost(d *Daemon, r *http.Request) Response {
 func profileDelete(d *Daemon, r *http.Request) Response {
 	name := mux.Vars(r)["name"]
 
+	if name == "default" {
+		return Forbidden(errors.New("The 'default' profile cannot be deleted"))
+	}
+
 	_, err := doProfileGet(d.State(), name)
 	if err != nil {
 		return SmartError(err)
@@ -334,5 +353,3 @@ func profileDelete(d *Daemon, r *http.Request) Response {
 
 	return EmptySyncResponse
 }
-
-var profileCmd = Command{name: "profiles/{name}", get: profileGet, put: profilePut, delete: profileDelete, post: profilePost, patch: profilePatch}

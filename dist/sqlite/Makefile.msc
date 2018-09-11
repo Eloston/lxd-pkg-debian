@@ -1186,14 +1186,14 @@ LIBOBJS0 = vdbe.lo parse.lo alter.lo analyze.lo attach.lo auth.lo \
          func.lo global.lo hash.lo \
          icu.lo insert.lo legacy.lo loadext.lo \
          main.lo malloc.lo mem0.lo mem1.lo mem2.lo mem3.lo mem5.lo \
-         memjournal.lo \
+         memdb.lo memjournal.lo \
          mutex.lo mutex_noop.lo mutex_unix.lo mutex_w32.lo \
          notify.lo opcodes.lo os.lo os_unix.lo os_win.lo \
          pager.lo pcache.lo pcache1.lo pragma.lo prepare.lo printf.lo \
          random.lo resolve.lo rowset.lo rtree.lo \
          sqlite3session.lo select.lo sqlite3rbu.lo status.lo \
          table.lo threads.lo tokenize.lo treeview.lo trigger.lo \
-         update.lo util.lo vacuum.lo \
+         update.lo upsert.lo util.lo vacuum.lo \
          vdbeapi.lo vdbeaux.lo vdbeblob.lo vdbemem.lo vdbesort.lo \
          vdbetrace.lo wal.lo walker.lo where.lo wherecode.lo whereexpr.lo \
          utf.lo vtab.lo
@@ -1259,6 +1259,7 @@ SRC00 = \
   $(TOP)\src\mem2.c \
   $(TOP)\src\mem3.c \
   $(TOP)\src\mem5.c \
+  $(TOP)\src\memdb.c \
   $(TOP)\src\memjournal.c \
   $(TOP)\src\mutex.c \
   $(TOP)\src\mutex_noop.c \
@@ -1291,6 +1292,7 @@ SRC01 = \
   $(TOP)\src\trigger.c \
   $(TOP)\src\utf.c \
   $(TOP)\src\update.c \
+  $(TOP)\src\upsert.c \
   $(TOP)\src\util.c \
   $(TOP)\src\vacuum.c \
   $(TOP)\src\vdbe.c \
@@ -1466,7 +1468,6 @@ TESTSRC = \
   $(TOP)\src\test_osinst.c \
   $(TOP)\src\test_pcache.c \
   $(TOP)\src\test_quota.c \
-  $(TOP)\src\test_replication.c \
   $(TOP)\src\test_rtree.c \
   $(TOP)\src\test_schema.c \
   $(TOP)\src\test_server.c \
@@ -1476,6 +1477,7 @@ TESTSRC = \
   $(TOP)\src\test_tclvar.c \
   $(TOP)\src\test_thread.c \
   $(TOP)\src\test_vfs.c \
+  $(TOP)/src/test_walreplication.c \
   $(TOP)\src\test_windirent.c \
   $(TOP)\src\test_wsd.c \
   $(TOP)\ext\fts3\fts3_term.c \
@@ -1501,6 +1503,7 @@ TESTEXT = \
   $(TOP)\ext\misc\ieee754.c \
   $(TOP)\ext\misc\mmapwarm.c \
   $(TOP)\ext\misc\nextchar.c \
+  $(TOP)\ext\misc\normalize.c \
   $(TOP)\ext\misc\percentile.c \
   $(TOP)\ext\misc\regexp.c \
   $(TOP)\ext\misc\remember.c \
@@ -1597,7 +1600,8 @@ FUZZDATA = \
   $(TOP)\test\fuzzdata2.db \
   $(TOP)\test\fuzzdata3.db \
   $(TOP)\test\fuzzdata4.db \
-  $(TOP)\test\fuzzdata5.db
+  $(TOP)\test\fuzzdata5.db \
+  $(TOP)\test\fuzzdata6.db
 # <</mark>>
 
 # Additional compiler options for the shell.  These are only effective
@@ -1615,12 +1619,11 @@ SHELL_COMPILE_OPTS = $(SHELL_COMPILE_OPTS) -DSQLITE_ENABLE_RTREE
 #
 MPTESTER_COMPILE_OPTS = -DSQLITE_ENABLE_JSON1 -DSQLITE_ENABLE_FTS5
 FUZZERSHELL_COMPILE_OPTS = -DSQLITE_ENABLE_JSON1
-FUZZCHECK_COMPILE_OPTS = -DSQLITE_ENABLE_JSON1 -DSQLITE_ENABLE_MEMSYS5 -DSQLITE_OSS_FUZZ -DSQLITE_MAX_MEMORY=50000000
+FUZZCHECK_COMPILE_OPTS = -DSQLITE_ENABLE_JSON1 -DSQLITE_ENABLE_MEMSYS5 -DSQLITE_OSS_FUZZ -DSQLITE_MAX_MEMORY=50000000 -DSQLITE_PRINTF_PRECISION_LIMIT=1000
 FUZZCHECK_SRC = $(TOP)\test\fuzzcheck.c $(TOP)\test\ossfuzz.c
 OSSSHELL_SRC = $(TOP)\test\ossshell.c $(TOP)\test\ossfuzz.c
 DBFUZZ_COMPILE_OPTS = -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION
 KV_COMPILE_OPTS = -DSQLITE_THREADSAFE=0 -DSQLITE_DIRECT_OVERFLOW_READ
-DBSELFTEST_COMPILE_OPTS = -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_ENABLE_RTREE -DSQLITE_ENABLE_FTS4 -DSQLITE_ENABLE_FTS5
 ST_COMPILE_OPTS = -DSQLITE_THREADSAFE=0
 
 # Standard options to testfixture.
@@ -1672,7 +1675,7 @@ $(SQLITE3DLL):	$(LIBOBJ) $(LIBRESOBJS) $(CORE_LINK_DEP)
 sqlite3.def:	libsqlite3.lib
 	echo EXPORTS > sqlite3.def
 	dumpbin /all libsqlite3.lib \
-		| $(TCLSH_CMD) $(TOP)\tool\replace.tcl include "^\s+1 _?(sqlite3(?:session|changeset|changegroup)?_[^@]*)(?:@\d+)?$$" \1 \
+		| $(TCLSH_CMD) $(TOP)\tool\replace.tcl include "^\s+1 _?(sqlite3(?:session|changeset|changegroup|rebaser)?_[^@]*)(?:@\d+)?$$" \1 \
 		| sort >> sqlite3.def
 # <</block2>>
 
@@ -1688,7 +1691,7 @@ dbhash.exe:	$(TOP)\tool\dbhash.c $(SQLITE3C) $(SQLITE3H)
 	$(LTLINK) $(NO_WARN) $(TOP)\tool\dbhash.c $(SQLITE3C) /link $(LDFLAGS) $(LTLINKOPTS)
 
 scrub.exe:	$(TOP)\ext\misc\scrub.c $(SQLITE3C) $(SQLITE3H)
-	$(LTLINK) $(NO_WARN) $(TOP)\ext\misc\scrub.c $(SQLITE3C) /link $(LDFLAGS) $(LTLINKOPTS)
+	$(LTLINK) $(NO_WARN) -DSCRUB_STANDALONE=1 $(TOP)\ext\misc\scrub.c $(SQLITE3C) /link $(LDFLAGS) $(LTLINKOPTS)
 
 srcck1.exe:	$(TOP)\tool\srcck1.c
 	$(BCC) $(NO_WARN) -Fe$@ $(TOP)\tool\srcck1.c
@@ -1707,6 +1710,9 @@ fuzzcheck.exe:	$(FUZZCHECK_SRC) $(SQLITE3C) $(SQLITE3H)
 
 ossshell.exe:	$(OSSSHELL_SRC) $(SQLITE3C) $(SQLITE3H)
 	$(LTLINK) $(NO_WARN) $(FUZZCHECK_COMPILE_OPTS) $(OSSSHELL_SRC) $(SQLITE3C) /link $(LDFLAGS) $(LTLINKOPTS)
+
+sessionfuzz.exe:	zlib $(TOP)\test\sessionfuzz.c $(SQLITE3C) $(SQLITE3H)
+	$(LTLINK) $(NO_WARN) -I$(ZLIBINCDIR) $(TOP)\test\sessionfuzz.c /link $(LDFLAGS) $(LTLINKOPTS) /LIBPATH:$(ZLIBLIBDIR) $(ZLIBLIB)
 
 mptester.exe:	$(TOP)\mptest\mptest.c $(SQLITE3C) $(SQLITE3H)
 	$(LTLINK) $(NO_WARN) $(MPTESTER_COMPILE_OPTS) $(TOP)\mptest\mptest.c $(SQLITE3C) /link $(LDFLAGS) $(LTLINKOPTS)
@@ -1909,6 +1915,9 @@ mem3.lo:	$(TOP)\src\mem3.c $(HDR)
 mem5.lo:	$(TOP)\src\mem5.c $(HDR)
 	$(LTCOMPILE) $(CORE_COMPILE_OPTS) -c $(TOP)\src\mem5.c
 
+memdb.lo:	$(TOP)\src\memdb.c $(HDR)
+	$(LTCOMPILE) $(CORE_COMPILE_OPTS) -c $(TOP)\src\memdb.c
+
 memjournal.lo:	$(TOP)\src\memjournal.c $(HDR)
 	$(LTCOMPILE) $(CORE_COMPILE_OPTS) -c $(TOP)\src\memjournal.c
 
@@ -1986,6 +1995,9 @@ trigger.lo:	$(TOP)\src\trigger.c $(HDR)
 
 update.lo:	$(TOP)\src\update.c $(HDR)
 	$(LTCOMPILE) $(CORE_COMPILE_OPTS) -c $(TOP)\src\update.c
+
+upsert.lo:	$(TOP)\src\upsert.c $(HDR)
+	$(LTCOMPILE) $(CORE_COMPILE_OPTS) -c $(TOP)\src\upsert.c
 
 utf.lo:	$(TOP)\src\utf.c $(HDR)
 	$(LTCOMPILE) $(CORE_COMPILE_OPTS) -c $(TOP)\src\utf.c
@@ -2085,7 +2097,7 @@ keywordhash.h:	$(TOP)\tool\mkkeywordhash.c mkkeywordhash.exe
 # Source files that go into making shell.c
 SHELL_SRC = \
 	$(TOP)\src\shell.c.in \
-        $(TOP)\ext\misc\appendvfs.c \
+	$(TOP)\ext\misc\appendvfs.c \
 	$(TOP)\ext\misc\shathree.c \
 	$(TOP)\ext\misc\fileio.c \
 	$(TOP)\ext\misc\completion.c \
@@ -2252,6 +2264,7 @@ TESTFIXTURE_FLAGS = $(TESTFIXTURE_FLAGS) -DSQLITE_SERIES_CONSTRAINT_VERIFY=1
 TESTFIXTURE_FLAGS = $(TESTFIXTURE_FLAGS) -DSQLITE_DEFAULT_PAGE_SIZE=1024
 TESTFIXTURE_FLAGS = $(TESTFIXTURE_FLAGS) -DSQLITE_ENABLE_STMTVTAB
 TESTFIXTURE_FLAGS = $(TESTFIXTURE_FLAGS) -DSQLITE_ENABLE_DBPAGE_VTAB
+TESTFIXTURE_FLAGS = $(TESTFIXTURE_FLAGS) -DSQLITE_ENABLE_JSON1
 TESTFIXTURE_FLAGS = $(TESTFIXTURE_FLAGS) $(TEST_CCONV_OPTS)
 
 TESTFIXTURE_SRC0 = $(TESTEXT) $(TESTSRC2)
@@ -2365,11 +2378,11 @@ sqlite3_checker.exe:	sqlite3_checker.c $(LIBRESOBJS)
 	$(LTLINK) $(NO_WARN) -DBUILD_sqlite -I$(TCLINCDIR) sqlite3_checker.c \
 		/link $(LDFLAGS) $(LTLINKOPTS) $(TCLLIBPATHS) $(LTLIBPATHS) $(LIBRESOBJS) $(TCLLIBS) $(LTLIBS) $(TLIBS)
 
-dbdump.exe:	$(TOP)\ext\misc\dbdump.c $(SQLITE3C) $(SQLITE3H)
+dbdump.exe:	$(TOP)\ext\misc\dbdump.c $(SQLITE3C) $(SQLITE3H) $(LIBRESOBJS)
 	$(LTLINK) $(NO_WARN) -DDBDUMP_STANDALONE $(TOP)\ext\misc\dbdump.c $(SQLITE3C) \
 		/link $(LDFLAGS) $(LTLINKOPTS) $(LTLIBPATHS) $(LIBRESOBJS) $(LTLIBS)
 
-testloadext.lo:	$(TOP)\src\test_loadext.c
+testloadext.lo:	$(TOP)\src\test_loadext.c $(SQLITE3H)
 	$(LTCOMPILE) $(NO_WARN) -c $(TOP)\src\test_loadext.c
 
 testloadext.dll:	testloadext.lo
@@ -2422,9 +2435,6 @@ kvtest.exe:	$(TOP)\test\kvtest.c $(SQLITE3C) $(SQLITE3H)
 	$(LTLINK) $(NO_WARN) $(KV_COMPILE_OPTS) \
 		$(TOP)\test\kvtest.c $(SQLITE3C) /link $(LDFLAGS) $(LTLINKOPTS)
 
-dbselftest.exe:	$(TOP)\test\dbselftest.c $(SQLITE3C) $(SQLITE3H)
-	$(LTLINK) $(NO_WARN) $(DBSELFTEST_COMPILE_OPTS) $(TOP)\test\dbselftest.c $(SQLITE3C)
-
 rbu.exe:	$(TOP)\ext\rbu\rbu.c $(TOP)\ext\rbu\sqlite3rbu.c $(SQLITE3C) $(SQLITE3H)
 	$(LTLINK) $(NO_WARN) -DSQLITE_ENABLE_RBU \
 		$(TOP)\ext\rbu\rbu.c $(SQLITE3C) /link $(LDFLAGS) $(LTLINKOPTS)
@@ -2464,7 +2474,10 @@ clean:
 	del /Q sqlite3_analyzer.exe sqlite3_analyzer.c 2>NUL
 	del /Q sqlite-*-output.vsix 2>NUL
 	del /Q fuzzershell.exe fuzzcheck.exe sqldiff.exe dbhash.exe 2>NUL
-	del /Q sqltclsh.exe 2>NUL
+	del /Q sqltclsh.* 2>NUL
+	del /Q dbfuzz.exe sessionfuzz.exe 2>NUL
+	del /Q kvtest.exe ossshell.exe scrub.exe 2>NUL
+	del /Q showshm.exe sqlite3_checker.* sqlite3_expert.exe 2>NUL
 	del /Q fts5.* fts5parse.* 2>NUL
 	del /Q lsm.h lsm1.c 2>NUL
 # <</mark>>

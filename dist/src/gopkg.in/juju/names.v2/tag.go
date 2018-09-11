@@ -140,7 +140,7 @@ func ParseTag(tag string) (Tag, error) {
 		}
 		return NewActionTag(id), nil
 	case VolumeTagKind:
-		id = volumeTagSuffixToId(id)
+		id = filesystemOrVolumeTagSuffixToId(id)
 		if !IsValidVolume(id) {
 			return nil, invalidTagError(tag, kind)
 		}
@@ -157,7 +157,7 @@ func ParseTag(tag string) (Tag, error) {
 		}
 		return NewStorageTag(id), nil
 	case FilesystemTagKind:
-		id = filesystemTagSuffixToId(id)
+		id = filesystemOrVolumeTagSuffixToId(id)
 		if !IsValidFilesystem(id) {
 			return nil, invalidTagError(tag, kind)
 		}

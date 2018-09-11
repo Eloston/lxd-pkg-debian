@@ -126,7 +126,7 @@ int sqlite3PagerClose(Pager *pPager, sqlite3*);
 int sqlite3PagerReadFileheader(Pager*, int, unsigned char*);
 
 /* Functions used to configure a Pager object. */
-void sqlite3PagerSetBusyhandler(Pager*, int(*)(void *), void *);
+void sqlite3PagerSetBusyHandler(Pager*, int(*)(void *), void *);
 int sqlite3PagerSetPagesize(Pager*, u32*, int);
 #ifdef SQLITE_HAS_CODEC
 void sqlite3PagerAlignReserve(Pager*,Pager*);
@@ -187,14 +187,15 @@ int sqlite3PagerSharedLock(Pager *pPager);
   int sqlite3PagerSnapshotOpen(Pager *pPager, sqlite3_snapshot *pSnapshot);
   int sqlite3PagerSnapshotRecover(Pager *pPager);
 # endif
-#ifdef SQLITE_ENABLE_REPLICATION
-  int sqlite3PagerReplicationModeGet(Pager *pPager);
-  int sqlite3PagerReplicationModeSet(Pager *pPager, sqlite3*, u8, void*);
-  int sqlite3PagerReplicationFrames(Pager *pPager,
-      int, int, int, sqlite3_replication_page*, unsigned, int isCommit, int);
-  int sqlite3PagerReplicationUndo(Pager *pPager);
-  int sqlite3PagerReplicationCheckpoint(Pager*, sqlite3*, int, int*, int*);
-#endif /* SQLITE_ENABLE_REPLICATION */
+#ifdef SQLITE_ENABLE_WAL_REPLICATION
+  int sqlite3PagerWalReplicationGet(Pager*, int*, sqlite3_wal_replication**);
+  int sqlite3PagerWalReplicationSet(Pager*,
+    sqlite3*, int, sqlite3_wal_replication*, void*);
+  int sqlite3PagerWalReplicationFrames(Pager*,
+    int, int, int, unsigned*, void*, unsigned, int);
+  int sqlite3PagerWalReplicationUndo(Pager*);
+  int sqlite3PagerWalReplicationCheckpoint(Pager*, sqlite3*, int, int*, int*);
+#endif /* SQLITE_ENABLE_WAL_REPLICATION */
 #else
 # define sqlite3PagerUseWal(x,y) 0
 #endif
@@ -220,6 +221,11 @@ int sqlite3PagerIsMemdb(Pager*);
 void sqlite3PagerCacheStat(Pager *, int, int, int *);
 void sqlite3PagerClearCache(Pager*);
 int sqlite3SectorSize(sqlite3_file *);
+#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
+void sqlite3PagerResetLockTimeout(Pager *pPager);
+#else
+# define sqlite3PagerResetLockTimeout(X)
+#endif
 
 /* Functions used to truncate the database file. */
 void sqlite3PagerTruncateImage(Pager*,Pgno);

@@ -5,79 +5,144 @@ package idmap
 
 import (
 	"fmt"
+	"io/ioutil"
 	"os"
+	"os/exec"
+	"syscall"
 	"unsafe"
+
+	"github.com/lxc/lxd/shared"
 )
 
 // #cgo LDFLAGS: -lacl
 /*
 #define _GNU_SOURCE
+#include <byteswap.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/capability.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/acl.h>
 
-int shiftowner(char *basepath, char *path, int uid, int gid) {
-	struct stat sb;
-	int fd, r;
-	char fdpath[PATH_MAX];
-	char realpath[PATH_MAX];
+// Needs to be included at the end
+#include <sys/xattr.h>
 
-	fd = open(path, O_PATH|O_NOFOLLOW);
-	if (fd < 0 ) {
+#ifndef VFS_CAP_REVISION_1
+#define VFS_CAP_REVISION_1 0x01000000
+#endif
+
+#ifndef VFS_CAP_REVISION_2
+#define VFS_CAP_REVISION_2 0x02000000
+#endif
+
+#ifndef VFS_CAP_REVISION_3
+#define VFS_CAP_REVISION_3 0x03000000
+struct vfs_ns_cap_data {
+	__le32 magic_etc;
+	struct {
+		__le32 permitted;
+		__le32 inheritable;
+	} data[VFS_CAP_U32];
+	__le32 rootid;
+};
+#endif
+
+#if __BYTE_ORDER == __BIG_ENDIAN
+#define BE32_TO_LE32(x) bswap_32(x)
+#else
+#define BE32_TO_LE32(x) (x)
+#endif
+
+int set_vfs_ns_caps(char *path, char *caps, ssize_t len, uint32_t uid)
+{
+	// Works because vfs_ns_cap_data is a superset of vfs_cap_data (rootid
+	// field added to the end)
+	struct vfs_ns_cap_data ns_xattr;
+
+	memset(&ns_xattr, 0, sizeof(ns_xattr));
+	memcpy(&ns_xattr, caps, len);
+	ns_xattr.magic_etc &= ~(VFS_CAP_REVISION_1 | VFS_CAP_REVISION_2);
+	ns_xattr.magic_etc |= VFS_CAP_REVISION_3;
+	ns_xattr.rootid = BE32_TO_LE32(uid);
+
+	return setxattr(path, "security.capability", &ns_xattr, sizeof(ns_xattr), 0);
+}
+
+int set_dummy_fs_ns_caps(const char *path)
+{
+	#define __raise_cap_permitted(x, ns_cap_data)   ns_cap_data.data[(x)>>5].permitted   |= (1<<((x)&31))
+
+	struct vfs_ns_cap_data ns_xattr;
+
+	memset(&ns_xattr, 0, sizeof(ns_xattr));
+        __raise_cap_permitted(CAP_NET_RAW, ns_xattr);
+	ns_xattr.magic_etc |= VFS_CAP_REVISION_3 | VFS_CAP_FLAGS_EFFECTIVE;
+	ns_xattr.rootid = BE32_TO_LE32(1000000);
+
+	return setxattr(path, "security.capability", &ns_xattr, sizeof(ns_xattr), 0);
+}
+
+int shiftowner(char *basepath, char *path, int uid, int gid)
+{
+	int fd, ret;
+	char fdpath[PATH_MAX], realpath[PATH_MAX];
+	struct stat sb;
+
+	fd = open(path, O_PATH | O_NOFOLLOW);
+	if (fd < 0) {
 		perror("Failed open");
 		return 1;
 	}
 
-	r = sprintf(fdpath, "/proc/self/fd/%d", fd);
-	if (r < 0) {
+	ret = sprintf(fdpath, "/proc/self/fd/%d", fd);
+	if (ret < 0) {
 		perror("Failed sprintf");
 		close(fd);
 		return 1;
 	}
 
-	r = readlink(fdpath, realpath, PATH_MAX);
-	if (r < 0) {
+	ret = readlink(fdpath, realpath, PATH_MAX);
+	if (ret < 0) {
 		perror("Failed readlink");
 		close(fd);
 		return 1;
 	}
 
 	if (strlen(realpath) < strlen(basepath)) {
-		printf("Invalid path, source (%s) is outside of basepath (%s).\n", realpath, basepath);
+		printf("Invalid path, source (%s) is outside of basepath (%s)\n", realpath, basepath);
 		close(fd);
 		return 1;
 	}
 
 	if (strncmp(realpath, basepath, strlen(basepath))) {
-		printf("Invalid path, source (%s) is outside of basepath (%s).\n", realpath, basepath);
+		printf("Invalid path, source (%s) is outside of basepath " "(%s).\n", realpath, basepath);
 		close(fd);
 		return 1;
 	}
 
-	r = fstat(fd, &sb);
-	if (r < 0) {
+	ret = fstat(fd, &sb);
+	if (ret < 0) {
 		perror("Failed fstat");
 		close(fd);
 		return 1;
 	}
 
-	r = fchownat(fd, "", uid, gid, AT_EMPTY_PATH|AT_SYMLINK_NOFOLLOW);
-	if (r < 0) {
+	ret = fchownat(fd, "", uid, gid, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
+	if (ret < 0) {
 		perror("Failed chown");
 		close(fd);
 		return 1;
 	}
 
 	if (!S_ISLNK(sb.st_mode)) {
-		r = chmod(fdpath, sb.st_mode);
-		if (r < 0) {
+		ret = chmod(fdpath, sb.st_mode);
+		if (ret < 0) {
 			perror("Failed chmod");
 			close(fd);
 			return 1;
@@ -102,20 +167,44 @@ func ShiftOwner(basepath string, path string, uid int, gid int) error {
 	if r != 0 {
 		return fmt.Errorf("Failed to change ownership of: %s", path)
 	}
+
+	return nil
+}
+
+// GetCaps extracts the list of capabilities effective on the file
+func GetCaps(path string) ([]byte, error) {
+	xattrs, err := shared.GetAllXattr(path)
+	if err != nil {
+		return nil, err
+	}
+
+	valueStr, ok := xattrs["security.capability"]
+	if !ok {
+		return nil, nil
+	}
+
+	return []byte(valueStr), nil
+}
+
+// SetCaps applies the caps for a particular root uid
+func SetCaps(path string, caps []byte, uid int64) error {
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+
+	ccaps := C.CString(string(caps))
+	defer C.free(unsafe.Pointer(ccaps))
+
+	r := C.set_vfs_ns_caps(cpath, ccaps, C.ssize_t(len(caps)), C.uint32_t(uid))
+	if r != 0 {
+		return fmt.Errorf("Failed to apply capabilities to: %s", path)
+	}
+
 	return nil
 }
 
 // ShiftACL updates uid and gid for file ACLs when entering/exiting a namespace
 func ShiftACL(path string, shiftIds func(uid int64, gid int64) (int64, int64)) error {
-	finfo, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	if finfo.Mode()&os.ModeSymlink != 0 {
-		return nil
-	}
-
-	err = shiftAclType(path, C.ACL_TYPE_ACCESS, shiftIds)
+	err := shiftAclType(path, C.ACL_TYPE_ACCESS, shiftIds)
 	if err != nil {
 		return err
 	}
@@ -207,4 +296,39 @@ func shiftAclType(path string, aclType _Ctype_acl_type_t, shiftIds func(uid int6
 	}
 
 	return nil
+}
+
+func supportsV3Fcaps(prefix string) bool {
+	tmpfile, err := ioutil.TempFile(prefix, ".lxd_fcaps_v3_")
+	if err != nil {
+		return false
+	}
+	tmpfile.Close()
+	defer os.Remove(tmpfile.Name())
+
+	err = os.Chmod(tmpfile.Name(), 0001)
+	if err != nil {
+		return false
+	}
+
+	cpath := C.CString(tmpfile.Name())
+	defer C.free(unsafe.Pointer(cpath))
+
+	r := C.set_dummy_fs_ns_caps(cpath)
+	if r != 0 {
+		return false
+	}
+
+	cmd := exec.Command(tmpfile.Name())
+	err = cmd.Run()
+	if err != nil {
+		errno, isErrno := shared.GetErrno(err)
+		if isErrno && (errno == syscall.ERANGE || errno == syscall.EOVERFLOW) {
+			return false
+		}
+
+		return true
+	}
+
+	return true
 }

@@ -22,8 +22,12 @@ cleanup() {
 }
 
 trap cleanup EXIT HUP INT TERM
+
 # Disable LVM tests on systems (adt runners don't have a suitable LVM setup)
 [ -e /sbin/lvm ] && mv /sbin/lvm /sbin/lvm.orig
+
+# Disable static analysis tests (not useful for autopkgtest)
+sed -i "/static_analysis/d" test/main.sh
 
 # Define lxdbr0 if missing
 lxc network show lxdbr0 --force-local >/dev/null || lxc network create lxdbr0 --force-local
@@ -38,4 +42,5 @@ unset HTTPS_PROXY
 export LXD_OFFLINE=1
 export LXD_TMPFS=1
 export LXD_VERBOSE=1
+
 (cd test/ && ./main.sh)

@@ -25,6 +25,7 @@ import (
 	"gopkg.in/lxc/go-lxc.v2"
 	"gopkg.in/yaml.v2"
 
+	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/db/query"
 	"github.com/lxc/lxd/lxd/maas"
@@ -341,7 +342,7 @@ func containerLXCCreate(s *state.State, args db.ContainerArgs) (container, error
 
 	if rootDiskDevice["pool"] == "" {
 		c.Delete()
-		return nil, fmt.Errorf("The container's root device is missing the pool property.")
+		return nil, fmt.Errorf("The container's root device is missing the pool property")
 	}
 
 	storagePool := rootDiskDevice["pool"]
@@ -446,11 +447,13 @@ func containerLXCCreate(s *state.State, args db.ContainerArgs) (container, error
 	}
 
 	// Update MAAS
-	err = c.maasUpdate(false)
-	if err != nil {
-		c.Delete()
-		logger.Error("Failed creating container", ctxMap)
-		return nil, err
+	if !c.IsSnapshot() {
+		err = c.maasUpdate(false)
+		if err != nil {
+			c.Delete()
+			logger.Error("Failed creating container", ctxMap)
+			return nil, err
+		}
 	}
 
 	// Update lease files
@@ -463,15 +466,20 @@ func containerLXCCreate(s *state.State, args db.ContainerArgs) (container, error
 	return c, nil
 }
 
-func containerLXCLoad(s *state.State, args db.ContainerArgs) (container, error) {
+func containerLXCLoad(s *state.State, args db.ContainerArgs, profiles []api.Profile) (container, error) {
 	// Create the container struct
 	c := containerLXCInstantiate(s, args)
 
 	// Setup finalizer
 	runtime.SetFinalizer(c, containerLXCUnload)
 
-	// Load the config.
-	err := c.init()
+	// Expand config and devices
+	err := c.expandConfig(profiles)
+	if err != nil {
+		return nil, err
+	}
+
+	err = c.expandDevices(profiles)
 	if err != nil {
 		return nil, err
 	}
@@ -776,7 +784,7 @@ func findIdmap(state *state.State, cName string, isolatedStr string, configBase 
 	idmapLock.Lock()
 	defer idmapLock.Unlock()
 
-	cs, err := state.Cluster.ContainersList(db.CTypeRegular)
+	cts, err := containerLoadAll(state)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -784,15 +792,12 @@ func findIdmap(state *state.State, cName string, isolatedStr string, configBase 
 	offset := state.OS.IdmapSet.Idmap[0].Hostid + 65536
 
 	mapentries := idmap.ByHostid{}
-	for _, name := range cs {
+	for _, container := range cts {
+		name := container.Name()
+
 		/* Don't change our map Just Because. */
 		if name == cName {
 			continue
-		}
-
-		container, err := containerLoadByName(state, name)
-		if err != nil {
-			return nil, 0, err
 		}
 
 		if container.IsPrivileged() {
@@ -862,17 +867,17 @@ func findIdmap(state *state.State, cName string, isolatedStr string, configBase 
 		return set, offset, nil
 	}
 
-	return nil, 0, fmt.Errorf("Not enough uid/gid available for the container.")
+	return nil, 0, fmt.Errorf("Not enough uid/gid available for the container")
 }
 
 func (c *containerLXC) init() error {
 	// Compute the expanded config and device list
-	err := c.expandConfig()
+	err := c.expandConfig(nil)
 	if err != nil {
 		return err
 	}
 
-	err = c.expandDevices()
+	err = c.expandDevices(nil)
 	if err != nil {
 		return err
 	}
@@ -888,7 +893,7 @@ func (c *containerLXC) initLXC(config bool) error {
 
 	// Check if being called from a hook
 	if c.fromHook {
-		return fmt.Errorf("You can't use go-lxc from inside a LXC hook.")
+		return fmt.Errorf("You can't use go-lxc from inside a LXC hook")
 	}
 
 	// Check if already initialized
@@ -906,8 +911,7 @@ func (c *containerLXC) initLXC(config bool) error {
 
 	// Setup logging
 	logfile := c.LogFilePath()
-
-	err = cc.SetLogFile(logfile)
+	err = lxcSetConfigItem(cc, "lxc.log.file", logfile)
 	if err != nil {
 		return err
 	}
@@ -1713,17 +1717,23 @@ func (c *containerLXC) initStorage() error {
 }
 
 // Config handling
-func (c *containerLXC) expandConfig() error {
+func (c *containerLXC) expandConfig(profiles []api.Profile) error {
 	// Fetch profile configs
 	profileConfigs := make([]map[string]string, len(c.profiles))
 
 	// Apply all the profiles
-	for i, name := range c.profiles {
-		profileConfig, err := c.state.Cluster.ProfileConfig(name)
-		if err != nil {
-			return err
+	if profiles != nil {
+		for i, profile := range profiles {
+			profileConfigs[i] = profile.Config
 		}
-		profileConfigs[i] = profileConfig
+	} else {
+		for i, name := range c.profiles {
+			profileConfig, err := c.state.Cluster.ProfileConfig(name)
+			if err != nil {
+				return err
+			}
+			profileConfigs[i] = profileConfig
+		}
 	}
 
 	c.expandConfigFromProfiles(profileConfigs)
@@ -1750,15 +1760,23 @@ func (c *containerLXC) expandConfigFromProfiles(profileConfigs []map[string]stri
 	c.expandedConfig = config
 }
 
-func (c *containerLXC) expandDevices() error {
+func (c *containerLXC) expandDevices(profiles []api.Profile) error {
 	// Fetch profile devices
 	profileDevices := make([]types.Devices, len(c.profiles))
-	for _, p := range c.profiles {
-		devices, err := c.state.Cluster.Devices(p, true)
-		if err != nil {
-			return err
+
+	// Apply all the profiles
+	if profiles != nil {
+		for i, profile := range profiles {
+			profileDevices[i] = profile.Devices
 		}
-		profileDevices = append(profileDevices, devices)
+	} else {
+		for _, p := range c.profiles {
+			devices, err := c.state.Cluster.Devices(p, true)
+			if err != nil {
+				return err
+			}
+			profileDevices = append(profileDevices, devices)
+		}
 	}
 
 	c.expandDevicesFromProfiles(profileDevices)
@@ -1941,7 +1959,11 @@ func (c *containerLXC) startCommon() (string, error) {
 		}
 
 		if lastIdmap != nil {
-			err = lastIdmap.UnshiftRootfs(c.RootfsPath())
+			if c.Storage().GetStorageType() == storageTypeZfs {
+				err = lastIdmap.UnshiftRootfs(c.RootfsPath(), zfsIdmapSetSkipper)
+			} else {
+				err = lastIdmap.UnshiftRootfs(c.RootfsPath(), nil)
+			}
 			if err != nil {
 				if ourStart {
 					c.StorageStop()
@@ -1951,7 +1973,11 @@ func (c *containerLXC) startCommon() (string, error) {
 		}
 
 		if idmap != nil {
-			err = idmap.ShiftRootfs(c.RootfsPath())
+			if c.Storage().GetStorageType() == storageTypeZfs {
+				err = idmap.ShiftRootfs(c.RootfsPath(), zfsIdmapSetSkipper)
+			} else {
+				err = idmap.ShiftRootfs(c.RootfsPath(), nil)
+			}
 			if err != nil {
 				if ourStart {
 					c.StorageStop()
@@ -2010,9 +2036,7 @@ func (c *containerLXC) startCommon() (string, error) {
 	c.removeProxyDevices()
 
 	var usbs []usbDevice
-	var gpus []gpuDevice
 	var sriov []string
-	var nvidiaDevices []nvidiaGpuDevices
 	diskDevices := map[string]types.Device{}
 
 	// Create the devices
@@ -2074,11 +2098,10 @@ func (c *containerLXC) startCommon() (string, error) {
 				}
 			}
 		} else if m["type"] == "gpu" {
-			if gpus == nil {
-				gpus, nvidiaDevices, err = deviceLoadGpu()
-				if err != nil {
-					return "", err
-				}
+			allGpus := deviceWantsAllGPUs(m)
+			gpus, nvidiaDevices, err := deviceLoadGpu(allGpus)
+			if err != nil {
+				return "", err
 			}
 
 			sawNvidia := false
@@ -2098,20 +2121,31 @@ func (c *containerLXC) startCommon() (string, error) {
 					return "", err
 				}
 
-				if gpu.nvidia.path == "" {
+				if !gpu.isNvidia {
 					continue
 				}
 
-				err = c.setupUnixDevice(fmt.Sprintf("unix.%s", k), m, gpu.nvidia.major, gpu.nvidia.minor, gpu.nvidia.path, true, false)
-				if err != nil {
-					return "", err
+				if gpu.nvidia.path != "" {
+					err = c.setupUnixDevice(fmt.Sprintf("unix.%s", k), m, gpu.nvidia.major, gpu.nvidia.minor, gpu.nvidia.path, true, false)
+					if err != nil {
+						return "", err
+					}
+				} else if !allGpus {
+					errMsg := fmt.Errorf("Failed to detect correct \"/dev/nvidia\" path")
+					logger.Errorf("%s", errMsg)
+					return "", errMsg
 				}
 
 				sawNvidia = true
 			}
 
-			if sawNvidia && !shared.IsTrue(c.expandedConfig["nvidia.runtime"]) {
+			if sawNvidia {
 				for _, gpu := range nvidiaDevices {
+					if shared.IsTrue(c.expandedConfig["nvidia.runtime"]) {
+						if !gpu.isCard {
+							continue
+						}
+					}
 					err := c.setupUnixDevice(fmt.Sprintf("unix.%s", k), m, gpu.major, gpu.minor, gpu.path, true, false)
 					if err != nil {
 						return "", err
@@ -2391,7 +2425,7 @@ func (c *containerLXC) Start(stateful bool) error {
 	// If stateful, restore now
 	if stateful {
 		if !c.stateful {
-			return fmt.Errorf("Container has no existing state to restore.")
+			return fmt.Errorf("Container has no existing state to restore")
 		}
 
 		criuMigrationArgs := CriuMigrationArgs{
@@ -2484,7 +2518,13 @@ func (c *containerLXC) Start(stateful bool) error {
 		return err
 	}
 
-	c.restartProxyDevices()
+	// Start proxy devices
+	err = c.restartProxyDevices()
+	if err != nil {
+		// Attempt to stop the container
+		c.Stop(false)
+		return err
+	}
 
 	logger.Info("Started container", ctxMap)
 	eventSendLifecycle("container-started",
@@ -2985,7 +3025,7 @@ func (c *containerLXC) Render() (interface{}, interface{}, error) {
 			ExpandedConfig:  c.expandedConfig,
 			ExpandedDevices: c.expandedDevices,
 			LastUsedDate:    c.lastUsedDate,
-			Name:            c.name,
+			Name:            strings.SplitN(c.name, "/", 2)[1],
 			Profiles:        c.profiles,
 			Stateful:        c.stateful,
 		}, etag, nil
@@ -3006,7 +3046,7 @@ func (c *containerLXC) Render() (interface{}, interface{}, error) {
 			Location:        c.node,
 		}
 
-		ct.Description = c.Description()
+		ct.Description = c.description
 		ct.Architecture = architectureName
 		ct.Config = c.localConfig
 		ct.CreatedAt = c.creationDate
@@ -3094,7 +3134,7 @@ func (c *containerLXC) Restore(sourceContainer container, stateful bool) error {
 	if shared.PathExists(c.StatePath()) {
 		_, err := exec.LookPath("criu")
 		if err != nil {
-			return fmt.Errorf("Failed to restore container state. CRIU isn't installed.")
+			return fmt.Errorf("Failed to restore container state. CRIU isn't installed")
 		}
 	}
 
@@ -3138,10 +3178,10 @@ func (c *containerLXC) Restore(sourceContainer container, stateful bool) error {
 	args := db.ContainerArgs{
 		Architecture: sourceContainer.Architecture(),
 		Config:       sourceContainer.LocalConfig(),
+		Description:  sourceContainer.Description(),
 		Devices:      sourceContainer.LocalDevices(),
 		Ephemeral:    sourceContainer.IsEphemeral(),
 		Profiles:     sourceContainer.Profiles(),
-		Description:  sourceContainer.Description(),
 	}
 
 	err = c.Update(args, false)
@@ -3286,6 +3326,21 @@ func (c *containerLXC) Delete() error {
 			logger.Error("Failed deleting container MAAS record", log.Ctx{"name": c.Name(), "err": err})
 			return err
 		}
+
+		// Update network files
+		networkUpdateStatic(c.state, "")
+		for k, m := range c.expandedDevices {
+			if m["type"] != "nic" || m["nictype"] != "bridged" {
+				continue
+			}
+
+			m, err := c.fillNetworkDevice(k, m)
+			if err != nil {
+				continue
+			}
+
+			networkClearLease(c.state, c.name, m["parent"], m["hwaddr"])
+		}
 	}
 
 	// Remove the database record
@@ -3306,21 +3361,6 @@ func (c *containerLXC) Delete() error {
 		if err != nil {
 			return err
 		}
-	}
-
-	// Update network files
-	networkUpdateStatic(c.state, "")
-	for k, m := range c.expandedDevices {
-		if (m["type"] != "nic" && m["type"] != "infiniband") || m["nictype"] != "bridged" || (m["ipv4.address"] == "" && m["ipv6.address"] == "") {
-			continue
-		}
-
-		m, err := c.fillNetworkDevice(k, m)
-		if err != nil {
-			continue
-		}
-
-		networkClearLease(c.state, m["parent"], m["hwaddr"])
 	}
 
 	logger.Info("Deleted container", ctxMap)
@@ -3367,9 +3407,11 @@ func (c *containerLXC) Rename(newName string) error {
 	c.cleanup()
 
 	// Rename the MAAS entry
-	err = c.maasRename(newName)
-	if err != nil {
-		return err
+	if !c.IsSnapshot() {
+		err = c.maasRename(newName)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Rename the logging path
@@ -3513,10 +3555,10 @@ func (c *containerLXC) ConfigKeySet(key string, value string) error {
 	args := db.ContainerArgs{
 		Architecture: c.architecture,
 		Config:       c.localConfig,
+		Description:  c.description,
 		Devices:      c.localDevices,
 		Ephemeral:    c.ephemeral,
 		Profiles:     c.profiles,
-		Description:  c.description,
 	}
 
 	return c.Update(args, false)
@@ -3542,7 +3584,7 @@ func writeBackupFile(c container) error {
 
 	/* deal with the container occasionally not being monuted */
 	if !shared.PathExists(c.RootfsPath()) {
-		logger.Warn("Unable to update backup.yaml at this time.", log.Ctx{"name": c.Name()})
+		logger.Warn("Unable to update backup.yaml at this time", log.Ctx{"name": c.Name()})
 		return nil
 	}
 
@@ -3666,21 +3708,21 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 	if userRequested {
 		for k, v := range args.Config {
 			if strings.HasPrefix(k, "volatile.") && c.localConfig[k] != v {
-				return fmt.Errorf("Volatile keys are read-only.")
+				return fmt.Errorf("Volatile keys are read-only")
 			}
 
 			if strings.HasPrefix(k, "image.") && c.localConfig[k] != v {
-				return fmt.Errorf("Image keys are read-only.")
+				return fmt.Errorf("Image keys are read-only")
 			}
 		}
 
 		for k, v := range c.localConfig {
 			if strings.HasPrefix(k, "volatile.") && args.Config[k] != v {
-				return fmt.Errorf("Volatile keys are read-only.")
+				return fmt.Errorf("Volatile keys are read-only")
 			}
 
 			if strings.HasPrefix(k, "image.") && args.Config[k] != v {
-				return fmt.Errorf("Image keys are read-only.")
+				return fmt.Errorf("Image keys are read-only")
 			}
 		}
 	}
@@ -3760,12 +3802,12 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 	c.profiles = args.Profiles
 
 	// Expand the config and refresh the LXC config
-	err = c.expandConfig()
+	err = c.expandConfig(nil)
 	if err != nil {
 		return err
 	}
 
-	err = c.expandDevices()
+	err = c.expandDevices(nil)
 	if err != nil {
 		return err
 	}
@@ -3887,12 +3929,12 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 
 		if newLocalRootDiskDevice["pool"] == "" {
 			if len(newProfileRootDiskDevices) == 0 {
-				return fmt.Errorf("Update will cause the container to rely on a profile's root disk device but none was found.")
+				return fmt.Errorf("Update will cause the container to rely on a profile's root disk device but none was found")
 			} else if len(newProfileRootDiskDevices) > 1 {
-				return fmt.Errorf("Update will cause the container to rely on a profile's root disk device but conflicting devices were found.")
+				return fmt.Errorf("Update will cause the container to rely on a profile's root disk device but conflicting devices were found")
 			} else if c.expandedDevices[newProfileRootDiskDevices[0]]["pool"] != oldLocalRootDiskDevice["pool"] {
 				newRootDiskDeviceKey = newProfileRootDiskDevices[0]
-				return fmt.Errorf("Using the profile's root disk device would change the storage pool of the container.")
+				return fmt.Errorf("Using the profile's root disk device would change the storage pool of the container")
 			}
 		}
 	} else {
@@ -3906,14 +3948,14 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 			if len(oldProfileRootDiskDevices) > 0 {
 				oldRootDiskDeviceKey = oldProfileRootDiskDevices[0]
 				if oldExpandedDevices[oldRootDiskDeviceKey]["pool"] != newLocalRootDiskDevice["pool"] {
-					return fmt.Errorf("The new local root disk device would change the storage pool of the container.")
+					return fmt.Errorf("The new local root disk device would change the storage pool of the container")
 				}
 			}
 		} else {
 			if len(newProfileRootDiskDevices) == 0 {
-				return fmt.Errorf("Update will cause the container to rely on a profile's root disk device but none was found.")
+				return fmt.Errorf("Update will cause the container to rely on a profile's root disk device but none was found")
 			} else if len(newProfileRootDiskDevices) > 1 {
-				return fmt.Errorf("Using the profile's root disk device would change the storage pool of the container.")
+				return fmt.Errorf("Using the profile's root disk device would change the storage pool of the container")
 			}
 			newRootDiskDeviceKey = newProfileRootDiskDevices[0]
 		}
@@ -3951,7 +3993,7 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 		}
 	}
 
-	if updateMAAS {
+	if !c.IsSnapshot() && updateMAAS {
 		err = c.maasUpdate(true)
 		if err != nil {
 			return err
@@ -4233,8 +4275,6 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 		}
 
 		var usbs []usbDevice
-		var gpus []gpuDevice
-		var nvidiaDevices []nvidiaGpuDevices
 
 		// Live update the devices
 		for k, m := range removeDevices {
@@ -4288,11 +4328,10 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 					}
 				}
 			} else if m["type"] == "gpu" {
-				if gpus == nil {
-					gpus, nvidiaDevices, err = deviceLoadGpu()
-					if err != nil {
-						return err
-					}
+				allGpus := deviceWantsAllGPUs(m)
+				gpus, nvidiaDevices, err := deviceLoadGpu(allGpus)
+				if err != nil {
+					return err
 				}
 
 				for _, gpu := range gpus {
@@ -4305,18 +4344,24 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 
 					err := c.removeUnixDeviceNum(fmt.Sprintf("unix.%s", k), m, gpu.major, gpu.minor, gpu.path)
 					if err != nil {
-						logger.Error("Failed to remove GPU device.", log.Ctx{"err": err, "gpu": gpu, "container": c.Name()})
+						logger.Error("Failed to remove GPU device", log.Ctx{"err": err, "gpu": gpu, "container": c.Name()})
 						return err
 					}
 
-					if gpu.nvidia.path == "" {
+					if !gpu.isNvidia {
 						continue
 					}
 
-					err = c.removeUnixDeviceNum(fmt.Sprintf("unix.%s", k), m, gpu.nvidia.major, gpu.nvidia.minor, gpu.nvidia.path)
-					if err != nil {
-						logger.Error("Failed to remove GPU device.", log.Ctx{"err": err, "gpu": gpu, "container": c.Name()})
-						return err
+					if gpu.nvidia.path != "" {
+						err = c.removeUnixDeviceNum(fmt.Sprintf("unix.%s", k), m, gpu.nvidia.major, gpu.nvidia.minor, gpu.nvidia.path)
+						if err != nil {
+							logger.Error("Failed to remove GPU device", log.Ctx{"err": err, "gpu": gpu, "container": c.Name()})
+							return err
+						}
+					} else if !allGpus {
+						errMsg := fmt.Errorf("Failed to detect correct \"/dev/nvidia\" path")
+						logger.Errorf("%s", errMsg)
+						return errMsg
 					}
 				}
 
@@ -4330,14 +4375,21 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 					}
 				}
 
-				if !nvidiaExists && !shared.IsTrue(c.expandedConfig["nvidia.runtime"]) {
+				if !nvidiaExists {
 					for _, gpu := range nvidiaDevices {
+						if shared.IsTrue(c.expandedConfig["nvidia.runtime"]) {
+							if !gpu.isCard {
+								continue
+							}
+						}
+
 						if !c.deviceExistsInDevicesFolder(fmt.Sprintf("unix.%s", k), gpu.path) {
 							continue
 						}
+
 						err = c.removeUnixDeviceNum(fmt.Sprintf("unix.%s", k), m, gpu.major, gpu.minor, gpu.path)
 						if err != nil {
-							logger.Error("Failed to remove GPU device.", log.Ctx{"err": err, "gpu": gpu, "container": c.Name()})
+							logger.Error("Failed to remove GPU device", log.Ctx{"err": err, "gpu": gpu, "container": c.Name()})
 							return err
 						}
 					}
@@ -4408,15 +4460,14 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 
 					err = c.insertUnixDeviceNum(fmt.Sprintf("unix.%s", k), m, usb.major, usb.minor, usb.path, false)
 					if err != nil {
-						logger.Error("failed to insert usb device", log.Ctx{"err": err, "usb": usb, "container": c.Name()})
+						logger.Error("Failed to insert usb device", log.Ctx{"err": err, "usb": usb, "container": c.Name()})
 					}
 				}
 			} else if m["type"] == "gpu" {
-				if gpus == nil {
-					gpus, nvidiaDevices, err = deviceLoadGpu()
-					if err != nil {
-						return err
-					}
+				allGpus := deviceWantsAllGPUs(m)
+				gpus, nvidiaDevices, err := deviceLoadGpu(allGpus)
+				if err != nil {
+					return err
 				}
 
 				sawNvidia := false
@@ -4433,31 +4484,44 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 
 					err = c.insertUnixDeviceNum(fmt.Sprintf("unix.%s", k), m, gpu.major, gpu.minor, gpu.path, false)
 					if err != nil {
-						logger.Error("Failed to insert GPU device.", log.Ctx{"err": err, "gpu": gpu, "container": c.Name()})
+						logger.Error("Failed to insert GPU device", log.Ctx{"err": err, "gpu": gpu, "container": c.Name()})
 						return err
 					}
 
-					if gpu.nvidia.path == "" {
+					if !gpu.isNvidia {
 						continue
 					}
 
-					err = c.insertUnixDeviceNum(fmt.Sprintf("unix.%s", k), m, gpu.nvidia.major, gpu.nvidia.minor, gpu.nvidia.path, false)
-					if err != nil {
-						logger.Error("Failed to insert GPU device.", log.Ctx{"err": err, "gpu": gpu, "container": c.Name()})
-						return err
+					if gpu.nvidia.path != "" {
+						err = c.insertUnixDeviceNum(fmt.Sprintf("unix.%s", k), m, gpu.nvidia.major, gpu.nvidia.minor, gpu.nvidia.path, false)
+						if err != nil {
+							logger.Error("Failed to insert GPU device", log.Ctx{"err": err, "gpu": gpu, "container": c.Name()})
+							return err
+						}
+					} else if !allGpus {
+						errMsg := fmt.Errorf("Failed to detect correct \"/dev/nvidia\" path")
+						logger.Errorf("%s", errMsg)
+						return errMsg
 					}
 
 					sawNvidia = true
 				}
 
-				if sawNvidia && !shared.IsTrue(c.expandedConfig["nvidia.runtime"]) {
+				if sawNvidia {
 					for _, gpu := range nvidiaDevices {
+						if shared.IsTrue(c.expandedConfig["nvidia.runtime"]) {
+							if !gpu.isCard {
+								continue
+							}
+						}
+
 						if c.deviceExistsInDevicesFolder(k, gpu.path) {
 							continue
 						}
+
 						err = c.insertUnixDeviceNum(fmt.Sprintf("unix.%s", k), m, gpu.major, gpu.minor, gpu.path, false)
 						if err != nil {
-							logger.Error("failed to insert GPU device", log.Ctx{"err": err, "gpu": gpu, "container": c.Name()})
+							logger.Error("Failed to insert GPU device", log.Ctx{"err": err, "gpu": gpu, "container": c.Name()})
 							return err
 						}
 					}
@@ -4749,12 +4813,23 @@ func (c *containerLXC) Export(w io.Writer, properties map[string]string) error {
 	}
 
 	if idmap != nil {
-		if err := idmap.UnshiftRootfs(c.RootfsPath()); err != nil {
+		var err error
+
+		if c.Storage().GetStorageType() == storageTypeZfs {
+			err = idmap.UnshiftRootfs(c.RootfsPath(), zfsIdmapSetSkipper)
+		} else {
+			err = idmap.UnshiftRootfs(c.RootfsPath(), nil)
+		}
+		if err != nil {
 			logger.Error("Failed exporting container", ctxMap)
 			return err
 		}
 
-		defer idmap.ShiftRootfs(c.RootfsPath())
+		if c.Storage().GetStorageType() == storageTypeZfs {
+			defer idmap.ShiftRootfs(c.RootfsPath(), zfsIdmapSetSkipper)
+		} else {
+			defer idmap.ShiftRootfs(c.RootfsPath(), nil)
+		}
 	}
 
 	// Create the tarball
@@ -4998,7 +5073,7 @@ func (c *containerLXC) Migrate(args *CriuMigrationArgs) error {
 
 	_, err := exec.LookPath("criu")
 	if err != nil {
-		return fmt.Errorf("Unable to perform container live migration. CRIU isn't installed.")
+		return fmt.Errorf("Unable to perform container live migration. CRIU isn't installed")
 	}
 
 	logger.Info("Migrating container", ctxMap)
@@ -5021,7 +5096,7 @@ func (c *containerLXC) Migrate(args *CriuMigrationArgs) error {
 		prettyCmd = "feature-check"
 	default:
 		prettyCmd = "unknown"
-		logger.Warn("unknown migrate call", log.Ctx{"cmd": args.cmd})
+		logger.Warn("Unknown migrate call", log.Ctx{"cmd": args.cmd})
 	}
 
 	preservesInodes := c.storage.PreservesInodes()
@@ -5063,7 +5138,11 @@ func (c *containerLXC) Migrate(args *CriuMigrationArgs) error {
 				return err
 			}
 
-			err = idmapset.ShiftRootfs(args.stateDir)
+			if c.Storage().GetStorageType() == storageTypeZfs {
+				err = idmapset.ShiftRootfs(args.stateDir, zfsIdmapSetSkipper)
+			} else {
+				err = idmapset.ShiftRootfs(args.stateDir, nil)
+			}
 			if ourStart {
 				_, err2 := c.StorageStop()
 				if err != nil {
@@ -5706,7 +5785,6 @@ func (c *containerLXC) Exec(command []string, env map[string]string, stdin *os.F
 	r, w, err := shared.Pipe()
 	defer r.Close()
 	if err != nil {
-		logger.Errorf("%s", err)
 		return nil, -1, -1, err
 	}
 
@@ -6486,7 +6564,7 @@ func (c *containerLXC) removeUnixDeviceNum(prefix string, m types.Device, major 
 
 	err := c.removeUnixDevice(prefix, temp, true)
 	if err != nil {
-		logger.Error("failed to remove device", log.Ctx{"err": err, m["type"]: path, "container": c.Name()})
+		logger.Error("Failed to remove device", log.Ctx{"err": err, m["type"]: path, "container": c.Name()})
 		return err
 	}
 
@@ -6744,7 +6822,7 @@ func (c *containerLXC) removeUnixDevices() error {
 		devicePath := filepath.Join(c.DevicesPath(), f.Name())
 		err := os.Remove(devicePath)
 		if err != nil {
-			logger.Error("failed removing unix device", log.Ctx{"err": err, "path": devicePath})
+			logger.Error("Failed removing unix device", log.Ctx{"err": err, "path": devicePath})
 		}
 	}
 
@@ -6773,8 +6851,6 @@ func (c *containerLXC) insertProxyDevice(devName string, m types.Device) error {
 		proxyValues.listenAddr,
 		proxyValues.connectPid,
 		proxyValues.connectAddr,
-		"0",
-		"0",
 		logPath,
 		pidPath)
 	if err != nil {
@@ -6821,7 +6897,7 @@ func (c *containerLXC) removeProxyDevices() error {
 		devicePath := filepath.Join(c.DevicesPath(), f.Name())
 		err = killProxyProc(devicePath)
 		if err != nil {
-			logger.Error("failed removing proxy device", log.Ctx{"err": err, "path": devicePath})
+			logger.Error("Failed removing proxy device", log.Ctx{"err": err, "path": devicePath})
 		}
 	}
 
@@ -6833,49 +6909,28 @@ func (c *containerLXC) updateProxyDevice(devName string, m types.Device) error {
 		return fmt.Errorf("Can't update proxy device in stopped container")
 	}
 
-	proxyValues, err := setupProxyProcInfo(c, m)
-	if err != nil {
-		return err
-	}
-
 	devFileName := fmt.Sprintf("proxy.%s", devName)
 	pidPath := filepath.Join(c.DevicesPath(), devFileName)
-	logFileName := fmt.Sprintf("proxy.%s.log", devName)
-	logPath := filepath.Join(c.LogPath(), logFileName)
-
-	err = killProxyProc(pidPath)
+	err := killProxyProc(pidPath)
 	if err != nil {
-		return fmt.Errorf("Error occurred when removing old proxy device")
+		return fmt.Errorf("Error occurred when removing old proxy device: %v", err)
 	}
 
-	_, err = shared.RunCommand(
-		c.state.OS.ExecPath,
-		"forkproxy",
-		proxyValues.listenPid,
-		proxyValues.listenAddr,
-		proxyValues.connectPid,
-		proxyValues.connectAddr,
-		"0",
-		"0",
-		logPath,
-		pidPath)
-	if err != nil {
-		return fmt.Errorf("Error occurred when starting new proxy device")
-	}
-
-	return nil
+	return c.insertProxyDevice(devName, m)
 }
 
-func (c *containerLXC) restartProxyDevices() {
+func (c *containerLXC) restartProxyDevices() error {
 	for _, name := range c.expandedDevices.DeviceNames() {
 		m := c.expandedDevices[name]
 		if m["type"] == "proxy" {
 			err := c.insertProxyDevice(name, m)
 			if err != nil {
-				fmt.Printf("Error when starting proxy device '%s' for container %s: %s\n", name, c.name, err)
+				return fmt.Errorf("Error when starting proxy device '%s' for container %s: %v\n", name, c.name, err)
 			}
 		}
 	}
+
+	return nil
 }
 
 // Network device handling
@@ -7464,7 +7519,7 @@ func (c *containerLXC) createDiskDevice(name string, m types.Device) (string, er
 		// yet support container mounts.
 
 		if filepath.IsAbs(m["source"]) {
-			return "", fmt.Errorf("When the \"pool\" property is set \"source\" must specify the name of a volume, not a path.")
+			return "", fmt.Errorf("When the \"pool\" property is set \"source\" must specify the name of a volume, not a path")
 		}
 
 		volumeTypeName := ""
@@ -7479,7 +7534,7 @@ func (c *containerLXC) createDiskDevice(name string, m types.Device) (string, er
 
 		switch volumeTypeName {
 		case storagePoolVolumeTypeNameContainer:
-			return "", fmt.Errorf("Using container storage volumes is not supported.")
+			return "", fmt.Errorf("Using container storage volumes is not supported")
 		case "":
 			// We simply received the name of a storage volume.
 			volumeTypeName = storagePoolVolumeTypeNameCustom
@@ -7487,9 +7542,9 @@ func (c *containerLXC) createDiskDevice(name string, m types.Device) (string, er
 		case storagePoolVolumeTypeNameCustom:
 			srcPath = shared.VarPath("storage-pools", m["pool"], volumeTypeName, volumeName)
 		case storagePoolVolumeTypeNameImage:
-			return "", fmt.Errorf("Using image storage volumes is not supported.")
+			return "", fmt.Errorf("Using image storage volumes is not supported")
 		default:
-			return "", fmt.Errorf("Unknown storage type prefix \"%s\" found.", volumeTypeName)
+			return "", fmt.Errorf("Unknown storage type prefix \"%s\" found", volumeTypeName)
 		}
 
 		// Initialize a new storage interface and check if the
@@ -7497,7 +7552,7 @@ func (c *containerLXC) createDiskDevice(name string, m types.Device) (string, er
 		volumeType, _ := storagePoolVolumeTypeNameToType(volumeTypeName)
 		s, err := storagePoolVolumeAttachInit(c.state, m["pool"], volumeName, volumeType, c)
 		if err != nil && !isOptional {
-			return "", fmt.Errorf("Failed to initialize storage volume \"%s\" of type \"%s\" on storage pool \"%s\": %s.",
+			return "", fmt.Errorf("Failed to initialize storage volume \"%s\" of type \"%s\" on storage pool \"%s\": %s",
 				volumeName,
 				volumeTypeName,
 				m["pool"], err)
@@ -8314,8 +8369,17 @@ func (c *containerLXC) maasConnected() bool {
 }
 
 func (c *containerLXC) maasUpdate(force bool) error {
-	if c.state.MAAS == nil {
+	maasURL, err := cluster.ConfigGetString(c.state.Cluster, "maas.api.url")
+	if err != nil {
+		return err
+	}
+
+	if maasURL == "" {
 		return nil
+	}
+
+	if c.state.MAAS == nil {
+		return fmt.Errorf("Can't perform the operation because MAAS is currently unavailable")
 	}
 
 	if !c.maasConnected() {
@@ -8350,8 +8414,17 @@ func (c *containerLXC) maasUpdate(force bool) error {
 }
 
 func (c *containerLXC) maasRename(newName string) error {
-	if c.state.MAAS == nil {
+	maasURL, err := cluster.ConfigGetString(c.state.Cluster, "maas.api.url")
+	if err != nil {
+		return err
+	}
+
+	if maasURL == "" {
 		return nil
+	}
+
+	if c.state.MAAS == nil {
+		return fmt.Errorf("Can't perform the operation because MAAS is currently unavailable")
 	}
 
 	if !c.maasConnected() {
@@ -8371,8 +8444,17 @@ func (c *containerLXC) maasRename(newName string) error {
 }
 
 func (c *containerLXC) maasDelete() error {
-	if c.state.MAAS == nil {
+	maasURL, err := cluster.ConfigGetString(c.state.Cluster, "maas.api.url")
+	if err != nil {
+		return err
+	}
+
+	if maasURL == "" {
 		return nil
+	}
+
+	if c.state.MAAS == nil {
+		return fmt.Errorf("Can't perform the operation because MAAS is currently unavailable")
 	}
 
 	if !c.maasConnected() {

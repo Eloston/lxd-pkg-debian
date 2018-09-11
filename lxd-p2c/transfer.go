@@ -68,11 +68,12 @@ func rsyncSendSetup(path string, rsyncArgs string) (*exec.Cmd, net.Conn, io.Read
 	rsyncCmd := fmt.Sprintf("sh -c \"%s netcat %s\"", execPath, auds)
 
 	args := []string{
-		"-arvP",
+		"-ar",
 		"--devices",
 		"--numeric-ids",
 		"--partial",
 		"--sparse",
+		"--xattrs",
 	}
 
 	// Ignore deletions (requires 3.1 or higher)
@@ -108,6 +109,7 @@ func rsyncSendSetup(path string, rsyncArgs string) (*exec.Cmd, net.Conn, io.Read
 	args = append(args, []string{"-e", rsyncCmd}...)
 
 	cmd := exec.Command("rsync", args...)
+	cmd.Stdout = os.Stderr
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/CanonicalLtd/go-sqlite3"
+	"github.com/mattn/go-sqlite3"
 	"github.com/spf13/cobra"
 
 	"github.com/lxc/lxd/client"
@@ -58,7 +58,7 @@ func (c *cmdActivateifneeded) Run(cmd *cobra.Command, args []string) error {
 	if !shared.PathExists(d.os.LocalDatabasePath()) {
 		path = d.os.LegacyLocalDatabasePath()
 		if !shared.PathExists(path) {
-			logger.Debugf("No DB, so no need to start the daemon now.")
+			logger.Debugf("No DB, so no need to start the daemon now")
 			return nil
 		}
 	}
@@ -71,7 +71,7 @@ func (c *cmdActivateifneeded) Run(cmd *cobra.Command, args []string) error {
 	}
 	d.db = db.ForLegacyPatches(sqldb)
 
-	/* Load the configured address the database */
+	// Load the configured address from the database
 	address, err := node.HTTPSAddress(d.db)
 	if err != nil {
 		return err
@@ -85,7 +85,7 @@ func (c *cmdActivateifneeded) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Load the idmap for unprivileged containers
-	d.os.IdmapSet, err = idmap.DefaultIdmapSet("")
+	d.os.IdmapSet, err = idmap.DefaultIdmapSet("", "")
 	if err != nil {
 		return err
 	}
@@ -95,7 +95,7 @@ func (c *cmdActivateifneeded) Run(cmd *cobra.Command, args []string) error {
 	if !shared.PathExists(path) {
 		path = d.os.LegacyGlobalDatabasePath()
 		if !shared.PathExists(path) {
-			logger.Debugf("No DB, so no need to start the daemon now.")
+			logger.Debugf("No DB, so no need to start the daemon now")
 			return nil
 		}
 	}
@@ -137,7 +137,7 @@ func (c *cmdActivateifneeded) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	sqldb.Close()
-	logger.Debugf("No need to start the daemon now.")
+	logger.Debugf("No need to start the daemon now")
 	return nil
 }
 

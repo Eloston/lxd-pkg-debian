@@ -4,6 +4,7 @@ lxd: manpage-section-mismatch usr/share/man/man1/lxd.*
 # Coming from an external source
 lxd: spelling-error-in-binary usr/lib/lxd/lxd Nam Name
 lxd: spelling-error-in-binary usr/lib/lxd/lxd wiH with
+lxd: spelling-error-in-binary usr/lib/lxd/lxd containe contained
 
 # Unknown origin but not our code
 lxd: package-has-unnecessary-activation-of-ldconfig-trigger

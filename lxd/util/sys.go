@@ -1,6 +1,7 @@
 package util
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -40,7 +41,7 @@ func GetArchitectures() ([]int, error) {
 
 // GetIdmapSet reads the uid/gid allocation.
 func GetIdmapSet() *idmap.IdmapSet {
-	idmapSet, err := idmap.DefaultIdmapSet("")
+	idmapSet, err := idmap.DefaultIdmapSet("", "")
 	if err != nil {
 		logger.Warn("Error reading default uid/gid map", log.Ctx{"err": err.Error()})
 		logger.Warnf("Only privileged containers will be able to run")
@@ -50,7 +51,7 @@ func GetIdmapSet() *idmap.IdmapSet {
 		if err == nil {
 			logger.Infof("Kernel uid/gid map:")
 			for _, lxcmap := range kernelIdmapSet.ToLxcString() {
-				logger.Infof(" - " + lxcmap)
+				logger.Infof(fmt.Sprintf(" - %s", lxcmap))
 			}
 		}
 

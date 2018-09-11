@@ -13,7 +13,7 @@ const VolumeTagKind = "volume"
 
 // Volumes may be bound to a machine, meaning that the volume cannot
 // exist without that machine. We encode this in the tag to allow
-var validVolume = regexp.MustCompile("^(" + MachineSnippet + "/)?" + NumberSnippet + "$")
+var validVolume = regexp.MustCompile("^((" + MachineSnippet + "|" + UnitSnippet + ")/)?" + NumberSnippet + "$")
 
 type VolumeTag struct {
 	id string
@@ -21,7 +21,7 @@ type VolumeTag struct {
 
 func (t VolumeTag) String() string { return t.Kind() + "-" + t.id }
 func (t VolumeTag) Kind() string   { return VolumeTagKind }
-func (t VolumeTag) Id() string     { return volumeTagSuffixToId(t.id) }
+func (t VolumeTag) Id() string     { return filesystemOrVolumeTagSuffixToId(t.id) }
 
 // NewVolumeTag returns the tag for the volume with the given ID.
 // It will panic if the given volume ID is not valid.
@@ -60,7 +60,27 @@ func VolumeMachine(tag VolumeTag) (MachineTag, bool) {
 	if pos == -1 {
 		return MachineTag{}, false
 	}
-	return NewMachineTag(id[:pos]), true
+	id = id[:pos]
+	if !IsValidMachine(id) {
+		return MachineTag{}, false
+	}
+	return NewMachineTag(id), true
+}
+
+// VolumeUnit returns the unit component of the volume
+// tag, and a boolean indicating whether or not there is a
+// unit component.
+func VolumeUnit(tag VolumeTag) (UnitTag, bool) {
+	id := tag.Id()
+	pos := strings.LastIndex(id, "/")
+	if pos == -1 {
+		return UnitTag{}, false
+	}
+	id = id[:pos]
+	if !IsValidUnit(id) {
+		return UnitTag{}, false
+	}
+	return NewUnitTag(id[:pos]), true
 }
 
 func tagFromVolumeId(id string) (VolumeTag, bool) {
@@ -69,8 +89,4 @@ func tagFromVolumeId(id string) (VolumeTag, bool) {
 	}
 	id = strings.Replace(id, "/", "-", -1)
 	return VolumeTag{id}, true
-}
-
-func volumeTagSuffixToId(s string) string {
-	return strings.Replace(s, "-", "/", -1)
 }

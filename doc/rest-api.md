@@ -179,47 +179,48 @@ it to empty will usually do the trick, but there are cases where PATCH
 won't work and PUT needs to be used instead.
 
 # API structure
- * `/`
-   * `/1.0`
-     * `/1.0/certificates`
-       * `/1.0/certificates/<fingerprint>`
-     * `/1.0/containers`
-       * `/1.0/containers/<name>`
-         * `/1.0/containers/<name>/console`
-         * `/1.0/containers/<name>/exec`
-         * `/1.0/containers/<name>/files`
-         * `/1.0/containers/<name>/snapshots`
-         * `/1.0/containers/<name>/snapshots/<name>`
-         * `/1.0/containers/<name>/state`
-         * `/1.0/containers/<name>/logs`
-         * `/1.0/containers/<name>/logs/<logfile>`
-         * `/1.0/containers/<name>/metadata`
-         * `/1.0/containers/<name>/metadata/templates`
-     * `/1.0/events`
-     * `/1.0/images`
-       * `/1.0/images/<fingerprint>`
-         * `/1.0/images/<fingerprint>/export`
-         * `/1.0/images/<fingerprint>/refresh`
-         * `/1.0/images/<fingerprint>/secret`
-       * `/1.0/images/aliases`
-         * `/1.0/images/aliases/<name>`
-     * `/1.0/networks`
-       * `/1.0/networks/<name>`
-     * `/1.0/operations`
-       * `/1.0/operations/<uuid>`
-         * `/1.0/operations/<uuid>/wait`
-         * `/1.0/operations/<uuid>/websocket`
-     * `/1.0/profiles`
-       * `/1.0/profiles/<name>`
-     * `/1.0/storage-pools`
-       * `/1.0/storage-pools/<name>`
-         * `/1.0/storage-pools/<name>/resources`
-         * `/1.0/storage-pools/<name>/volumes`
-           * `/1.0/storage-pools/<name>/volumes/<volume type>/<volume>`
-     * `/1.0/resources`
-     * `/1.0/cluster`
-       * `/1.0/cluster/members`
-         * `/1.0/cluster/members/<name>`
+ * [`/`](#)
+   * [`/1.0`](#10)
+     * [`/1.0/certificates`](#10certificates)
+       * [`/1.0/certificates/<fingerprint>`](#10certificatesfingerprint)
+     * [`/1.0/containers`](#10containers)
+       * [`/1.0/containers/<name>`](#10containersname)
+         * [`/1.0/containers/<name>/console`](#10containersnameconsole)
+         * [`/1.0/containers/<name>/exec`](#10containersnameexec)
+         * [`/1.0/containers/<name>/files`](#10containersnamefiles)
+         * [`/1.0/containers/<name>/snapshots`](#10containersnamesnapshots)
+         * [`/1.0/containers/<name>/snapshots/<name>`](#10containersnamesnapshotsname)
+         * [`/1.0/containers/<name>/state`](#10containersnamestate)
+         * [`/1.0/containers/<name>/logs`](#10containersnamelogs)
+         * [`/1.0/containers/<name>/logs/<logfile>`](#10containersnamelogslogfile)
+         * [`/1.0/containers/<name>/metadata`](#10containersnamemetadata)
+         * [`/1.0/containers/<name>/metadata/templates`](#10containersnamemetadatatemplates)
+     * [`/1.0/events`](#10events)
+     * [`/1.0/images`](#10images)
+       * [`/1.0/images/<fingerprint>`](#10imagesfingerprint)
+         * [`/1.0/images/<fingerprint>/export`](#10imagesfingerprintexport)
+         * [`/1.0/images/<fingerprint>/refresh`](#10imagesfingerprintrefresh)
+         * [`/1.0/images/<fingerprint>/secret`](#10imagesfingerprintsecret)
+       * [`/1.0/images/aliases`](#10imagesaliases)
+         * [`/1.0/images/aliases/<name>`](#10imagesaliasesname)
+     * [`/1.0/networks`](#10networks)
+       * [`/1.0/networks/<name>`](#10networksname)
+     * [`/1.0/operations`](#10operations)
+       * [`/1.0/operations/<uuid>`](#10operationsuuid)
+         * [`/1.0/operations/<uuid>/wait`](#10operationsuuidwait)
+         * [`/1.0/operations/<uuid>/websocket`](#10operationsuuidwebsocket)
+     * [`/1.0/profiles`](#10profiles)
+       * [`/1.0/profiles/<name>`](#10profilesname)
+     * [`/1.0/storage-pools`](#10storage-pools)
+       * [`/1.0/storage-pools/<name>`](#10storage-poolsname)
+         * [`/1.0/storage-pools/<name>/resources`](#10storage-poolsnameresources)
+         * [`/1.0/storage-pools/<name>/volumes`](#10storage-poolsnamevolumes)
+           * [`/1.0/storage-pools/<name>/volumes/<type>`](#10storage-poolsnamevolumestype)
+             * [`/1.0/storage-pools/<pool>/volumes/<type>/<name>`](#10storage-poolspoolvolumestypename)
+     * [`/1.0/resources`](#10resources)
+     * [`/1.0/cluster`](#10cluster)
+       * [`/1.0/cluster/members`](#10clustermembers)
+         * [`/1.0/cluster/members/<name>`](#10clustermembersname)
 
 # API details
 ## `/`
@@ -716,7 +717,7 @@ Input:
         "ephemeral": true
     }
 
-### POST
+### POST (optional `?target=<member>`)
  * Description: used to rename/migrate the container
  * Authentication: trusted
  * Operation: async
@@ -730,7 +731,7 @@ Input (simple rename):
         "name": "new-name"
     }
 
-Input (migration across lxd instances):
+Input (migration across lxd instances or lxd cluster members):
 
     {
         "name": "new-name"
@@ -740,6 +741,8 @@ Input (migration across lxd instances):
 
 The migration does not actually start until someone (i.e. another lxd instance)
 connects to all the websockets and begins negotiation with the source.
+
+To migrate between cluster members the `?target=<member>` option is required.
 
 Output in metadata section (for migration):
 
@@ -881,6 +884,16 @@ Return (with wait-for-websocket=true and interactive=true):
         }
     }
 
+Return (with interactive=false and record-output=true):
+
+    {
+        "output": {
+            "1": "/1.0/containers/example/logs/exec_b0f737b4-2c8a-4edf-a7c1-4cc7e4e9e155.stdout",
+            "2": "/1.0/containers/example/logs/exec_b0f737b4-2c8a-4edf-a7c1-4cc7e4e9e155.stderr"
+        },
+        "return": 0
+    }
+
 When the exec command finishes, its exit status is available from the
 operation's metadata:
 
@@ -1014,7 +1027,7 @@ Return:
                 "type": "disk"
             },
         },
-        "name": "zerotier/blah",
+        "name": "blah",
         "profiles": [
             "default"
         ],
@@ -2075,6 +2088,8 @@ the renamed resource.
 
 Renaming to an existing name must return the 409 (Conflict) HTTP code.
 
+Attempting to rename the `default` profile will return the 403 (Forbidden) HTTP code.
+
 ### DELETE
  * Description: remove a profile
  * Authentication: trusted
@@ -2087,6 +2102,8 @@ Input (none at present):
     }
 
 HTTP code for this should be 202 (Accepted).
+
+Attempting to delete the `default` profile will return the 403 (Forbidden) HTTP code.
 
 ## `/1.0/storage-pools`
 ### GET
@@ -2298,7 +2315,6 @@ Input:
 
     {
         "config": {},
-        "pool": "pool1",
         "name": "vol1",
         "type": "custom"
     }
@@ -2307,7 +2323,6 @@ Input (when copying a volume):
 
     {
         "config": {},
-        "pool": "pool1",
         "name": "vol1",
         "type": "custom"
         "source": {
@@ -2321,9 +2336,48 @@ Input (when migrating a volume):
 
     {
         "config": {},
-        "pool": "pool1",
         "name": "vol1",
         "type": "custom"
+        "source": {
+            "pool": "pool2",
+            "name": "vol2",
+            "type": "migration"
+            "mode": "pull",                                                 # One of "pull" (default), "push", "relay"
+        }
+    }
+
+## `/1.0/storage-pools/<pool>/volumes/<type>`
+### POST
+ * Description: create a new storage volume of a particular type on a given storage pool
+ * Introduced: with API extension `storage`
+ * Authentication: trusted
+ * Operation: sync or async (when copying an existing volume)
+ * Return: standard return value or standard error
+
+Input:
+
+    {
+        "config": {},
+        "name": "vol1",
+    }
+
+Input (when copying a volume):
+
+    {
+        "config": {},
+        "name": "vol1",
+        "source": {
+            "pool": "pool2",
+            "name": "vol2",
+            "type": "copy"
+        }
+    }
+
+Input (when migrating a volume):
+
+    {
+        "config": {},
+        "name": "vol1",
         "source": {
             "pool": "pool2",
             "name": "vol2",
@@ -2560,7 +2614,6 @@ Return:
         "state": "Online"
     }
 
-## `/1.0/cluster/members/<name>`
 ### POST
  * Description: rename a cluster member
  * Introduced: with API extension `clustering`

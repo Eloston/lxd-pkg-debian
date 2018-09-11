@@ -67,7 +67,7 @@ func Unpack(file string, path string, blockBackend bool, runningInUserns bool) e
 			args = append(args, "--exclude=rootfs/dev/*")
 			args = append(args, "--exclude=rootfs/./dev/*")
 		}
-		args = append(args, "-C", path, "--numeric-owner")
+		args = append(args, "-C", path, "--numeric-owner", "--xattrs-include=*")
 		args = append(args, extractArgs...)
 		args = append(args, file)
 	} else if strings.HasPrefix(extension, ".squashfs") {
@@ -100,9 +100,9 @@ func Unpack(file string, path string, blockBackend bool, runningInUserns bool) e
 		// Check if we're running out of space
 		if int64(fs.Bfree) < int64(2*fs.Bsize) {
 			if blockBackend {
-				return fmt.Errorf("Unable to unpack image, run out of disk space (consider increasing your pool's volume.size).")
+				return fmt.Errorf("Unable to unpack image, run out of disk space (consider increasing your pool's volume.size)")
 			} else {
-				return fmt.Errorf("Unable to unpack image, run out of disk space.")
+				return fmt.Errorf("Unable to unpack image, run out of disk space")
 			}
 		}
 

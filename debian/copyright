@@ -7,7 +7,7 @@ Files: *
 Copyright: 2014-2015 LXD contributors
 License: Apache-2
 
-Files: dist/src/github.com/CanonicalLtd/go-sqlite3/*
+Files: dist/src/github.com/mattn/go-sqlite3/*
 Copyright: 2014 Yasuhiro Matsumoto
 License: Expat
 

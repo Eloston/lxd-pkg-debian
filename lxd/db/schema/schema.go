@@ -148,6 +148,7 @@ func (s *Schema) Ensure(db *sql.DB) (int, error) {
 		if err != nil {
 			return err
 		}
+
 		current, err = queryCurrentVersion(tx)
 		if err != nil {
 			return err
@@ -165,6 +166,7 @@ func (s *Schema) Ensure(db *sql.DB) (int, error) {
 				return err
 			}
 		}
+
 		// When creating the schema from scratch, use the fresh dump if
 		// available. Otherwise just apply all relevant updates.
 		if current == 0 && s.fresh != "" {
@@ -315,6 +317,7 @@ func queryCurrentVersion(tx *sql.Tx) (int, error) {
 		}
 		current = versions[len(versions)-1] // Highest recorded version
 	}
+
 	return current, nil
 }
 
@@ -362,8 +365,7 @@ func checkSchemaVersionsHaveNoHoles(versions []int) error {
 	// versions.
 	for i := range versions[:len(versions)-1] {
 		if versions[i+1] != versions[i]+1 {
-			return fmt.Errorf(
-				"missing updates: %d -> %d", versions[i], versions[i+1])
+			return fmt.Errorf("Missing updates: %d to %d", versions[i], versions[i+1])
 		}
 	}
 	return nil

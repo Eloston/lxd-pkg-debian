@@ -81,6 +81,7 @@ type ContainerServer interface {
 	// Container functions
 	GetContainerNames() (names []string, err error)
 	GetContainers() (containers []api.Container, err error)
+	GetContainersFull() (containers []api.ContainerFull, err error)
 	GetContainer(name string) (container *api.Container, ETag string, err error)
 	CreateContainer(container api.ContainersPost) (op Operation, err error)
 	CreateContainerFromImage(source ImageServer, image api.Image, imgcontainer api.ContainersPost) (op RemoteOperation, err error)
@@ -103,7 +104,7 @@ type ContainerServer interface {
 	GetContainerSnapshots(containerName string) (snapshots []api.ContainerSnapshot, err error)
 	GetContainerSnapshot(containerName string, name string) (snapshot *api.ContainerSnapshot, ETag string, err error)
 	CreateContainerSnapshot(containerName string, snapshot api.ContainerSnapshotsPost) (op Operation, err error)
-	CopyContainerSnapshot(source ContainerServer, snapshot api.ContainerSnapshot, args *ContainerSnapshotCopyArgs) (op RemoteOperation, err error)
+	CopyContainerSnapshot(source ContainerServer, containerName string, snapshot api.ContainerSnapshot, args *ContainerSnapshotCopyArgs) (op RemoteOperation, err error)
 	RenameContainerSnapshot(containerName string, name string, container api.ContainerSnapshotPost) (op Operation, err error)
 	MigrateContainerSnapshot(containerName string, name string, container api.ContainerSnapshotPost) (op Operation, err error)
 	DeleteContainerSnapshot(containerName string, name string) (op Operation, err error)
@@ -162,8 +163,9 @@ type ContainerServer interface {
 	GetOperationUUIDs() (uuids []string, err error)
 	GetOperations() (operations []api.Operation, err error)
 	GetOperation(uuid string) (op *api.Operation, ETag string, err error)
-	DeleteOperation(uuid string) (err error)
+	GetOperationWait(uuid string, timeout int) (op *api.Operation, ETag string, err error)
 	GetOperationWebsocket(uuid string, secret string) (conn *websocket.Conn, err error)
+	DeleteOperation(uuid string) (err error)
 
 	// Profile functions
 	GetProfileNames() (names []string, err error)

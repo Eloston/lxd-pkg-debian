@@ -31,8 +31,8 @@ spawn_lxd() {
         cp deps/server.crt "${lxddir}"
         cp deps/server.key "${lxddir}"
     else
-        cp deps/server-alt.crt "${lxddir}"
-        cp deps/server-alt.key "${lxddir}"
+        cp deps/server-alt.crt "${lxddir}"/server.crt
+        cp deps/server-alt.key "${lxddir}"/server.key
     fi
 
     # setup storage
@@ -164,6 +164,11 @@ kill_lxd() {
             lxc profile delete "${profile}" --force-local || true
         done
 
+        # Clear config of the default profile since the profile itself cannot
+        # be deleted.
+        echo "==> Clearing config of default profile"
+        printf 'config: {}\ndevices: {}' | lxc profile edit default
+
         echo "==> Deleting all storage pools"
         for storage in $(lxc storage list --force-local | tail -n+3 | grep "^| " | cut -d' ' -f2); do
             lxc storage delete "${storage}" --force-local || true
@@ -206,9 +211,7 @@ kill_lxd() {
         check_empty "${daemon_dir}/shmounts/"
         check_empty "${daemon_dir}/snapshots/"
 
-        echo "==> Checking for leftover cluster DB entries"
-        # FIXME: we should not use the command line sqlite client, since it's
-        #        not compatible with dqlite
+        echo "==> Checking for leftover DB entries"
         check_empty_table "${daemon_dir}/database/global/db.bin" "containers"
         check_empty_table "${daemon_dir}/database/global/db.bin" "containers_config"
         check_empty_table "${daemon_dir}/database/global/db.bin" "containers_devices"
@@ -290,7 +293,7 @@ wipe() {
     done
 
     if mountpoint -q "${1}"; then
-        umount "${1}"
+        umount -l "${1}"
     fi
 
     rm -Rf "${1}"

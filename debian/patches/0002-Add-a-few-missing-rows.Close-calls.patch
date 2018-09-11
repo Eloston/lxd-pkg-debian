@@ -1,0 +1,123 @@
+From dc28fc62c233c00ca010381aa644c9e51fa0b311 Mon Sep 17 00:00:00 2001
+From: Free Ekanayaka <free.ekanayaka@canonical.com>
+Date: Mon, 20 Aug 2018 11:58:14 +0200
+Subject: Add a few missing rows.Close() calls
+
+Signed-off-by: Free Ekanayaka <free.ekanayaka@canonical.com>
+---
+ lxd/api_internal.go    | 2 ++
+ lxd/db/migration.go    | 6 ++++++
+ lxd/db/node/update.go  | 2 +-
+ lxd/db/query/dump.go   | 1 +
+ lxd/db/schema/query.go | 3 +++
+ 5 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/lxd/api_internal.go b/lxd/api_internal.go
+index dcfc667fb..84b67dfea 100644
+--- a/lxd/api_internal.go
++++ b/lxd/api_internal.go
+@@ -255,12 +255,14 @@ func internalSQLPost(d *Daemon, r *http.Request) Response {
+ 
+ func internalSQLSelect(tx *sql.Tx, query string, result *internalSQLResult) error {
+ 	result.Type = "select"
++
+ 	rows, err := tx.Query(query)
+ 	if err != nil {
+ 		return errors.Wrap(err, "Failed to execute query")
+ 	}
+ 
+ 	defer rows.Close()
++
+ 	result.Columns, err = rows.Columns()
+ 	if err != nil {
+ 		return errors.Wrap(err, "Failed to fetch colume names")
+diff --git a/lxd/db/migration.go b/lxd/db/migration.go
+index ee769f53c..f889c661f 100644
+--- a/lxd/db/migration.go
++++ b/lxd/db/migration.go
+@@ -51,12 +51,15 @@ DELETE FROM storage_volumes_config WHERE storage_volume_id NOT IN (SELECT id FRO
+ 		logger.Debugf("Loading data from table %s", table)
+ 		data := [][]interface{}{}
+ 		stmt := fmt.Sprintf("SELECT * FROM %s", table)
++
+ 		rows, err := tx.Query(stmt)
+ 		if err != nil {
+ 			return nil, errors.Wrapf(err, "failed to fetch rows from %s", table)
+ 		}
++
+ 		columns, err := rows.Columns()
+ 		if err != nil {
++			rows.Close()
+ 			return nil, errors.Wrapf(err, "failed to get columns of %s", table)
+ 		}
+ 		dump.Schema[table] = columns
+@@ -69,14 +72,17 @@ DELETE FROM storage_volumes_config WHERE storage_volume_id NOT IN (SELECT id FRO
+ 			}
+ 			err := rows.Scan(row...)
+ 			if err != nil {
++				rows.Close()
+ 				return nil, errors.Wrapf(err, "failed to scan row from %s", table)
+ 			}
+ 			data = append(data, values)
+ 		}
+ 		err = rows.Err()
+ 		if err != nil {
++			rows.Close()
+ 			return nil, errors.Wrapf(err, "error while fetching rows from %s", table)
+ 		}
++		rows.Close()
+ 
+ 		dump.Data[table] = data
+ 	}
+diff --git a/lxd/db/node/update.go b/lxd/db/node/update.go
+index 4ffdf936d..65ba00f88 100644
+--- a/lxd/db/node/update.go
++++ b/lxd/db/node/update.go
+@@ -725,11 +725,11 @@ PRAGMA foreign_keys=ON; -- Make sure we turn integrity checks back on.`
+ 	if err != nil {
+ 		return err
+ 	}
++	defer rows.Close()
+ 
+ 	var tablestodelete []string
+ 	var rowidtodelete []int
+ 
+-	defer rows.Close()
+ 	for rows.Next() {
+ 		var tablename string
+ 		var rowid int
+diff --git a/lxd/db/query/dump.go b/lxd/db/query/dump.go
+index 3aa12933c..0a0cb3625 100644
+--- a/lxd/db/query/dump.go
++++ b/lxd/db/query/dump.go
+@@ -86,6 +86,7 @@ func dumpTable(tx *sql.Tx, table, schema string) (string, error) {
+ 	if err != nil {
+ 		return "", errors.Wrap(err, "failed to fetch rows")
+ 	}
++	defer rows.Close()
+ 
+ 	// Figure column names
+ 	columns, err := rows.Columns()
+diff --git a/lxd/db/schema/query.go b/lxd/db/schema/query.go
+index 3c4b84dbc..9919c78f6 100644
+--- a/lxd/db/schema/query.go
++++ b/lxd/db/schema/query.go
+@@ -22,15 +22,18 @@ SELECT COUNT(name) FROM sqlite_master WHERE type = 'table' AND name = 'schema'
+ 		return false, err
+ 	}
+ 	defer rows.Close()
++
+ 	if !rows.Next() {
+ 		return false, fmt.Errorf("schema table query returned no rows")
+ 	}
+ 
+ 	var count int
++
+ 	err = rows.Scan(&count)
+ 	if err != nil {
+ 		return false, err
+ 	}
++
+ 	return count == 1, nil
+ }
+ 

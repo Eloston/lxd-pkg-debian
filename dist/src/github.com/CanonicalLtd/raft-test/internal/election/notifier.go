@@ -67,7 +67,8 @@ func (n *notifier) Ignore() {
 
 // Close stops observing leadership changes.
 func (n *notifier) Close() {
-	close(n.shutdownCh)
+	n.shutdownCh <- struct{}{}
+	<-n.shutdownCh
 }
 
 // Acquired returns a Leadership object when the server acquires leadership, or
@@ -141,6 +142,7 @@ func (n *notifier) start() {
 			}
 		case <-n.shutdownCh:
 			n.logger.Printf("[DEBUG] raft-test: server %s: leadership: stop watching", n.id)
+			close(n.shutdownCh)
 			return
 		}
 	}

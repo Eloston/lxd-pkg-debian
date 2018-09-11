@@ -76,6 +76,7 @@ func TestCluster_Join(t *testing.T) {
 
 	// Make the second node join the cluster.
 	f.RegisterCertificate(daemons[1], daemons[0], "rusp", "sekret")
+
 	address := daemons[0].endpoints.NetworkAddress()
 	cert := string(daemons[0].endpoints.NetworkPublicKey())
 	client = f.ClientUnix(daemons[1])
@@ -116,7 +117,7 @@ func TestCluster_Join(t *testing.T) {
 	server, _, err := client.GetServer()
 	require.NoError(t, err)
 	serverPut := server.Writable()
-	serverPut.Config["core.macaroon.endpoint"] = "foo.bar"
+	serverPut.Config["candid.api.url"] = "foo.bar"
 	require.NoError(t, client.UpdateServer(serverPut, ""))
 
 	for _, daemon := range daemons {

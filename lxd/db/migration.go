@@ -51,12 +51,15 @@ DELETE FROM storage_volumes_config WHERE storage_volume_id NOT IN (SELECT id FRO
 		logger.Debugf("Loading data from table %s", table)
 		data := [][]interface{}{}
 		stmt := fmt.Sprintf("SELECT * FROM %s", table)
+
 		rows, err := tx.Query(stmt)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to fetch rows from %s", table)
 		}
+
 		columns, err := rows.Columns()
 		if err != nil {
+			rows.Close()
 			return nil, errors.Wrapf(err, "failed to get columns of %s", table)
 		}
 		dump.Schema[table] = columns
@@ -69,14 +72,17 @@ DELETE FROM storage_volumes_config WHERE storage_volume_id NOT IN (SELECT id FRO
 			}
 			err := rows.Scan(row...)
 			if err != nil {
+				rows.Close()
 				return nil, errors.Wrapf(err, "failed to scan row from %s", table)
 			}
 			data = append(data, values)
 		}
 		err = rows.Err()
 		if err != nil {
+			rows.Close()
 			return nil, errors.Wrapf(err, "error while fetching rows from %s", table)
 		}
+		rows.Close()
 
 		dump.Data[table] = data
 	}
@@ -204,7 +210,7 @@ func (c *Cluster) ImportPreClusteringData(dump *Dump) error {
 				return fmt.Errorf("could not insert %d int %s", i, table)
 			}
 
-			// Also insert the image ID -> node ID association.
+			// Also insert the image ID to node ID association.
 			if shared.StringInSlice(table, []string{"images", "networks", "storage_pools"}) {
 				entity := table[:len(table)-1]
 				importNodeAssociation(entity, columns, row, tx)
@@ -230,7 +236,7 @@ func importNodeAssociation(entity string, columns []string, row []interface{}, t
 	if id == 0 {
 		return fmt.Errorf("entity %s has invalid ID", entity)
 	}
-	_, err := tx.Exec(stmt, row...)
+	_, err := tx.Exec(stmt, id)
 	if err != nil {
 		return errors.Wrapf(err, "failed to associate %s to node", entity)
 	}

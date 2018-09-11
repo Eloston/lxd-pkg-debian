@@ -20,7 +20,24 @@ import (
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/version"
+
+	log "github.com/lxc/lxd/shared/log15"
 )
+
+var certificatesCmd = Command{
+	name:          "certificates",
+	untrustedPost: true,
+	get:           certificatesGet,
+	post:          certificatesPost,
+}
+
+var certificateFingerprintCmd = Command{
+	name:   "certificates/{fingerprint}",
+	get:    certificateFingerprintGet,
+	delete: certificateFingerprintDelete,
+	put:    certificateFingerprintPut,
+	patch:  certificateFingerprintPatch,
+}
 
 func certificatesGet(d *Daemon, r *http.Request) Response {
 	recursion := util.IsRecursionRequest(r)
@@ -105,8 +122,10 @@ func certificatesPost(d *Daemon, r *http.Request) Response {
 	if err != nil {
 		return SmartError(err)
 	}
+
 	if d.checkTrustedClient(r) != nil && util.PasswordCheck(secret, req.Password) != nil {
-		return Forbidden
+		logger.Warn("Bad trust password", log.Ctx{"url": r.URL.RequestURI(), "ip": r.RemoteAddr})
+		return Forbidden(nil)
 	}
 
 	if req.Type != "client" {
@@ -186,8 +205,6 @@ func certificatesPost(d *Daemon, r *http.Request) Response {
 
 	return SyncResponseLocation(true, nil, fmt.Sprintf("/%s/certificates/%s", version.APIVersion, fingerprint))
 }
-
-var certificatesCmd = Command{name: "certificates", untrustedPost: true, get: certificatesGet, post: certificatesPost}
 
 func certificateFingerprintGet(d *Daemon, r *http.Request) Response {
 	fingerprint := mux.Vars(r)["fingerprint"]
@@ -295,7 +312,7 @@ func certificateFingerprintDelete(d *Daemon, r *http.Request) Response {
 
 	certInfo, err := d.cluster.CertificateGet(fingerprint)
 	if err != nil {
-		return NotFound
+		return NotFound(err)
 	}
 
 	err = d.cluster.CertDelete(certInfo.Fingerprint)
@@ -306,5 +323,3 @@ func certificateFingerprintDelete(d *Daemon, r *http.Request) Response {
 
 	return EmptySyncResponse
 }
-
-var certificateFingerprintCmd = Command{name: "certificates/{fingerprint}", get: certificateFingerprintGet, delete: certificateFingerprintDelete, put: certificateFingerprintPut, patch: certificateFingerprintPatch}
