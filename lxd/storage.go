@@ -174,12 +174,12 @@ type storage interface {
 	ContainerDelete(c container) error
 	ContainerCopy(target container, source container, containerOnly bool) error
 	ContainerMount(c container) (bool, error)
-	ContainerUmount(name string, path string) (bool, error)
+	ContainerUmount(c container, path string) (bool, error)
 	ContainerRename(container container, newName string) error
 	ContainerRestore(container container, sourceContainer container) error
 	ContainerGetUsage(container container) (int64, error)
 	GetContainerPoolInfo() (int64, string, string)
-	ContainerStorageReady(name string) bool
+	ContainerStorageReady(container container) bool
 
 	ContainerSnapshotCreate(target container, source container) error
 	ContainerSnapshotDelete(c container) error
@@ -230,10 +230,11 @@ type storage interface {
 		conn *websocket.Conn,
 		srcIdmap *idmap.IdmapSet,
 		op *operation,
-		containerOnly bool) error
+		containerOnly bool,
+		args MigrationSinkArgs) error
 
 	StorageMigrationSource() (MigrationStorageSourceDriver, error)
-	StorageMigrationSink(conn *websocket.Conn, op *operation, storage storage) error
+	StorageMigrationSink(conn *websocket.Conn, op *operation, storage storage, args MigrationSinkArgs) error
 }
 
 func storageCoreInit(driver string) (storage, error) {

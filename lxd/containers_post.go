@@ -290,7 +290,7 @@ func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 			continue
 		}
 
-		args.Devices["root"] = rootDev
+		args.Devices[rootDevName] = rootDev
 	} else if localRootDiskDeviceKey != "" && localRootDiskDevice["pool"] == "" {
 		args.Devices[localRootDiskDeviceKey]["pool"] = storagePool
 	}
@@ -540,7 +540,7 @@ func containersPost(d *Daemon, r *http.Request) Response {
 		return BadRequest(err)
 	}
 
-	targetNode := r.FormValue("target")
+	targetNode := queryParam(r, "target")
 	if targetNode == "" {
 		// If no target node was specified, pick the node with the
 		// least number of containers. If there's just one node, or if

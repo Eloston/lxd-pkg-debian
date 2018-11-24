@@ -510,6 +510,40 @@ static MunitResult test_open_oom_wal(const MunitParameter params[], void *data)
 	return MUNIT_OK;
 }
 
+/* Open a temporary file. */
+static MunitResult test_open_tmp(const MunitParameter params[], void *data)
+{
+	sqlite3_vfs * vfs   = data;
+	sqlite3_file *file  = munit_malloc(vfs->szOsFile);
+	int           flags = 0;
+	char          buf[16];
+	int           rc;
+
+	(void)params;
+
+	flags |= SQLITE_OPEN_CREATE;
+	flags |= SQLITE_OPEN_READWRITE;
+	flags |= SQLITE_OPEN_TEMP_JOURNAL;
+	flags |= SQLITE_OPEN_DELETEONCLOSE;
+
+	rc = vfs->xOpen(vfs, NULL, file, flags, &flags);
+	munit_assert_int(rc, ==, SQLITE_OK);
+
+	rc = file->pMethods->xWrite(file, "hello", 5, 0);
+	munit_assert_int(rc, ==, SQLITE_OK);
+
+	memset(buf, 0, sizeof buf);
+	rc = file->pMethods->xRead(file, buf, 5, 0);
+	munit_assert_int(rc, ==, SQLITE_OK);
+
+	munit_assert_string_equal(buf, "hello");
+
+	rc = file->pMethods->xClose(file);
+	munit_assert_int(rc, ==, SQLITE_OK);
+
+	return MUNIT_OK;
+}
+
 static MunitTest dqlite__vfs_open_tests[] = {
     {"/exclusive", test_open_exclusive, setup, tear_down, 0, NULL},
     {"/again", test_open_again, setup, tear_down, 0, NULL},
@@ -521,6 +555,7 @@ static MunitTest dqlite__vfs_open_tests[] = {
     {"/oom", test_open_oom, setup, tear_down, 0, NULL},
     {"/oom-filename", test_open_oom_filename, setup, tear_down, 0, NULL},
     {"/oom-wal", test_open_oom_wal, setup, tear_down, 0, NULL},
+    {"/tmp", test_open_tmp, setup, tear_down, 0, NULL},
     {NULL, NULL, NULL, NULL, 0, NULL},
 };
 
@@ -1413,10 +1448,11 @@ static MunitResult test_shm_lock_excl_busy(const MunitParameter params[],
 static MunitResult test_shm_lock_release_unix(const MunitParameter params[],
                                               void *               data)
 {
-	sqlite3_vfs *  vfs   = sqlite3_vfs_find("unix");
-	sqlite3_file * file  = munit_malloc(vfs->szOsFile);
-	int            flags = SQLITE_OPEN_CREATE | SQLITE_OPEN_MAIN_DB;
-	const char *   dir   = test_dir_setup();
+	sqlite3_vfs * vfs  = sqlite3_vfs_find("unix");
+	sqlite3_file *file = munit_malloc(vfs->szOsFile);
+	int           flags =
+	    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_MAIN_DB;
+	const char *   dir = test_dir_setup();
 	char           path[256];
 	volatile void *region;
 	int            rc;
@@ -1425,10 +1461,12 @@ static MunitResult test_shm_lock_release_unix(const MunitParameter params[],
 	(void)data;
 
 	sprintf(path, "%s/test.db", dir);
+	path[strlen(path) + 1] = 0;
+
 	rc = vfs->xOpen(vfs, path, file, flags, &flags);
 	munit_assert_int(rc, ==, 0);
 
-	rc = file->pMethods->xShmMap(file, 0, 512, 1, &region);
+	rc = file->pMethods->xShmMap(file, 0, 4096, 1, &region);
 	munit_assert_int(rc, ==, 0);
 
 	flags = SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE;
@@ -1762,7 +1800,7 @@ static MunitResult test_integration_wal(const MunitParameter params[],
 
 	/* A shared lock is held on the second read mark (read locks start at
 	 * 3). */
-	munit_assert_true(__shm_shared_lock_held(db2, 4));
+	munit_assert_true(__shm_shared_lock_held(db2, 3 + 1));
 
 	/* Start a write transaction on db1 */
 	__db_exec(db1, "BEGIN");
@@ -1788,7 +1826,7 @@ static MunitResult test_integration_wal(const MunitParameter params[],
 	munit_assert_int(__wal_idx_mx_frame(db1), ==, 6);
 
 	/* The old read lock is still in place. */
-	munit_assert_true(__shm_shared_lock_held(db2, 4));
+	munit_assert_true(__shm_shared_lock_held(db2, 3 + 1));
 
 	/* Start a read transaction on db1 */
 	__db_exec(db1, "BEGIN");
@@ -1806,10 +1844,111 @@ static MunitResult test_integration_wal(const MunitParameter params[],
 	munit_assert_uint32(read_marks[4], ==, 0xffffffff);
 
 	/* The old read lock is still in place. */
-	munit_assert_true(__shm_shared_lock_held(db2, 4));
+	munit_assert_true(__shm_shared_lock_held(db2, 3 + 1));
 
 	/* The new read lock is in place as well. */
-	munit_assert_true(__shm_shared_lock_held(db2, 5));
+	munit_assert_true(__shm_shared_lock_held(db2, 3 + 2));
+
+	__db_close(db1);
+	__db_close(db2);
+
+	sqlite3_vfs_unregister(vfs);
+
+	return SQLITE_OK;
+}
+
+/* Full checkpoints are possible only when no read mark is set. */
+static MunitResult test_integration_checkpoint(const MunitParameter params[],
+                                               void *               data)
+{
+	sqlite3_vfs * vfs;
+	sqlite3 *     db1;
+	sqlite3 *     db2;
+	sqlite3_file *file1; /* main DB file */
+	sqlite3_file *file2; /* WAL file */
+	sqlite_int64  size;
+	uint32_t *    read_marks;
+	unsigned      mx_frame;
+	char          stmt[128];
+	int           log, ckpt;
+	int           i;
+	int           rv;
+
+	(void)params;
+
+	vfs = data;
+
+	sqlite3_vfs_register(vfs, 0);
+
+	db1 = __db_open();
+
+	__db_exec(db1, "CREATE TABLE test (n INT)");
+
+	/* Insert a few rows so we grow the size of the WAL. */
+	__db_exec(db1, "BEGIN");
+
+	for (i = 0; i < 500; i++) {
+		sprintf(stmt, "INSERT INTO test(n) VALUES(%d)", i);
+		__db_exec(db1, stmt);
+	}
+
+	__db_exec(db1, "COMMIT");
+
+	/* Get the file objects for the main database and the WAL. */
+	rv = sqlite3_file_control(
+	    db1, "main", SQLITE_FCNTL_FILE_POINTER, &file1);
+	munit_assert_int(rv, ==, 0);
+
+	rv = sqlite3_file_control(
+	    db1, "main",  SQLITE_FCNTL_JOURNAL_POINTER, &file2);
+	munit_assert_int(rv, ==, 0);
+
+	/* The WAL file has now 13 pages */
+	rv = file2->pMethods->xFileSize(file2, &size);
+	munit_logf(MUNIT_LOG_INFO, "size %lld", size);
+	munit_assert_int(dqlite__format_wal_calc_pages(512, size), ==, 13);
+
+	mx_frame = __wal_idx_mx_frame(db1);
+	munit_assert_int(mx_frame, ==, 13);
+
+	/* Start a read transaction on a different connection, acquiring a
+	 * shared lock on all WAL pages. */
+	db2 = __db_open();
+	__db_exec(db2, "BEGIN");
+	__db_exec(db2, "SELECT * FROM test");
+
+	read_marks = __wal_idx_read_marks(db1);
+	munit_assert_int(read_marks[1], ==, 13);
+
+	rv = file1->pMethods->xShmLock(file1, 3 + 1, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE);
+	munit_assert_int(rv, ==, SQLITE_BUSY);
+
+	munit_assert_true(__shm_shared_lock_held(db1, 3 + 1));
+
+	/* Execute a new write transaction, deleting some of the pages we
+	 * inserted and creating new ones. */
+	__db_exec(db1, "BEGIN");
+	__db_exec(db1, "DELETE FROM test WHERE n > 200");
+
+	for (i = 0; i < 1000; i++) {
+		sprintf(stmt, "INSERT INTO test(n) VALUES(%d)", i);
+		__db_exec(db1, stmt);
+	}
+
+	__db_exec(db1, "COMMIT");
+
+	/* Since there's a shared read lock, a full checkpoint will fail. */
+	rv = sqlite3_wal_checkpoint_v2(
+	    db1, "main", SQLITE_CHECKPOINT_TRUNCATE, &log, &ckpt);
+	munit_assert_int(rv, !=, 0);
+
+	/* If we complete the read transaction the shared lock is realeased and
+	 * the checkpoint succeeds. */
+	__db_exec(db2, "COMMIT");
+
+	rv = sqlite3_wal_checkpoint_v2(
+	    db1, "main", SQLITE_CHECKPOINT_TRUNCATE, &log, &ckpt);
+	munit_assert_int(rv, ==, 0);
 
 	__db_close(db1);
 	__db_close(db2);
@@ -1822,6 +1961,7 @@ static MunitResult test_integration_wal(const MunitParameter params[],
 static MunitTest dqlite__vfs_integration_tests[] = {
     {"/db", test_integration_db, setup, tear_down, 0, NULL},
     {"/wal", test_integration_wal, setup, tear_down, 0, NULL},
+    {"/checkpoint", test_integration_checkpoint, setup, tear_down, 0, NULL},
     {NULL, NULL, NULL, NULL, 0, NULL},
 };
 

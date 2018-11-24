@@ -191,7 +191,7 @@ on_error:
 	return fd_tmp;
 }
 
-int prepare_loop_dev(const char *source, char *loop_dev, int flags)
+static int prepare_loop_dev(const char *source, char *loop_dev, int flags)
 {
 	int ret;
 	struct loop_info64 lo64;
@@ -234,6 +234,19 @@ on_error:
 	return fd_loop;
 }
 
+static inline int prepare_loop_dev_retry(const char *source, char *loop_dev, int flags)
+{
+	int ret;
+	unsigned int idx = 0;
+
+	do {
+		ret = prepare_loop_dev(source, loop_dev, flags);
+		idx++;
+	} while (ret < 0 && errno == EBUSY && idx < 30);
+
+	return ret;
+}
+
 // Note that this does not guarantee to clear the loop device in time so that
 // find_associated_loop_device() will not report that there still is a
 // configured device (udev and so on...). So don't call
@@ -268,6 +281,7 @@ int unset_autoclear_loop_device(int fd_loop)
 	return ioctl(fd_loop, LOOP_SET_STATUS64, &lo64);
 }
 */
+// #cgo CFLAGS: -std=gnu11 -Wvla
 import "C"
 
 import (
@@ -276,6 +290,8 @@ import (
 	"os"
 	"strings"
 	"unsafe"
+
+	"github.com/pkg/errors"
 )
 
 // LoFlagsAutoclear determines whether the loop device will autodestruct on last
@@ -292,7 +308,7 @@ const MS_LAZYTIME uintptr = C.MS_LAZYTIME
 func prepareLoopDev(source string, flags int) (*os.File, error) {
 	cLoopDev := C.malloc(C.size_t(C.LO_NAME_SIZE))
 	if cLoopDev == nil {
-		return nil, fmt.Errorf("failed to allocate memory in C")
+		return nil, fmt.Errorf("Failed to allocate memory in C")
 	}
 	defer C.free(cLoopDev)
 
@@ -303,12 +319,13 @@ func prepareLoopDev(source string, flags int) (*os.File, error) {
 		return os.NewFile(uintptr(loopFd), C.GoString((*C.char)(cLoopDev))), nil
 	}
 
-	loopFd, err := C.prepare_loop_dev(cSource, (*C.char)(cLoopDev), C.int(flags))
+	loopFd, err := C.prepare_loop_dev_retry(cSource, (*C.char)(cLoopDev), C.int(flags))
 	if loopFd < 0 {
 		if err != nil {
-			return nil, fmt.Errorf("failed to prepare loop device: %s", err)
+			return nil, errors.Wrapf(err, "Failed to prepare loop device for %q", source)
 		}
-		return nil, fmt.Errorf("failed to prepare loop device")
+
+		return nil, fmt.Errorf("Failed to prepare loop device for %q", source)
 	}
 
 	return os.NewFile(uintptr(loopFd), C.GoString((*C.char)(cLoopDev))), nil
@@ -320,7 +337,7 @@ func setAutoclearOnLoopDev(loopFd int) error {
 		if err != nil {
 			return err
 		}
-		return fmt.Errorf("failed to set LO_FLAGS_AUTOCLEAR")
+		return fmt.Errorf("Failed to set LO_FLAGS_AUTOCLEAR")
 	}
 
 	return nil
@@ -332,7 +349,7 @@ func unsetAutoclearOnLoopDev(loopFd int) error {
 		if err != nil {
 			return err
 		}
-		return fmt.Errorf("failed to unset LO_FLAGS_AUTOCLEAR")
+		return fmt.Errorf("Failed to unset LO_FLAGS_AUTOCLEAR")
 	}
 
 	return nil
@@ -341,7 +358,7 @@ func unsetAutoclearOnLoopDev(loopFd int) error {
 func loopDeviceHasBackingFile(loopDevice string, loopFile string) (*os.File, error) {
 	lidx := strings.LastIndex(loopDevice, "/")
 	if lidx < 0 {
-		return nil, fmt.Errorf("invalid loop device path: \"%s\"", loopDevice)
+		return nil, fmt.Errorf("Invalid loop device path: \"%s\"", loopDevice)
 	}
 
 	loopName := loopDevice[(lidx + 1):]

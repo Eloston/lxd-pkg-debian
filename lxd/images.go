@@ -246,7 +246,11 @@ func imgPostContInfo(d *Daemon, r *http.Request, req api.ImagesPost, builddir st
 	info.Fingerprint = fmt.Sprintf("%x", sha256.Sum(nil))
 
 	_, _, err = d.cluster.ImageGet(info.Fingerprint, false, true)
-	if err == nil {
+	if err != db.ErrNoSuchObject {
+		if err != nil {
+			return nil, err
+		}
+
 		return nil, fmt.Errorf("The image already exists: %s", info.Fingerprint)
 	}
 
@@ -380,8 +384,7 @@ func getImgPostInfo(d *Daemon, r *http.Request, builddir string, post *os.File) 
 	var imageMeta *api.ImageMetadata
 	logger := logging.AddContext(logger.Log, log.Ctx{"function": "getImgPostInfo"})
 
-	public, _ := strconv.Atoi(r.Header.Get("X-LXD-public"))
-	info.Public = public == 1
+	info.Public = shared.IsTrue(r.Header.Get("X-LXD-public"))
 	propHeaders := r.Header[http.CanonicalHeaderKey("X-LXD-properties")]
 	ctype, ctypeParams, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil {
@@ -618,7 +621,8 @@ func imagesPost(d *Daemon, r *http.Request) Response {
 			fd.Close()
 		}
 
-		if err := os.RemoveAll(path); err != nil {
+		err := os.RemoveAll(path)
+		if err != nil {
 			logger.Debugf("Error deleting temporary directory \"%s\": %s", path, err)
 		}
 	}
@@ -645,8 +649,10 @@ func imagesPost(d *Daemon, r *http.Request) Response {
 	err = decoder.Decode(&req)
 	if err != nil {
 		if r.Header.Get("Content-Type") == "application/json" {
+			cleanup(builddir, post)
 			return BadRequest(err)
 		}
+
 		imageUpload = true
 	}
 
@@ -663,9 +669,12 @@ func imagesPost(d *Daemon, r *http.Request) Response {
 			r.Body = post
 			response, err := ForwardedResponseIfContainerIsRemote(d, r, name)
 			if err != nil {
+				cleanup(builddir, post)
 				return SmartError(err)
 			}
+
 			if response != nil {
+				cleanup(builddir, nil)
 				return response
 			}
 		}
@@ -703,18 +712,22 @@ func imagesPost(d *Daemon, r *http.Request) Response {
 		// Apply any provided alias
 		for _, alias := range req.Aliases {
 			_, _, err := d.cluster.ImageAliasGet(alias.Name, true)
-			if err == nil {
+			if err != db.ErrNoSuchObject {
+				if err != nil {
+					return errors.Wrapf(err, "Fetch image alias %q", alias.Name)
+				}
+
 				return fmt.Errorf("Alias already exists: %s", alias.Name)
 			}
 
 			id, _, err := d.cluster.ImageGet(info.Fingerprint, false, false)
 			if err != nil {
-				return err
+				return errors.Wrapf(err, "Fetch image %q", info.Fingerprint)
 			}
 
 			err = d.cluster.ImageAliasAdd(alias.Name, id, alias.Description)
 			if err != nil {
-				return err
+				return errors.Wrapf(err, "Add new image alias to the database")
 			}
 		}
 
@@ -728,6 +741,7 @@ func imagesPost(d *Daemon, r *http.Request) Response {
 
 	op, err := operationCreate(d.cluster, operationClassTask, "Downloading image", nil, nil, run, nil, nil)
 	if err != nil {
+		cleanup(builddir, post)
 		return InternalError(err)
 	}
 
@@ -737,7 +751,7 @@ func imagesPost(d *Daemon, r *http.Request) Response {
 func getImageMetadata(fname string) (*api.ImageMetadata, error) {
 	metadataName := "metadata.yaml"
 
-	compressionArgs, _, err := shared.DetectCompression(fname)
+	compressionArgs, _, _, err := shared.DetectCompression(fname)
 
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -820,8 +834,23 @@ func imagesGet(d *Daemon, r *http.Request) Response {
 
 func autoUpdateImagesTask(d *Daemon) (task.Func, task.Schedule) {
 	f := func(ctx context.Context) {
-		autoUpdateImages(ctx, d)
+		opRun := func(op *operation) error {
+			return autoUpdateImages(ctx, d)
+		}
+
+		op, err := operationCreate(d.cluster, operationClassTask, "Updating images", nil, nil, opRun, nil, nil)
+		if err != nil {
+			logger.Error("Failed to start image update operation", log.Ctx{"err": err})
+		}
+
+		logger.Infof("Updating images")
+		_, err = op.Run()
+		if err != nil {
+			logger.Error("Failed to update images", log.Ctx{"err": err})
+		}
+		logger.Infof("Done updating images")
 	}
+
 	schedule := func() (time.Duration, error) {
 		var interval time.Duration
 		err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
@@ -840,13 +869,10 @@ func autoUpdateImagesTask(d *Daemon) (task.Func, task.Schedule) {
 	return f, schedule
 }
 
-func autoUpdateImages(ctx context.Context, d *Daemon) {
-	logger.Infof("Updating images")
-
+func autoUpdateImages(ctx context.Context, d *Daemon) error {
 	images, err := d.cluster.ImagesGet(false)
 	if err != nil {
-		logger.Error("Unable to retrieve the list of images", log.Ctx{"err": err})
-		return
+		return errors.Wrap(err, "Unable to retrieve the list of images")
 	}
 
 	for _, fingerprint := range images {
@@ -870,12 +896,12 @@ func autoUpdateImages(ctx context.Context, d *Daemon) {
 		}()
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-ch:
 		}
 	}
 
-	logger.Infof("Done updating images")
+	return nil
 }
 
 // Update a single image.  The operation can be nil, if no progress tracking is needed.
@@ -1007,7 +1033,21 @@ func autoUpdateImage(d *Daemon, op *operation, id int, info *api.Image) error {
 
 func pruneExpiredImagesTask(d *Daemon) (task.Func, task.Schedule) {
 	f := func(ctx context.Context) {
-		pruneExpiredImages(ctx, d)
+		opRun := func(op *operation) error {
+			return pruneExpiredImages(ctx, d)
+		}
+
+		op, err := operationCreate(d.cluster, operationClassTask, "Cleaning up expired images", nil, nil, opRun, nil, nil)
+		if err != nil {
+			logger.Error("Failed to start expired image operation", log.Ctx{"err": err})
+		}
+
+		logger.Infof("Pruning expired images")
+		_, err = op.Run()
+		if err != nil {
+			logger.Error("Failed to expire images", log.Ctx{"err": err})
+		}
+		logger.Infof("Done pruning expired images")
 	}
 
 	// Skip the first run, and instead run an initial pruning synchronously
@@ -1016,8 +1056,9 @@ func pruneExpiredImagesTask(d *Daemon) (task.Func, task.Schedule) {
 	if err != nil {
 		logger.Error("Unable to fetch cluster configuration", log.Ctx{"err": err})
 	} else if expiry > 0 {
-		pruneExpiredImages(context.Background(), d)
+		f(context.Background())
 	}
+
 	first := true
 	schedule := func() (time.Duration, error) {
 		interval := 24 * time.Hour
@@ -1044,53 +1085,58 @@ func pruneExpiredImagesTask(d *Daemon) (task.Func, task.Schedule) {
 }
 
 func pruneLeftoverImages(d *Daemon) {
-	logger.Infof("Pruning leftover image files")
-
-	// Get all images
-	images, err := d.cluster.ImagesGet(false)
-	if err != nil {
-		logger.Error("Unable to retrieve the list of images", log.Ctx{"err": err})
-		return
-	}
-
-	// Look at what's in the images directory
-	entries, err := ioutil.ReadDir(shared.VarPath("images"))
-	if err != nil {
-		logger.Error("Unable to list the images directory", log.Ctx{"err": err})
-		return
-	}
-
-	// Check and delete leftovers
-	for _, entry := range entries {
-		fp := strings.Split(entry.Name(), ".")[0]
-		if !shared.StringInSlice(fp, images) {
-			err = os.RemoveAll(shared.VarPath("images", entry.Name()))
-			if err != nil {
-				logger.Error("Unable to remove leftover image", log.Ctx{"err": err, "file": entry.Name()})
-				continue
-			}
-
-			logger.Debugf("Removed leftover image file: %s", entry.Name())
+	opRun := func(op *operation) error {
+		// Get all images
+		images, err := d.cluster.ImagesGet(false)
+		if err != nil {
+			return errors.Wrap(err, "Unable to retrieve the list of images")
 		}
+
+		// Look at what's in the images directory
+		entries, err := ioutil.ReadDir(shared.VarPath("images"))
+		if err != nil {
+			return errors.Wrap(err, "Unable to list the images directory")
+		}
+
+		// Check and delete leftovers
+		for _, entry := range entries {
+			fp := strings.Split(entry.Name(), ".")[0]
+			if !shared.StringInSlice(fp, images) {
+				err = os.RemoveAll(shared.VarPath("images", entry.Name()))
+				if err != nil {
+					return errors.Wrapf(err, "Unable to remove leftover image: %v", entry.Name())
+				}
+
+				logger.Debugf("Removed leftover image file: %s", entry.Name())
+			}
+		}
+
+		return nil
 	}
 
+	op, err := operationCreate(d.cluster, operationClassTask, "Pruning leftover image files", nil, nil, opRun, nil, nil)
+	if err != nil {
+		logger.Error("Failed to start image leftover cleanup operation", log.Ctx{"err": err})
+	}
+
+	logger.Infof("Pruning leftover image files")
+	_, err = op.Run()
+	if err != nil {
+		logger.Error("Failed to prune leftover image files", log.Ctx{"err": err})
+	}
 	logger.Infof("Done pruning leftover image files")
 }
 
-func pruneExpiredImages(ctx context.Context, d *Daemon) {
-	logger.Infof("Pruning expired images")
-
+func pruneExpiredImages(ctx context.Context, d *Daemon) error {
 	expiry, err := cluster.ConfigGetInt64(d.cluster, "images.remote_cache_expiry")
 	if err != nil {
-		logger.Error("Unable to fetch cluster configuration", log.Ctx{"err": err})
-		return
+		return errors.Wrap(err, "Unable to fetch cluster configuration")
 	}
 
 	// Get the list of expired images.
 	images, err := d.cluster.ImagesGetExpired(expiry)
 	if err != nil {
-		logger.Error("Unable to retrieve the list of expired images", log.Ctx{"err": err})
-		return
+		return errors.Wrap(err, "Unable to retrieve the list of expired images")
 	}
 
 	// Delete them
@@ -1100,7 +1146,7 @@ func pruneExpiredImages(ctx context.Context, d *Daemon) {
 		// expired now will be expired at the next run.
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		default:
 		}
 
@@ -1120,8 +1166,7 @@ func pruneExpiredImages(ctx context.Context, d *Daemon) {
 		for _, pool := range poolNames {
 			err := doDeleteImageFromPool(d.State(), fp, pool)
 			if err != nil {
-				logger.Debugf("Error deleting image %s from storage pool %s: %s", fp, pool, err)
-				continue
+				return errors.Wrapf(err, "Error deleting image %s from storage pool %s", fp, pool)
 			}
 		}
 
@@ -1129,8 +1174,8 @@ func pruneExpiredImages(ctx context.Context, d *Daemon) {
 		fname := filepath.Join(d.os.VarDir, "images", fp)
 		if shared.PathExists(fname) {
 			err = os.Remove(fname)
-			if err != nil {
-				logger.Debugf("Error deleting image file %s: %s", fname, err)
+			if err != nil && !os.IsNotExist(err) {
+				return errors.Wrapf(err, "Error deleting image file %s", fname)
 			}
 		}
 
@@ -1138,23 +1183,23 @@ func pruneExpiredImages(ctx context.Context, d *Daemon) {
 		fname = filepath.Join(d.os.VarDir, "images", fp) + ".rootfs"
 		if shared.PathExists(fname) {
 			err = os.Remove(fname)
-			if err != nil {
-				logger.Debugf("Error deleting image file %s: %s", fname, err)
+			if err != nil && !os.IsNotExist(err) {
+				return errors.Wrapf(err, "Error deleting image file %s", fname)
 			}
 		}
 
 		imgID, _, err := d.cluster.ImageGet(fp, false, false)
 		if err != nil {
-			logger.Debugf("Error retrieving image info %s: %s", fp, err)
+			return errors.Wrapf(err, "Error retrieving image info %s", fp)
 		}
 
 		// Remove the database entry for the image.
 		if err = d.cluster.ImageDelete(imgID); err != nil {
-			logger.Debugf("Error deleting image %s from database: %s", fp, err)
+			return errors.Wrapf(err, "Error deleting image %s from database", fp)
 		}
 	}
 
-	logger.Infof("Done pruning expired images")
+	return nil
 }
 
 func doDeleteImageFromPool(state *state.State, fingerprint string, storagePool string) error {
@@ -1205,8 +1250,8 @@ func imageDelete(d *Daemon, r *http.Request) Response {
 		fname := shared.VarPath("images", imgInfo.Fingerprint)
 		if shared.PathExists(fname) {
 			err = os.Remove(fname)
-			if err != nil {
-				logger.Debugf("Error deleting image file %s: %s", fname, err)
+			if err != nil && !os.IsNotExist(err) {
+				return errors.Wrapf(err, "Error deleting image file %s", fname)
 			}
 		}
 
@@ -1277,8 +1322,8 @@ func imageDeleteFromDisk(fingerprint string) {
 	fname := shared.VarPath("images", fingerprint)
 	if shared.PathExists(fname) {
 		err := os.Remove(fname)
-		if err != nil {
-			logger.Debugf("Error deleting image file %s: %s", fname, err)
+		if err != nil && !os.IsNotExist(err) {
+			logger.Errorf("Error deleting image file %s: %s", fname, err)
 		}
 	}
 
@@ -1286,8 +1331,8 @@ func imageDeleteFromDisk(fingerprint string) {
 	fname = shared.VarPath("images", fingerprint) + ".rootfs"
 	if shared.PathExists(fname) {
 		err := os.Remove(fname)
-		if err != nil {
-			logger.Debugf("Error deleting image file %s: %s", fname, err)
+		if err != nil && !os.IsNotExist(err) {
+			logger.Errorf("Error deleting image file %s: %s", fname, err)
 		}
 	}
 }
@@ -1455,7 +1500,11 @@ func aliasesPost(d *Daemon, r *http.Request) Response {
 
 	// This is just to see if the alias name already exists.
 	_, _, err := d.cluster.ImageAliasGet(req.Name, true)
-	if err == nil {
+	if err != db.ErrNoSuchObject {
+		if err != nil {
+			return InternalError(err)
+		}
+
 		return Conflict(fmt.Errorf("Alias '%s' already exists", req.Name))
 	}
 
@@ -1676,7 +1725,7 @@ func imageExport(d *Daemon, r *http.Request) Response {
 	imagePath := shared.VarPath("images", imgInfo.Fingerprint)
 	rootfsPath := imagePath + ".rootfs"
 
-	_, ext, err := shared.DetectCompression(imagePath)
+	_, ext, _, err := shared.DetectCompression(imagePath)
 	if err != nil {
 		ext = ""
 	}
@@ -1691,7 +1740,7 @@ func imageExport(d *Daemon, r *http.Request) Response {
 
 		// Recompute the extension for the root filesystem, it may use a different
 		// compression algorithm than the metadata.
-		_, ext, err = shared.DetectCompression(rootfsPath)
+		_, ext, _, err = shared.DetectCompression(rootfsPath)
 		if err != nil {
 			ext = ""
 		}

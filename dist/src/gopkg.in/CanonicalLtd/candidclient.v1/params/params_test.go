@@ -4,14 +4,12 @@
 package params_test
 
 import (
-	gc "gopkg.in/check.v1"
+	"testing"
+
+	qt "github.com/frankban/quicktest"
 
 	"gopkg.in/CanonicalLtd/candidclient.v1/params"
 )
-
-type paramsSuite struct{}
-
-var _ = gc.Suite(&paramsSuite{})
 
 var usernameUnmarshalTests = []struct {
 	username    string
@@ -30,17 +28,21 @@ var usernameUnmarshalTests = []struct {
 	expectError: "username longer than 256 characters",
 }}
 
-func (s *paramsSuite) TestUsernameTextUnmarshal(c *gc.C) {
-	for i, test := range usernameUnmarshalTests {
-		c.Logf("%d. %s", i, test.username)
-		u := new(params.Username)
-		err := u.UnmarshalText([]byte(test.username))
-		if test.expectError == "" {
-			c.Assert(err, gc.IsNil)
-			c.Assert(*u, gc.Equals, params.Username(test.username))
-		} else {
-			c.Assert(err, gc.ErrorMatches, test.expectError)
-			c.Assert(*u, gc.Equals, params.Username(""))
-		}
+func TestUsernameTextUnmarshal(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
+
+	for _, test := range usernameUnmarshalTests {
+		c.Run(test.username, func(c *qt.C) {
+			u := new(params.Username)
+			err := u.UnmarshalText([]byte(test.username))
+			if test.expectError == "" {
+				c.Assert(err, qt.Equals, nil)
+				c.Assert(*u, qt.Equals, params.Username(test.username))
+			} else {
+				c.Assert(err, qt.ErrorMatches, test.expectError)
+				c.Assert(*u, qt.Equals, params.Username(""))
+			}
+		})
 	}
 }

@@ -36,6 +36,7 @@ import (
 	"github.com/lxc/lxd/lxd/task"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/idmap"
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/version"
 
@@ -53,11 +54,12 @@ type Daemon struct {
 	readyChan    chan struct{} // Closed when LXD is fully ready
 	shutdownChan chan struct{}
 
-	// Tasks registry for long-running background tasks.
-	tasks task.Group
+	// Tasks registry for long-running background tasks
+	// Keep clustering tasks separate as they cause a lot of CPU wakeups
+	tasks        task.Group
+	clusterTasks task.Group
 
-	// Indexes of tasks that need to be reset when their execution interval
-	// changes.
+	// Indexes of tasks that need to be reset when their execution interval changes
 	taskPruneImages *task.Task
 	taskAutoUpdate  *task.Task
 
@@ -72,6 +74,7 @@ type Daemon struct {
 
 type externalAuth struct {
 	endpoint string
+	expiry   int64
 	bakery   *identchecker.Bakery
 }
 
@@ -81,6 +84,38 @@ type DaemonConfig struct {
 	Trace              []string      // List of sub-systems to trace
 	RaftLatency        float64       // Coarse grain measure of the cluster latency
 	DqliteSetupTimeout time.Duration // How long to wait for the cluster database to be up
+}
+
+// IdentityClientWrapper is a wrapper around an IdentityClient.
+type IdentityClientWrapper struct {
+	client       identchecker.IdentityClient
+	ValidDomains []string
+}
+
+func (m *IdentityClientWrapper) IdentityFromContext(ctx context.Context) (identchecker.Identity, []checkers.Caveat, error) {
+	return m.client.IdentityFromContext(ctx)
+}
+
+func (m *IdentityClientWrapper) DeclaredIdentity(ctx context.Context, declared map[string]string) (identchecker.Identity, error) {
+	// Extract the domain from the username
+	fields := strings.SplitN(declared["username"], "@", 2)
+
+	// Only validate domain if we have a list of valid domains
+	if len(m.ValidDomains) > 0 {
+		// If no domain was provided by candid, reject the request
+		if len(fields) < 2 {
+			logger.Warnf("Failed candid client authentication: no domain provided")
+			return nil, fmt.Errorf("Missing domain in candid reply")
+		}
+
+		// Check that it was a valid domain
+		if !shared.StringInSlice(fields[1], m.ValidDomains) {
+			logger.Warnf("Failed candid client authentication: untrusted domain \"%s\"", fields[1])
+			return nil, fmt.Errorf("Untrusted candid domain")
+		}
+	}
+
+	return m.client.DeclaredIdentity(ctx, declared)
 }
 
 // NewDaemon returns a new Daemon object with the given configuration.
@@ -151,9 +186,13 @@ func (d *Daemon) checkTrustedClient(r *http.Request) error {
 
 	if d.externalAuth != nil && r.Header.Get(httpbakery.BakeryProtocolHeader) != "" {
 		ctx := httpbakery.ContextWithRequest(context.TODO(), r)
-		authChecker := d.externalAuth.bakery.Checker.Auth(
-			httpbakery.RequestMacaroons(r)...)
-		ops := getBakeryOps(r)
+		authChecker := d.externalAuth.bakery.Checker.Auth(httpbakery.RequestMacaroons(r)...)
+
+		ops := []bakery.Op{{
+			Entity: r.URL.Path,
+			Action: r.Method,
+		}}
+
 		_, err := authChecker.Allow(ctx, ops...)
 		return err
 	}
@@ -167,17 +206,10 @@ func (d *Daemon) checkTrustedClient(r *http.Request) error {
 	return fmt.Errorf("unauthorized")
 }
 
-// Return the bakery operations implied by the given HTTP request
-func getBakeryOps(r *http.Request) []bakery.Op {
-	return []bakery.Op{{
-		Entity: r.URL.Path,
-		Action: r.Method,
-	}}
-}
-
-func writeMacaroonsRequiredResponse(b *identchecker.Bakery, r *http.Request, w http.ResponseWriter, derr *bakery.DischargeRequiredError) {
+func writeMacaroonsRequiredResponse(b *identchecker.Bakery, r *http.Request, w http.ResponseWriter, derr *bakery.DischargeRequiredError, expiry int64) {
 	ctx := httpbakery.ContextWithRequest(context.TODO(), r)
-	caveats := append(derr.Caveats, checkers.TimeBeforeCaveat(time.Now().Add(5*time.Minute)))
+	caveats := append(derr.Caveats,
+		checkers.TimeBeforeCaveat(time.Now().Add(time.Duration(expiry)*time.Second)))
 
 	// Mint an appropriate macaroon and send it back to the client.
 	m, err := b.Oven.NewMacaroon(
@@ -258,7 +290,7 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c Command) {
 				fmt.Sprintf("allowing untrusted %s", r.Method),
 				log.Ctx{"url": r.URL.RequestURI(), "ip": r.RemoteAddr})
 		} else if derr, ok := err.(*bakery.DischargeRequiredError); ok {
-			writeMacaroonsRequiredResponse(d.externalAuth.bakery, r, w, derr)
+			writeMacaroonsRequiredResponse(d.externalAuth.bakery, r, w, derr, d.externalAuth.expiry)
 			return
 		} else {
 			logger.Warn(
@@ -399,6 +431,29 @@ func (d *Daemon) init() error {
 		return err
 	}
 
+	// Look for kernel features
+	logger.Infof("Kernel features:")
+	d.os.NetnsGetifaddrs = CanUseNetnsGetifaddrs()
+	if d.os.NetnsGetifaddrs {
+		logger.Infof(" - netnsid-based network retrieval: yes")
+	} else {
+		logger.Infof(" - netnsid-based network retrieval: no")
+	}
+
+	/*
+	 * During daemon startup we're the only thread that touches VFS3Fscaps
+	 * so we don't need to bother with atomic.StoreInt32() when touching
+	 * VFS3Fscaps.
+	 */
+	d.os.VFS3Fscaps = idmap.SupportsVFS3Fscaps("")
+	if d.os.VFS3Fscaps {
+		idmap.VFS3Fscaps = idmap.VFS3FscapsSupported
+		logger.Infof(" - unprivileged file capabilities: yes")
+	} else {
+		idmap.VFS3Fscaps = idmap.VFS3FscapsUnsupported
+		logger.Infof(" - unprivileged file capabilities: no")
+	}
+
 	/* Initialize the database */
 	dump, err := initializeDbObject(d)
 	if err != nil {
@@ -409,6 +464,34 @@ func (d *Daemon) init() error {
 	certInfo, err := util.LoadCert(d.os.VarDir)
 	if err != nil {
 		return err
+	}
+
+	clustered, err := cluster.Enabled(d.db)
+	if err != nil {
+		return err
+	}
+
+	// If not already applied, run the daemon patch that shrinks the boltdb
+	// file. We can't run this daemon patch later on along with the other
+	// ones because it needs to run before we open the cluster database.
+	appliedPatches, err := d.db.Patches()
+	if err != nil {
+		return errors.Wrap(err, "Fetch applied daemon patches")
+	}
+	if !shared.StringInSlice("shrink_logs_db_file", appliedPatches) {
+		if !clustered {
+			// We actually run the patch only if this lxd daemon is
+			// not clustered.
+			err := patchShrinkLogsDBFile("", d)
+			if err != nil {
+				return errors.Wrap(err, "Shrink logs.db file")
+			}
+		}
+
+		err = d.db.PatchesMarkApplied("shrink_logs_db_file")
+		if err != nil {
+			return err
+		}
 	}
 
 	/* Setup dqlite */
@@ -462,11 +545,22 @@ func (d *Daemon) init() error {
 		logger.Info("Initializing global database")
 		dir := filepath.Join(d.os.VarDir, "database")
 		store := d.gateway.ServerStore()
+
+		contextTimeout := 5 * time.Second
+		if !clustered {
+			// FIXME: this is a workaround for #5234. We set a very
+			// high timeout when we're not clustered, since there's
+			// actually no networking involved.
+			contextTimeout = time.Minute
+		}
+
 		d.cluster, err = db.OpenCluster(
 			"db.bin", store, address, dir,
+			d.config.DqliteSetupTimeout,
 			dqlite.WithDialFunc(d.gateway.DialFunc()),
 			dqlite.WithContext(d.gateway.Context()),
-			dqlite.WithConnectionTimeout(d.config.DqliteSetupTimeout),
+			dqlite.WithConnectionTimeout(10*time.Second),
+			dqlite.WithContextTimeout(contextTimeout),
 			dqlite.WithLogFunc(cluster.DqliteLog),
 		)
 		if err == nil {
@@ -524,11 +618,6 @@ func (d *Daemon) init() error {
 	}
 
 	// Setup the user-agent
-	clustered, err := cluster.Enabled(d.db)
-	if err != nil {
-		return err
-	}
-
 	if clustered {
 		version.UserAgentFeatures([]string{"cluster"})
 	}
@@ -559,14 +648,14 @@ func (d *Daemon) init() error {
 		return err
 	}
 
-	/* Log expiry */
-	d.tasks.Add(expireLogsTask(d.State()))
-
 	// Cleanup leftover images
 	pruneLeftoverImages(d)
 
 	/* Setup the proxy handler, external authentication and MAAS */
+	var candidExpiry int64
+	candidDomains := ""
 	candidEndpoint := ""
+	candidEndpointKey := ""
 	maasAPIURL := ""
 	maasAPIKey := ""
 	maasMachine := ""
@@ -584,7 +673,7 @@ func (d *Daemon) init() error {
 		return err
 	}
 
-	logger.Infof("Loading configuration")
+	logger.Infof("Loading daemon configuration")
 	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
 		config, err := cluster.ConfigLoad(tx)
 		if err != nil {
@@ -595,6 +684,9 @@ func (d *Daemon) init() error {
 			config.ProxyHTTPS(), config.ProxyHTTP(), config.ProxyIgnoreHosts(),
 		)
 		candidEndpoint = config.CandidEndpoint()
+		candidEndpointKey = config.CandidEndpointKey()
+		candidExpiry = config.CandidExpiry()
+		candidDomains = config.CandidDomains()
 		maasAPIURL, maasAPIKey = config.MAASController()
 		return nil
 	})
@@ -602,7 +694,7 @@ func (d *Daemon) init() error {
 		return err
 	}
 
-	err = d.setupExternalAuthentication(candidEndpoint)
+	err = d.setupExternalAuthentication(candidEndpoint, candidEndpointKey, candidExpiry, candidDomains)
 	if err != nil {
 		return err
 	}
@@ -624,18 +716,20 @@ func (d *Daemon) init() error {
 		readSavedClientCAList(d)
 
 		// Connect to MAAS
-		go func() {
-			for {
-				err = d.setupMAASController(maasAPIURL, maasAPIKey, maasMachine)
-				if err == nil {
-					logger.Info("Connected to MAAS controller")
-					break
-				}
+		if maasAPIURL != "" {
+			go func() {
+				for {
+					err = d.setupMAASController(maasAPIURL, maasAPIKey, maasMachine)
+					if err == nil {
+						logger.Info("Connected to MAAS controller", log.Ctx{"url": maasAPIURL})
+						break
+					}
 
-				logger.Warn("Unable to connect to MAAS, trying again in a minute", log.Ctx{"err": err})
-				time.Sleep(time.Minute)
-			}
-		}()
+					logger.Warn("Unable to connect to MAAS, trying again in a minute", log.Ctx{"url": maasAPIURL, "err": err})
+					time.Sleep(time.Minute)
+				}
+			}()
+		}
 	}
 
 	close(d.setupChan)
@@ -649,12 +743,35 @@ func (d *Daemon) init() error {
 	return nil
 }
 
-func (d *Daemon) Ready() error {
-	/* Heartbeats */
-	d.tasks.Add(cluster.Heartbeat(d.gateway, d.cluster))
+func (d *Daemon) startClusterTasks() {
+	// Heartbeats
+	d.clusterTasks.Add(cluster.Heartbeat(d.gateway, d.cluster))
 
-	/* Events */
-	d.tasks.Add(cluster.Events(d.endpoints, d.cluster, eventForward))
+	// Events
+	d.clusterTasks.Add(cluster.Events(d.endpoints, d.cluster, eventForward))
+
+	// Cluster update trigger
+	d.clusterTasks.Add(cluster.KeepUpdated(d.State()))
+
+	// Start all background tasks
+	d.clusterTasks.Start()
+}
+
+func (d *Daemon) stopClusterTasks() {
+	d.clusterTasks.Stop(3 * time.Second)
+	d.clusterTasks = task.Group{}
+}
+
+func (d *Daemon) Ready() error {
+	// Check if clustered
+	clustered, err := cluster.Enabled(d.db)
+	if err != nil {
+		return err
+	}
+
+	if clustered {
+		d.startClusterTasks()
+	}
 
 	// FIXME: There's no hard reason for which we should not run these
 	//        tasks in mock mode. However it requires that we tweak them so
@@ -663,25 +780,32 @@ func (d *Daemon) Ready() error {
 	//        for proper cancellation is something that has been started
 	//        but has not been fully completed.
 	if !d.os.MockMode {
+		// Log expiry (daily)
+		d.tasks.Add(expireLogsTask(d.State()))
+
+		// Remove expired images (daily)
 		d.taskPruneImages = d.tasks.Add(pruneExpiredImagesTask(d))
 
-		/* Auto-update images */
+		// Auto-update images (every 6 hours, configurable)
 		d.taskAutoUpdate = d.tasks.Add(autoUpdateImagesTask(d))
 
-		/* Auto-update instance types */
+		// Auto-update instance types (daily)
 		d.tasks.Add(instanceRefreshTypesTask(d))
 	}
 
+	// Start all background tasks
 	d.tasks.Start()
 
+	// Get daemon state struct
 	s := d.State()
 
-	/* Restore containers */
+	// Restore containers
 	containersRestart(s)
 
-	/* Re-balance in case things changed while LXD was down */
+	// Re-balance in case things changed while LXD was down
 	deviceTaskBalance(s)
 
+	// Unblock incoming requests
 	close(d.readyChan)
 
 	return nil
@@ -726,7 +850,8 @@ func (d *Daemon) Stop() error {
 		trackError(d.endpoints.Down())
 	}
 
-	trackError(d.tasks.Stop(3 * time.Second)) // Give tasks a bit of time to cleanup.
+	trackError(d.tasks.Stop(3 * time.Second))        // Give tasks a bit of time to cleanup.
+	trackError(d.clusterTasks.Stop(3 * time.Second)) // Give tasks a bit of time to cleanup.
 
 	shouldUnmount := false
 	if d.cluster != nil {
@@ -803,42 +928,85 @@ func (d *Daemon) Stop() error {
 }
 
 // Setup external authentication
-func (d *Daemon) setupExternalAuthentication(authEndpoint string) error {
+func (d *Daemon) setupExternalAuthentication(authEndpoint string, authPubkey string, expiry int64, domains string) error {
+	// Parse the list of domains
+	authDomains := []string{}
+	for _, domain := range strings.Split(domains, ",") {
+		if domain == "" {
+			continue
+		}
+
+		authDomains = append(authDomains, strings.TrimSpace(domain))
+	}
+
+	// Allow disable external authentication
 	if authEndpoint == "" {
 		d.externalAuth = nil
 		return nil
 	}
 
+	// Setup the candid client
 	idmClient, err := candidclient.New(candidclient.NewParams{
 		BaseURL: authEndpoint,
 	})
 	if err != nil {
 		return err
 	}
+
+	idmClientWrapper := &IdentityClientWrapper{
+		client:       idmClient,
+		ValidDomains: authDomains,
+	}
+
+	// Generate an internal private key
 	key, err := bakery.GenerateKey()
 	if err != nil {
 		return err
 	}
-	pkLocator := httpbakery.NewThirdPartyLocator(nil, nil)
-	if strings.HasPrefix(authEndpoint, "http://") {
-		pkLocator.AllowInsecure()
+
+	pkCache := bakery.NewThirdPartyStore()
+	pkLocator := httpbakery.NewThirdPartyLocator(nil, pkCache)
+	if authPubkey != "" {
+		// Parse the public key
+		pkKey := bakery.Key{}
+		err := pkKey.UnmarshalText([]byte(authPubkey))
+		if err != nil {
+			return err
+		}
+
+		// Add the key information
+		pkCache.AddInfo(authEndpoint, bakery.ThirdPartyInfo{
+			PublicKey: bakery.PublicKey{Key: pkKey},
+			Version:   3,
+		})
+
+		// Allow http URLs if we have a public key set
+		if strings.HasPrefix(authEndpoint, "http://") {
+			pkLocator.AllowInsecure()
+		}
 	}
+
+	// Setup the bakery
 	bakery := identchecker.NewBakery(identchecker.BakeryParams{
 		Key:            key,
 		Location:       authEndpoint,
 		Locator:        pkLocator,
 		Checker:        httpbakery.NewChecker(),
-		IdentityClient: idmClient,
+		IdentityClient: idmClientWrapper,
 		Authorizer: identchecker.ACLAuthorizer{
 			GetACL: func(ctx context.Context, op bakery.Op) ([]string, bool, error) {
 				return []string{identchecker.Everyone}, false, nil
 			},
 		},
 	})
+
+	// Store our settings
 	d.externalAuth = &externalAuth{
 		endpoint: authEndpoint,
+		expiry:   expiry,
 		bakery:   bakery,
 	}
+
 	return nil
 }
 

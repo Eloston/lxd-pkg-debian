@@ -715,7 +715,8 @@ func (s *storageCeph) StoragePoolUpdate(writable *api.StoragePoolPut, changedCon
 	return nil
 }
 
-func (s *storageCeph) ContainerStorageReady(name string) bool {
+func (s *storageCeph) ContainerStorageReady(container container) bool {
+	name := container.Name()
 	logger.Debugf(`Checking if RBD storage volume for container "%s" on storage pool "%s" is ready`, name, s.pool.Name)
 
 	ok := cephRBDVolumeExists(s.ClusterName, s.OSDPoolName, name,
@@ -905,7 +906,7 @@ func (s *storageCeph) ContainerCreateFromImage(container container, fingerprint 
 		return err
 	}
 	if ourMount {
-		defer s.ContainerUmount(containerName, containerPath)
+		defer s.ContainerUmount(container, containerPath)
 	}
 
 	if !privileged {
@@ -958,7 +959,7 @@ func (s *storageCeph) ContainerDelete(container container) error {
 	containerPath := container.Path()
 	containerMntPoint := getContainerMountPoint(s.pool.Name, containerName)
 	if shared.PathExists(containerMntPoint) {
-		_, err := s.ContainerUmount(containerName, containerPath)
+		_, err := s.ContainerUmount(container, containerPath)
 		if err != nil {
 			return err
 		}
@@ -1230,7 +1231,7 @@ func (s *storageCeph) ContainerCopy(target container, source container,
 		return err
 	}
 	if ourMount {
-		defer s.ContainerUmount(target.Name(), targetContainerMountPoint)
+		defer s.ContainerUmount(target, targetContainerMountPoint)
 	}
 
 	err = s.setUnprivUserACL(source, targetContainerMountPoint)
@@ -1264,8 +1265,9 @@ func (s *storageCeph) ContainerMount(c container) (bool, error) {
 	return ourMount, nil
 }
 
-func (s *storageCeph) ContainerUmount(name string, path string) (bool, error) {
+func (s *storageCeph) ContainerUmount(c container, path string) (bool, error) {
 	logger.Debugf("Unmounting RBD storage volume for container \"%s\" on storage pool \"%s\"", s.volume.Name, s.pool.Name)
+	name := c.Name()
 
 	containerMntPoint := getContainerMountPoint(s.pool.Name, name)
 	if shared.IsSnapshot(name) {
@@ -1279,6 +1281,7 @@ func (s *storageCeph) ContainerUmount(name string, path string) (bool, error) {
 		if _, ok := <-waitChannel; ok {
 			logger.Warnf("Received value over semaphore, this should not have happened")
 		}
+
 		// Give the benefit of the doubt and assume that the other
 		// thread actually succeeded in unmounting the storage volume.
 		logger.Debugf("RBD storage volume for container \"%s\" on storage pool \"%s\" appears to be already unmounted", s.volume.Name, s.pool.Name)
@@ -1320,7 +1323,7 @@ func (s *storageCeph) ContainerRename(c container, newName string) error {
 	logger.Debugf(`Renaming RBD storage volume for container "%s" from "%s" to "%s"`, oldName, oldName, newName)
 
 	// unmount
-	_, err := s.ContainerUmount(oldName, containerPath)
+	_, err := s.ContainerUmount(c, containerPath)
 	if err != nil {
 		return err
 	}
@@ -1469,19 +1472,19 @@ func (s *storageCeph) ContainerRestore(target container, source container) error
 
 	logger.Debugf(`Restoring RBD storage volume for container "%s" from %s to %s`, targetName, sourceName, targetName)
 
-	ourStorageStop, err := source.StorageStop()
+	ourStop, err := source.StorageStop()
 	if err != nil {
 		return err
 	}
-	if !ourStorageStop {
+	if ourStop {
 		defer source.StorageStart()
 	}
 
-	ourStorageStop, err = target.StorageStop()
+	ourStop, err = target.StorageStop()
 	if err != nil {
 		return err
 	}
-	if !ourStorageStop {
+	if ourStop {
 		defer target.StorageStart()
 	}
 
@@ -1738,38 +1741,40 @@ func (s *storageCeph) ContainerSnapshotStart(c container) (bool, error) {
 }
 
 func (s *storageCeph) ContainerSnapshotStop(c container) (bool, error) {
-	containerName := c.Name()
-	logger.Debugf(`Stopping RBD storage volume for snapshot "%s" on storage pool "%s"`, containerName, s.pool.Name)
+	logger.Debugf(`Stopping RBD storage volume for snapshot "%s" on storage pool "%s"`, c.Name(), s.pool.Name)
 
+	containerName := c.Name()
 	containerMntPoint := getSnapshotMountPoint(s.pool.Name, containerName)
-	if shared.IsMountPoint(containerMntPoint) {
-		err := tryUnmount(containerMntPoint, syscall.MNT_DETACH)
-		if err != nil {
-			logger.Errorf("Failed to unmount %s: %s", containerMntPoint,
-				err)
-			return false, err
-		}
-		logger.Debugf("Unmounted %s", containerMntPoint)
+
+	// Check if already unmounted
+	if !shared.IsMountPoint(containerMntPoint) {
+		return false, nil
 	}
+
+	// Unmount
+	err := tryUnmount(containerMntPoint, syscall.MNT_DETACH)
+	if err != nil {
+		logger.Errorf("Failed to unmount %s: %s", containerMntPoint, err)
+		return false, err
+	}
+
+	logger.Debugf("Unmounted %s", containerMntPoint)
 
 	containerOnlyName, snapOnlyName, _ := containerGetParentAndSnapshotName(containerName)
 	cloneName := fmt.Sprintf("%s_%s_start_clone", containerOnlyName, snapOnlyName)
-	// unmap
-	err := cephRBDVolumeUnmap(s.ClusterName, s.OSDPoolName, cloneName,
-		"snapshots", s.UserName, true)
+
+	// Unmap the RBD volume
+	err = cephRBDVolumeUnmap(s.ClusterName, s.OSDPoolName, cloneName, "snapshots", s.UserName, true)
 	if err != nil {
 		logger.Warnf(`Failed to unmap RBD storage volume for container "%s" on storage pool "%s": %s`, containerName, s.pool.Name, err)
 	} else {
 		logger.Debugf(`Unmapped RBD storage volume for container "%s" on storage pool "%s"`, containerName, s.pool.Name)
 	}
 
-	rbdVolumeExists := cephRBDVolumeExists(s.ClusterName, s.OSDPoolName,
-		cloneName, "snapshots", s.UserName)
-
+	rbdVolumeExists := cephRBDVolumeExists(s.ClusterName, s.OSDPoolName, cloneName, "snapshots", s.UserName)
 	if rbdVolumeExists {
-		// delete
-		err = cephRBDVolumeDelete(s.ClusterName, s.OSDPoolName, cloneName,
-			"snapshots", s.UserName)
+		// Delete the temporary RBD volume
+		err = cephRBDVolumeDelete(s.ClusterName, s.OSDPoolName, cloneName, "snapshots", s.UserName)
 		if err != nil {
 			logger.Errorf(`Failed to delete clone of RBD storage volume for container "%s" on storage pool "%s": %s`, containerName, s.pool.Name, err)
 			return false, err
@@ -2415,8 +2420,8 @@ func (s *storageCeph) StorageMigrationSource() (MigrationStorageSourceDriver, er
 	return rsyncStorageMigrationSource()
 }
 
-func (s *storageCeph) StorageMigrationSink(conn *websocket.Conn, op *operation, storage storage) error {
-	return rsyncStorageMigrationSink(conn, op, storage)
+func (s *storageCeph) StorageMigrationSink(conn *websocket.Conn, op *operation, storage storage, args MigrationSinkArgs) error {
+	return rsyncStorageMigrationSink(conn, op, storage, args)
 }
 
 func (s *storageCeph) GetStoragePool() *api.StoragePool {

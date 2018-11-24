@@ -267,6 +267,16 @@ func (r *ProtocolLXD) CopyContainer(source ContainerServer, container api.Contai
 			return nil, fmt.Errorf("The source server is missing the required \"container_push_target\" API extension")
 		}
 
+		if args.Refresh {
+			if !r.HasExtension("container_incremental_copy") {
+				return nil, fmt.Errorf("The target server is missing the required \"container_incremental_copy\" API extension")
+			}
+
+			if !source.HasExtension("container_incremental_copy") {
+				return nil, fmt.Errorf("The source server is missing the required \"container_incremental_copy\" API extension")
+			}
+		}
+
 		// Allow overriding the target name
 		if args.Name != "" {
 			req.Name = args.Name
@@ -274,6 +284,7 @@ func (r *ProtocolLXD) CopyContainer(source ContainerServer, container api.Contai
 
 		req.Source.Live = args.Live
 		req.Source.ContainerOnly = args.ContainerOnly
+		req.Source.Refresh = args.Refresh
 	}
 
 	if req.Source.Live {
@@ -287,11 +298,20 @@ func (r *ProtocolLXD) CopyContainer(source ContainerServer, container api.Contai
 
 	destInfo, err := r.GetConnectionInfo()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get source connection info: %v", err)
+		return nil, fmt.Errorf("Failed to get destination connection info: %v", err)
 	}
 
 	// Optimization for the local copy case
 	if destInfo.URL == sourceInfo.URL && !r.IsClustered() {
+		// Project handling
+		if destInfo.Project != sourceInfo.Project {
+			if !r.HasExtension("container_copy_project") {
+				return nil, fmt.Errorf("The server is missing the required \"container_copy_project\" API extension")
+			}
+
+			req.Source.Project = sourceInfo.Project
+		}
+
 		// Local copy source fields
 		req.Source.Type = "copy"
 		req.Source.Source = container.Name
@@ -334,11 +354,13 @@ func (r *ProtocolLXD) CopyContainer(source ContainerServer, container api.Contai
 		// Create the container
 		req.Source.Type = "migration"
 		req.Source.Mode = "push"
+		req.Source.Refresh = args.Refresh
 
 		op, err := r.CreateContainer(req)
 		if err != nil {
 			return nil, err
 		}
+
 		opAPI := op.Get()
 
 		targetSecrets := map[string]string{}
@@ -757,6 +779,11 @@ func (r *ProtocolLXD) GetContainerFile(containerName string, path string) (io.Re
 		return nil, nil, err
 	}
 
+	requestURL, err = r.setQueryAttributes(requestURL)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	req, err := http.NewRequest("GET", requestURL, nil)
 	if err != nil {
 		return nil, nil, err
@@ -836,7 +863,14 @@ func (r *ProtocolLXD) CreateContainerFile(containerName string, path string, arg
 	}
 
 	// Prepare the HTTP request
-	req, err := http.NewRequest("POST", fmt.Sprintf("%s/1.0/containers/%s/files?path=%s", r.httpHost, url.QueryEscape(containerName), url.QueryEscape(path)), args.Content)
+	requestURL := fmt.Sprintf("%s/1.0/containers/%s/files?path=%s", r.httpHost, url.QueryEscape(containerName), url.QueryEscape(path))
+
+	requestURL, err := r.setQueryAttributes(requestURL)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", requestURL, args.Content)
 	if err != nil {
 		return err
 	}
@@ -1283,6 +1317,12 @@ func (r *ProtocolLXD) GetContainerLogfiles(name string) ([]string, error) {
 func (r *ProtocolLXD) GetContainerLogfile(name string, filename string) (io.ReadCloser, error) {
 	// Prepare the HTTP request
 	url := fmt.Sprintf("%s/1.0/containers/%s/logs/%s", r.httpHost, url.QueryEscape(name), url.QueryEscape(filename))
+
+	url, err := r.setQueryAttributes(url)
+	if err != nil {
+		return nil, err
+	}
+
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -1377,6 +1417,12 @@ func (r *ProtocolLXD) GetContainerTemplateFile(containerName string, templateNam
 	}
 
 	url := fmt.Sprintf("%s/1.0/containers/%s/metadata/templates?path=%s", r.httpHost, url.QueryEscape(containerName), url.QueryEscape(templateName))
+
+	url, err := r.setQueryAttributes(url)
+	if err != nil {
+		return nil, err
+	}
+
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -1388,7 +1434,7 @@ func (r *ProtocolLXD) GetContainerTemplateFile(containerName string, templateNam
 	}
 
 	// Send the request
-	resp, err := r.http.Do(req)
+	resp, err := r.do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -1420,6 +1466,12 @@ func (r *ProtocolLXD) setContainerTemplateFile(containerName string, templateNam
 	}
 
 	url := fmt.Sprintf("%s/1.0/containers/%s/metadata/templates?path=%s", r.httpHost, url.QueryEscape(containerName), url.QueryEscape(templateName))
+
+	url, err := r.setQueryAttributes(url)
+	if err != nil {
+		return err
+	}
+
 	req, err := http.NewRequest(httpMethod, url, content)
 	if err != nil {
 		return err
@@ -1432,7 +1484,7 @@ func (r *ProtocolLXD) setContainerTemplateFile(containerName string, templateNam
 	}
 
 	// Send the request
-	resp, err := r.http.Do(req)
+	resp, err := r.do(req)
 	// Check the return value for a cleaner error
 	if resp.StatusCode != http.StatusOK {
 		_, _, err := lxdParseResponse(resp)
@@ -1532,6 +1584,12 @@ func (r *ProtocolLXD) GetContainerConsoleLog(containerName string, args *Contain
 
 	// Prepare the HTTP request
 	url := fmt.Sprintf("%s/1.0/containers/%s/console", r.httpHost, url.QueryEscape(containerName))
+
+	url, err := r.setQueryAttributes(url)
+	if err != nil {
+		return nil, err
+	}
+
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -1689,6 +1747,9 @@ func (r *ProtocolLXD) GetContainerBackupFile(containerName string, name string, 
 	// Build the URL
 	uri := fmt.Sprintf("%s/1.0/containers/%s/backups/%s/export", r.httpHost,
 		url.QueryEscape(containerName), url.QueryEscape(name))
+	if r.project != "" {
+		uri += fmt.Sprintf("?project=%s", url.QueryEscape(r.project))
+	}
 
 	// Prepare the download request
 	request, err := http.NewRequest("GET", uri, nil)

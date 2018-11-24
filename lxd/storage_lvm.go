@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/gorilla/websocket"
+	"github.com/pkg/errors"
 
 	"github.com/lxc/lxd/lxd/migration"
 	"github.com/lxc/lxd/lxd/state"
@@ -143,8 +144,9 @@ func (s *storageLvm) StoragePoolCreate() error {
 		}
 	}()
 
-	if source == "" {
-		source = filepath.Join(shared.VarPath("disks"), fmt.Sprintf("%s.img", s.pool.Name))
+	defaultSource := filepath.Join(shared.VarPath("disks"), fmt.Sprintf("%s.img", s.pool.Name))
+	if source == "" || source == defaultSource {
+		source = defaultSource
 		s.pool.Config["source"] = source
 
 		if s.pool.Config["lvm.vg_name"] == "" {
@@ -202,7 +204,7 @@ func (s *storageLvm) StoragePoolCreate() error {
 		if filepath.IsAbs(source) {
 			pvName = source
 			if !shared.IsBlockdevPath(pvName) {
-				return fmt.Errorf("custom loop file locations are not supported")
+				return fmt.Errorf("Custom loop file locations are not supported")
 			}
 
 			if s.pool.Config["lvm.vg_name"] == "" {
@@ -227,10 +229,11 @@ func (s *storageLvm) StoragePoolCreate() error {
 			// The physical volume must already consist
 			pvExisted = true
 			vgName = source
-			if s.pool.Config["lvm.vg_name"] != "" {
+			if s.pool.Config["lvm.vg_name"] != "" && s.pool.Config["lvm.vg_name"] != vgName {
 				// User gave us something weird.
-				return fmt.Errorf("invalid combination of \"source\" and \"zfs.pool_name\" property")
+				return fmt.Errorf("Invalid combination of \"source\" and \"lvm.vg_name\" property")
 			}
+
 			s.pool.Config["lvm.vg_name"] = vgName
 			s.vgName = vgName
 
@@ -241,7 +244,7 @@ func (s *storageLvm) StoragePoolCreate() error {
 
 			// Volume group must exist but doesn't.
 			if !vgExisted {
-				return fmt.Errorf("the requested volume group \"%s\" does not exist", vgName)
+				return fmt.Errorf("The requested volume group \"%s\" does not exist", vgName)
 			}
 		}
 	}
@@ -255,7 +258,7 @@ func (s *storageLvm) StoragePoolCreate() error {
 
 		output, err := shared.TryRunCommand("pvcreate", pvName)
 		if err != nil {
-			return fmt.Errorf("failed to create the physical volume for the lvm storage pool: %s", output)
+			return fmt.Errorf("Failed to create the physical volume for the lvm storage pool: %s", output)
 		}
 		defer func() {
 			if tryUndo {
@@ -785,7 +788,7 @@ func (s *storageLvm) StoragePoolUpdate(writable *api.StoragePoolPut, changedConf
 
 func (s *storageLvm) StoragePoolVolumeUpdate(writable *api.StorageVolumePut,
 	changedConfig []string) error {
-	logger.Infof(`Updating LVM storage volume "%s"`, s.pool.Name)
+	logger.Infof(`Updating LVM storage volume "%s"`, s.volume.Name)
 
 	changeable := changeableStoragePoolVolumeProperties["lvm"]
 	unchangeable := []string{}
@@ -853,8 +856,8 @@ func (s *storageLvm) StoragePoolVolumeRename(newName string) error {
 		storagePoolVolumeTypeCustom, s.poolID)
 }
 
-func (s *storageLvm) ContainerStorageReady(name string) bool {
-	containerLvmName := containerNameToLVName(name)
+func (s *storageLvm) ContainerStorageReady(container container) bool {
+	containerLvmName := containerNameToLVName(container.Name())
 	poolName := s.getOnDiskPoolName()
 	containerLvmPath := getLvmDevPath(poolName, storagePoolVolumeAPIEndpointContainers, containerLvmName)
 	ok, _ := storageLVExists(containerLvmPath)
@@ -954,11 +957,11 @@ func (s *storageLvm) ContainerCreateFromImage(container container, fingerprint s
 	containerPath := container.Path()
 	err = os.MkdirAll(containerMntPoint, 0711)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "Create container mount point directory at %s", containerMntPoint)
 	}
 	err = createContainerMountpoint(containerMntPoint, containerPath, container.IsPrivileged())
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Create container mount point")
 	}
 
 	poolName := s.getOnDiskPoolName()
@@ -973,10 +976,10 @@ func (s *storageLvm) ContainerCreateFromImage(container container, fingerprint s
 
 	ourMount, err := s.ContainerMount(container)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Container mount")
 	}
 	if ourMount {
-		defer s.ContainerUmount(containerName, containerPath)
+		defer s.ContainerUmount(container, containerPath)
 	}
 
 	if container.IsPrivileged() {
@@ -985,13 +988,13 @@ func (s *storageLvm) ContainerCreateFromImage(container container, fingerprint s
 		err = os.Chmod(containerMntPoint, 0711)
 	}
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Set mount point permissions")
 	}
 
 	if !container.IsPrivileged() {
 		err := s.shiftRootfs(container, nil)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "Shift rootfs")
 		}
 	}
 
@@ -1181,16 +1184,20 @@ func (s *storageLvm) doContainerMount(name string) (bool, error) {
 	lxdStorageMapLock.Unlock()
 
 	if mounterr != nil {
-		return false, mounterr
+		return false, errors.Wrapf(mounterr, "Mount %s onto %s", containerLvmPath, containerMntPoint)
 	}
 
 	logger.Debugf("Mounted LVM storage volume for container \"%s\" on storage pool \"%s\"", s.volume.Name, s.pool.Name)
 	return ourMount, nil
 }
 
-func (s *storageLvm) ContainerUmount(name string, path string) (bool, error) {
-	logger.Debugf("Unmounting LVM storage volume for container \"%s\" on storage pool \"%s\"", s.volume.Name, s.pool.Name)
+func (s *storageLvm) ContainerUmount(c container, path string) (bool, error) {
+	name := c.Name()
+	return s.umount(name, path)
+}
 
+func (s *storageLvm) umount(name string, path string) (bool, error) {
+	logger.Debugf("Unmounting LVM storage volume for container \"%s\" on storage pool \"%s\"", s.volume.Name, s.pool.Name)
 	containerMntPoint := getContainerMountPoint(s.pool.Name, name)
 	if shared.IsSnapshot(name) {
 		containerMntPoint = getSnapshotMountPoint(s.pool.Name, name)
@@ -1242,7 +1249,7 @@ func (s *storageLvm) ContainerRename(container container, newContainerName strin
 	oldLvmName := containerNameToLVName(oldName)
 	newLvmName := containerNameToLVName(newContainerName)
 
-	_, err := s.ContainerUmount(oldName, container.Path())
+	_, err := s.ContainerUmount(container, container.Path())
 	if err != nil {
 		return err
 	}
@@ -1317,14 +1324,6 @@ func (s *storageLvm) ContainerRename(container container, newContainerName strin
 func (s *storageLvm) ContainerRestore(target container, source container) error {
 	logger.Debugf("Restoring LVM storage volume for container \"%s\" from %s to %s", s.volume.Name, source.Name(), target.Name())
 
-	ourStart, err := source.StorageStart()
-	if err != nil {
-		return err
-	}
-	if ourStart {
-		defer source.StorageStop()
-	}
-
 	_, sourcePool, _ := source.Storage().GetContainerPoolInfo()
 	if s.pool.Name != sourcePool {
 		return fmt.Errorf("containers must be on the same pool to be restored")
@@ -1337,9 +1336,12 @@ func (s *storageLvm) ContainerRestore(target container, source container) error 
 	targetLvmName := containerNameToLVName(targetName)
 	targetPath := target.Path()
 	if s.useThinpool {
-		_, err = target.Storage().ContainerUmount(targetName, targetPath)
+		ourUmount, err := target.Storage().ContainerUmount(target, targetPath)
 		if err != nil {
 			return err
+		}
+		if ourUmount {
+			defer target.Storage().ContainerMount(target)
 		}
 
 		poolName := s.getOnDiskPoolName()
@@ -1357,18 +1359,21 @@ func (s *storageLvm) ContainerRestore(target container, source container) error 
 		if err != nil {
 			return fmt.Errorf("Error creating snapshot LV: %v", err)
 		}
-
-		_, err = target.Storage().ContainerMount(target)
-		if err != nil {
-			return err
-		}
 	} else {
-		ourMount, err := target.Storage().ContainerMount(target)
+		ourStart, err := source.StorageStart()
 		if err != nil {
 			return err
 		}
-		if ourMount {
-			defer target.Storage().ContainerUmount(targetName, targetPath)
+		if ourStart {
+			defer source.StorageStop()
+		}
+
+		ourStart, err = target.StorageStart()
+		if err != nil {
+			return err
+		}
+		if ourStart {
+			defer target.StorageStop()
 		}
 
 		poolName := s.getOnDiskPoolName()
@@ -1727,8 +1732,8 @@ func (s *storageLvm) MigrationSource(container container, containerOnly bool) (M
 	return rsyncMigrationSource(container, containerOnly)
 }
 
-func (s *storageLvm) MigrationSink(live bool, container container, snapshots []*migration.Snapshot, conn *websocket.Conn, srcIdmap *idmap.IdmapSet, op *operation, containerOnly bool) error {
-	return rsyncMigrationSink(live, container, snapshots, conn, srcIdmap, op, containerOnly)
+func (s *storageLvm) MigrationSink(live bool, container container, snapshots []*migration.Snapshot, conn *websocket.Conn, srcIdmap *idmap.IdmapSet, op *operation, containerOnly bool, args MigrationSinkArgs) error {
+	return rsyncMigrationSink(live, container, snapshots, conn, srcIdmap, op, containerOnly, args)
 }
 
 func (s *storageLvm) StorageEntitySetQuota(volumeType int, size int64, data interface{}) error {
@@ -1925,8 +1930,8 @@ func (s *storageLvm) StorageMigrationSource() (MigrationStorageSourceDriver, err
 	return rsyncStorageMigrationSource()
 }
 
-func (s *storageLvm) StorageMigrationSink(conn *websocket.Conn, op *operation, storage storage) error {
-	return rsyncStorageMigrationSink(conn, op, storage)
+func (s *storageLvm) StorageMigrationSink(conn *websocket.Conn, op *operation, storage storage, args MigrationSinkArgs) error {
+	return rsyncStorageMigrationSink(conn, op, storage, args)
 }
 
 func (s *storageLvm) GetStoragePool() *api.StoragePool {

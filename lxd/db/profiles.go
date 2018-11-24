@@ -37,6 +37,10 @@ func (c *Cluster) ProfileGet(name string) (int64, *api.Profile, error) {
 	arg2 := []interface{}{&id, &description}
 	err := dbQueryRowScan(c.db, q, arg1, arg2)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			return -1, nil, ErrNoSuchObject
+		}
+
 		return -1, nil, err
 	}
 
@@ -233,7 +237,7 @@ func (c *Cluster) ProfileContainersGet(profile string) ([]string, error) {
 	q := `SELECT containers.name FROM containers JOIN containers_profiles
 		ON containers.id == containers_profiles.container_id
 		JOIN profiles ON containers_profiles.profile_id == profiles.id
-		WHERE profiles.name == ?`
+		WHERE profiles.name == ? AND containers.type == 0`
 
 	results := []string{}
 	inargs := []interface{}{profile}
@@ -265,4 +269,80 @@ DELETE FROM profiles_devices_config WHERE profile_device_id NOT IN (SELECT id FR
 	}
 
 	return nil
+}
+
+// Note: the code below was backported from the 3.x master branch, and it's
+//       mostly cut and paste from there to avoid re-inventing that logic.
+
+// Profile is a value object holding db-related details about a profile.
+type Profile struct {
+	ID          int
+	Name        string `db:"primary=yes"`
+	Description string `db:"coalesce=''"`
+	Config      map[string]string
+	Devices     map[string]map[string]string
+	UsedBy      []string
+}
+
+// ProfileToAPI is a convenience to convert a Profile db struct into
+// an API profile struct.
+func ProfileToAPI(profile *Profile) *api.Profile {
+	p := &api.Profile{
+		Name:   profile.Name,
+		UsedBy: profile.UsedBy,
+	}
+	p.Description = profile.Description
+	p.Config = profile.Config
+	p.Devices = profile.Devices
+
+	return p
+}
+
+// ProfilesExpandConfig expands the given container config with the config
+// values of the given profiles.
+func ProfilesExpandConfig(config map[string]string, profiles []api.Profile) map[string]string {
+	expandedConfig := map[string]string{}
+
+	// Apply all the profiles
+	profileConfigs := make([]map[string]string, len(profiles))
+	for i, profile := range profiles {
+		profileConfigs[i] = profile.Config
+	}
+
+	for i := range profileConfigs {
+		for k, v := range profileConfigs[i] {
+			expandedConfig[k] = v
+		}
+	}
+
+	// Stick the given config on top
+	for k, v := range config {
+		expandedConfig[k] = v
+	}
+
+	return expandedConfig
+}
+
+// ProfilesExpandDevices expands the given container devices with the devices
+// defined in the given profiles.
+func ProfilesExpandDevices(devices types.Devices, profiles []api.Profile) types.Devices {
+	expandedDevices := types.Devices{}
+
+	// Apply all the profiles
+	profileDevices := make([]types.Devices, len(profiles))
+	for i, profile := range profiles {
+		profileDevices[i] = profile.Devices
+	}
+	for i := range profileDevices {
+		for k, v := range profileDevices[i] {
+			expandedDevices[k] = v
+		}
+	}
+
+	// Stick the given devices on top
+	for k, v := range devices {
+		expandedDevices[k] = v
+	}
+
+	return expandedDevices
 }

@@ -98,7 +98,6 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 			return err
 		}
 	}
-
 	// Confirm that --target is only used with a cluster
 	if c.flagTarget != "" && !dest.IsClustered() {
 		return fmt.Errorf(i18n.G("To use --target, the destination remote must be a cluster"))
@@ -134,6 +133,10 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 
 	var op lxd.RemoteOperation
 	if shared.IsSnapshot(sourceName) {
+		if containerOnly {
+			return fmt.Errorf(i18n.G("--container-only can't be passed when the source is a snapshot"))
+		}
+
 		// Prepare the container creation request
 		args := lxd.ContainerSnapshotCopyArgs{
 			Name: destName,
@@ -197,7 +200,10 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 		}
 
 		// Do the actual copy
-		dest = dest.UseTarget(c.flagTarget)
+		if c.flagTarget != "" {
+			dest = dest.UseTarget(c.flagTarget)
+		}
+
 		op, err = dest.CopyContainerSnapshot(source, srcFields[0], *entry, &args)
 		if err != nil {
 			return err
@@ -266,7 +272,10 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 		}
 
 		// Do the actual copy
-		dest = dest.UseTarget(c.flagTarget)
+		if c.flagTarget != "" {
+			dest = dest.UseTarget(c.flagTarget)
+		}
+
 		op, err = dest.CopyContainer(source, *entry, &args)
 		if err != nil {
 			return err
@@ -282,7 +291,7 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 	}
 
 	// Wait for the copy to complete
-	err = op.Wait()
+	err = utils.CancelableWait(op, &progress)
 	if err != nil {
 		progress.Done("")
 		return err

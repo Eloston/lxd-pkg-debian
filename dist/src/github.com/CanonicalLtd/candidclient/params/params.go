@@ -106,6 +106,10 @@ type QueryUsersRequest struct {
 	// if using Time.MarshalText. It matches all identies that have a
 	// last discharge time after the given time.
 	LastDischargeSince string `httprequest:"last-discharge-since,form"`
+
+	// Owner, if present, matches all agent identities with the given
+	// owner.
+	Owner string `httprequest:"owner,form"`
 }
 
 // UserRequest is a request for the user details of the named user.
@@ -149,6 +153,13 @@ type CreateAgentBody struct {
 	FullName   string              `json:"fullname"`
 	Groups     []string            `json:"idpgroups"`
 	PublicKeys []*bakery.PublicKey `json:"public_keys"`
+
+	// A parent agent is one that can create its own agents. A parent
+	// agent does not have an owner and so remains a member of the
+	// groups it has been allocated irrespective of whether the
+	// creating user remains a member. Only users in the write-user
+	// ACL can create a parent agent.
+	Parent bool `json:"parent,omitempty"`
 }
 
 // CreateAgentResponse holds the response from a

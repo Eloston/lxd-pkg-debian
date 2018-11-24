@@ -11,7 +11,9 @@ import (
 	"os"
 	"time"
 
+	dqlite "github.com/CanonicalLtd/go-dqlite"
 	"github.com/mattn/go-sqlite3"
+	"github.com/pkg/errors"
 
 	lxd "github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/cluster"
@@ -68,11 +70,10 @@ func (r *syncResponse) Render(w http.ResponseWriter) error {
 	}
 
 	resp := api.ResponseRaw{
-		Response: api.Response{
-			Type:       api.SyncResponse,
-			Status:     status.String(),
-			StatusCode: int(status)},
-		Metadata: r.metadata,
+		Type:       api.SyncResponse,
+		Status:     status.String(),
+		StatusCode: int(status),
+		Metadata:   r.metadata,
 	}
 
 	return util.WriteJSON(w, resp, debug)
@@ -162,7 +163,7 @@ func ForwardedResponse(client lxd.ContainerServer, request *http.Request) Respon
 // ForwardedResponseIfTargetIsRemote redirects a request to the request has a
 // targetNode parameter pointing to a node which is not the local one.
 func ForwardedResponseIfTargetIsRemote(d *Daemon, request *http.Request) Response {
-	targetNode := request.FormValue("target")
+	targetNode := queryParam(request, "target")
 	if targetNode == "" {
 		return nil
 	}
@@ -210,7 +211,7 @@ func ForwardedResponseIfContainerIsRemote(d *Daemon, r *http.Request, name strin
 // This is used when no targetNode is specified, and saves users some typing
 // when the volume name/type is unique to a node.
 func ForwardedResponseIfVolumeIsRemote(d *Daemon, r *http.Request, poolID int64, volumeName string, volumeType int) Response {
-	if r.FormValue("target") != "" {
+	if queryParam(r, "target") != "" {
 		return nil
 	}
 
@@ -355,13 +356,11 @@ func (r *operationResponse) Render(w http.ResponseWriter) error {
 	}
 
 	body := api.ResponseRaw{
-		Response: api.Response{
-			Type:       api.AsyncResponse,
-			Status:     api.OperationCreated.String(),
-			StatusCode: int(api.OperationCreated),
-			Operation:  url,
-		},
-		Metadata: md,
+		Type:       api.AsyncResponse,
+		Status:     api.OperationCreated.String(),
+		StatusCode: int(api.OperationCreated),
+		Operation:  url,
+		Metadata:   md,
 	}
 
 	w.Header().Set("Location", url)
@@ -394,13 +393,11 @@ func (r *forwardedOperationResponse) Render(w http.ResponseWriter) error {
 	url := fmt.Sprintf("/%s/operations/%s", version.APIVersion, r.op.ID)
 
 	body := api.ResponseRaw{
-		Response: api.Response{
-			Type:       api.AsyncResponse,
-			Status:     api.OperationCreated.String(),
-			StatusCode: int(api.OperationCreated),
-			Operation:  url,
-		},
-		Metadata: r.op,
+		Type:       api.AsyncResponse,
+		Status:     api.OperationCreated.String(),
+		StatusCode: int(api.OperationCreated),
+		Operation:  url,
+		Metadata:   r.op,
 	}
 
 	w.Header().Set("Location", url)
@@ -514,7 +511,7 @@ func PreconditionFailed(err error) Response {
  * SmartError returns the right error message based on err.
  */
 func SmartError(err error) Response {
-	switch err {
+	switch errors.Cause(err) {
 	case nil:
 		return EmptySyncResponse
 	case os.ErrNotExist:
@@ -529,6 +526,8 @@ func SmartError(err error) Response {
 		return Conflict(nil)
 	case sqlite3.ErrConstraintUnique:
 		return Conflict(nil)
+	case dqlite.ErrNoAvailableLeader:
+		return Unavailable(err)
 	default:
 		return InternalError(err)
 	}

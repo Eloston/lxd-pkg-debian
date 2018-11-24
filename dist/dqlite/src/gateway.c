@@ -65,24 +65,20 @@ static int dqlite__gateway_maybe_checkpoint(void *      ctx,
 
 	/* Check each mark and associated lock. This logic is similar to the one
 	 * in the walCheckpoint function of wal.c, in the SQLite code. */
-	for (i = 1; i < DQLITE__FORMAT_WAL_NREADER; i++) {
-		if (mx_frame > read_marks[i]) {
-			/* This read mark is set, let's check if it's also
-			 * locked. */
-			int flags = SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE;
+	for (i = 0; i < SQLITE_SHM_NLOCK; i++) {
+		int flags = SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE;
 
-			rc = file->pMethods->xShmLock(file, i, 1, flags);
-			if (rc == SQLITE_BUSY) {
-				/* It's locked. Let's postpone the checkpoint
-				 * for now. */
-				return SQLITE_OK;
-			}
-
-			/* Not locked. Let's release the lock we just
-			 * acquired. */
-			flags = SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE;
-			file->pMethods->xShmLock(file, i, 1, flags);
+		rc = file->pMethods->xShmLock(file, i, 1, flags);
+		if (rc == SQLITE_BUSY) {
+			/* It's locked. Let's postpone the checkpoint
+			 * for now. */
+			return SQLITE_OK;
 		}
+
+		/* Not locked. Let's release the lock we just
+		 * acquired. */
+		flags = SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE;
+		file->pMethods->xShmLock(file, i, 1, flags);
 	}
 
 	/* Attempt to perfom a checkpoint across all nodes.
@@ -318,6 +314,7 @@ static void dqlite__gateway_exec(struct dqlite__gateway *    g,
 	} else {
 		dqlite__error_printf(&g->error, stmt->error);
 		dqlite__gateway_failure(g, ctx, rc);
+		sqlite3_reset(stmt->stmt);
 	}
 }
 
@@ -335,6 +332,8 @@ static void dqlite__gateway_query_batch(struct dqlite__gateway *    g,
 
 	rc = dqlite__stmt_query(stmt, &ctx->response.message);
 	if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+		sqlite3_reset(stmt->stmt);
+
 		/* Finalize the statement if needed. */
 		if (ctx->cleanup == DQLITE__GATEWAY_CLEANUP_FINALIZE) {
 			dqlite__db_finalize(db, stmt);
@@ -600,12 +599,14 @@ static void dqlite__gateway_loop()
 void dqlite__gateway_init(struct dqlite__gateway *    g,
                           struct dqlite__gateway_cbs *callbacks,
                           struct dqlite_cluster *     cluster,
+                          struct dqlite_logger *      logger,
                           struct dqlite__options *    options)
 {
 	int i;
 
 	assert(g != NULL);
 	assert(cluster != NULL);
+	assert(logger != NULL);
 	assert(options != NULL);
 	assert(callbacks != NULL);
 	assert(callbacks->xFlush != NULL);
@@ -620,6 +621,7 @@ void dqlite__gateway_init(struct dqlite__gateway *    g,
 	memcpy(&g->callbacks, callbacks, sizeof *callbacks);
 
 	g->cluster = cluster;
+	g->logger  = logger;
 	g->options = options;
 
 	/* Reset all request contexts in the buffer */

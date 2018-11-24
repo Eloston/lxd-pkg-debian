@@ -4,9 +4,10 @@
 package candidtest_test
 
 import (
-	jc "github.com/juju/testing/checkers"
+	"testing"
+
+	qt "github.com/frankban/quicktest"
 	"golang.org/x/net/context"
-	gc "gopkg.in/check.v1"
 	"gopkg.in/macaroon-bakery.v2/bakery"
 	"gopkg.in/macaroon-bakery.v2/bakery/identchecker"
 	"gopkg.in/macaroon-bakery.v2/httpbakery"
@@ -16,11 +17,10 @@ import (
 	candidparams "gopkg.in/CanonicalLtd/candidclient.v1/params"
 )
 
-type suite struct{}
+func TestDischarge(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
 
-var _ = gc.Suite(&suite{})
-
-func (*suite) TestDischarge(c *gc.C) {
 	ctx := context.TODO()
 	srv := candidtest.NewServer()
 	srv.AddUser("server-user", candidtest.GroupListGroup)
@@ -28,7 +28,7 @@ func (*suite) TestDischarge(c *gc.C) {
 	client := srv.Client("bob")
 
 	key, err := bakery.GenerateKey()
-	c.Assert(err, gc.IsNil)
+	c.Assert(err, qt.Equals, nil)
 	b := identchecker.NewBakery(identchecker.BakeryParams{
 		Key:            key,
 		Locator:        srv,
@@ -40,33 +40,36 @@ func (*suite) TestDischarge(c *gc.C) {
 		candidclient.IdentityCaveats(srv.URL.String()),
 		identchecker.LoginOp,
 	)
-	c.Assert(err, gc.IsNil)
+	c.Assert(err, qt.Equals, nil)
 
 	ms, err := client.DischargeAll(ctx, m)
-	c.Assert(err, gc.IsNil)
+	c.Assert(err, qt.Equals, nil)
 
 	// Make sure that the macaroon discharged correctly and that it
 	// has the right declared caveats.
 	authInfo, err := b.Checker.Auth(ms).Allow(ctx, identchecker.LoginOp)
-	c.Assert(err, gc.IsNil)
-	c.Assert(authInfo.Identity, gc.NotNil)
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(authInfo.Identity, qt.Not(qt.IsNil))
 	ident := authInfo.Identity.(candidclient.Identity)
-	c.Assert(ident.Id(), gc.Equals, "bob")
+	c.Assert(ident.Id(), qt.Equals, "bob")
 	username, err := ident.Username()
-	c.Assert(err, gc.IsNil)
-	c.Assert(username, gc.Equals, "bob")
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(username, qt.Equals, "bob")
 	groups, err := ident.Groups()
-	c.Assert(err, gc.IsNil)
-	c.Assert(groups, jc.DeepEquals, []string{"somegroup"})
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(groups, qt.DeepEquals, []string{"somegroup"})
 }
 
-func (*suite) TestDischargeDefaultUser(c *gc.C) {
+func TestDischargeDefaultUser(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
+
 	ctx := context.TODO()
 	srv := candidtest.NewServer()
 	srv.SetDefaultUser("bob")
 
 	key, err := bakery.GenerateKey()
-	c.Assert(err, gc.IsNil)
+	c.Assert(err, qt.Equals, nil)
 	b := identchecker.NewBakery(identchecker.BakeryParams{
 		Key:            key,
 		Locator:        srv,
@@ -78,28 +81,31 @@ func (*suite) TestDischargeDefaultUser(c *gc.C) {
 		candidclient.IdentityCaveats(srv.URL.String()),
 		identchecker.LoginOp,
 	)
-	c.Assert(err, gc.IsNil)
+	c.Assert(err, qt.Equals, nil)
 
 	client := httpbakery.NewClient()
 	ms, err := client.DischargeAll(ctx, m)
-	c.Assert(err, gc.IsNil)
+	c.Assert(err, qt.Equals, nil)
 
 	// Make sure that the macaroon discharged correctly and that it
 	// has the right declared caveats.
 	authInfo, err := b.Checker.Auth(ms).Allow(ctx, identchecker.LoginOp)
-	c.Assert(err, gc.IsNil)
-	c.Assert(authInfo.Identity, gc.NotNil)
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(authInfo.Identity, qt.Not(qt.IsNil))
 	ident := authInfo.Identity.(candidclient.Identity)
-	c.Assert(ident.Id(), gc.Equals, "bob")
+	c.Assert(ident.Id(), qt.Equals, "bob")
 	username, err := ident.Username()
-	c.Assert(err, gc.IsNil)
-	c.Assert(username, gc.Equals, "bob")
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(username, qt.Equals, "bob")
 	groups, err := ident.Groups()
-	c.Assert(err, gc.IsNil)
-	c.Assert(groups, gc.HasLen, 0)
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(groups, qt.HasLen, 0)
 }
 
-func (*suite) TestGroups(c *gc.C) {
+func TestGroups(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
+
 	srv := candidtest.NewServer()
 	srv.AddUser("server-user", candidtest.GroupListGroup)
 	srv.AddUser("bob", "beatles", "bobbins")
@@ -109,17 +115,20 @@ func (*suite) TestGroups(c *gc.C) {
 	groups, err := client.UserGroups(context.TODO(), &candidparams.UserGroupsRequest{
 		Username: "bob",
 	})
-	c.Assert(err, gc.IsNil)
-	c.Assert(groups, jc.DeepEquals, []string{"beatles", "bobbins"})
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(groups, qt.DeepEquals, []string{"beatles", "bobbins"})
 
 	groups, err = client.UserGroups(context.TODO(), &candidparams.UserGroupsRequest{
 		Username: "alice",
 	})
-	c.Assert(err, gc.IsNil)
-	c.Assert(groups, gc.HasLen, 0)
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(groups, qt.HasLen, 0)
 }
 
-func (s *suite) TestAddUserWithExistingGroups(c *gc.C) {
+func TestAddUserWithExistingGroups(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
+
 	srv := candidtest.NewServer()
 	srv.AddUser("alice", "anteaters")
 	srv.AddUser("alice")
@@ -129,6 +138,6 @@ func (s *suite) TestAddUserWithExistingGroups(c *gc.C) {
 	groups, err := client.UserGroups(context.TODO(), &candidparams.UserGroupsRequest{
 		Username: "alice",
 	})
-	c.Assert(err, gc.IsNil)
-	c.Assert(groups, jc.DeepEquals, []string{"anteaters", "goof"})
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(groups, qt.DeepEquals, []string{"anteaters", "goof"})
 }

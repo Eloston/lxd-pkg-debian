@@ -762,6 +762,12 @@ Tcl_SetVar2(interp, "sqlite_options", "mergesort", "1", TCL_GLOBAL_ONLY);
   Tcl_SetVar2(interp, "sqlite_options", "uri_00_error", "0", TCL_GLOBAL_ONLY);
 #endif
 
+#ifdef SQLITE_OMIT_WINDOWFUNC
+  Tcl_SetVar2(interp, "sqlite_options", "windowfunc", "0", TCL_GLOBAL_ONLY);
+#else
+  Tcl_SetVar2(interp, "sqlite_options", "windowfunc", "1", TCL_GLOBAL_ONLY);
+#endif
+
 #if defined(SQLITE_ENABLE_WAL_REPLICATION) && !defined(SQLITE_OMIT_WAL)
   Tcl_SetVar2(interp, "sqlite_options", "wal_replication", "1", TCL_GLOBAL_ONLY);
 #else

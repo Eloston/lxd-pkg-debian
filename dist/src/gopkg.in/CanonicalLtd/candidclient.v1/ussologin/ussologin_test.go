@@ -8,25 +8,22 @@ import (
 	"fmt"
 	"io/ioutil"
 	"path/filepath"
+	"testing"
 
-	"github.com/juju/testing"
-	jc "github.com/juju/testing/checkers"
+	qt "github.com/frankban/quicktest"
+	jt "github.com/juju/testing"
 	"github.com/juju/usso"
 	"golang.org/x/net/context"
-	gc "gopkg.in/check.v1"
 	errgo "gopkg.in/errgo.v1"
 	"gopkg.in/juju/environschema.v1/form"
 
 	"gopkg.in/CanonicalLtd/candidclient.v1/ussologin"
 )
 
-type storeSuite struct {
-	testing.CleanupSuite
-}
+func TestPutGetToken(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
 
-var _ = gc.Suite(&storeSuite{})
-
-func (s *storeSuite) TestPutGetToken(c *gc.C) {
 	token := &usso.SSOData{
 		ConsumerKey:    "consumerkey",
 		ConsumerSecret: "consumersecret",
@@ -35,39 +32,39 @@ func (s *storeSuite) TestPutGetToken(c *gc.C) {
 		TokenName:      "tokenname",
 		TokenSecret:    "tokensecret",
 	}
-	path := filepath.Join(c.MkDir(), "subdir", "tokenFile")
+	path := filepath.Join(c.Mkdir(), "subdir", "tokenFile")
 	store := ussologin.NewFileTokenStore(path)
 	err := store.Put(token)
-	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(err, qt.Equals, nil)
 
 	tok, err := store.Get()
-	c.Assert(err, jc.ErrorIsNil)
-	c.Assert(tok, gc.DeepEquals, token)
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(tok, qt.DeepEquals, token)
 	data, err := ioutil.ReadFile(path)
-	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(err, qt.Equals, nil)
 	var storedToken *usso.SSOData
 	err = json.Unmarshal(data, &storedToken)
-	c.Assert(err, jc.ErrorIsNil)
-	c.Assert(token, gc.DeepEquals, storedToken)
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(token, qt.DeepEquals, storedToken)
 }
 
-func (s *storeSuite) TestReadInvalidToken(c *gc.C) {
-	path := fmt.Sprintf("%s/tokenFile", c.MkDir())
+func TestReadInvalidToken(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
+
+	path := fmt.Sprintf("%s/tokenFile", c.Mkdir())
 	err := ioutil.WriteFile(path, []byte("foobar"), 0700)
-	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(err, qt.Equals, nil)
 	store := ussologin.NewFileTokenStore(path)
 
 	_, err = store.Get()
-	c.Assert(err, gc.ErrorMatches, `cannot unmarshal token: invalid character 'o' in literal false \(expecting 'a'\)`)
+	c.Assert(err, qt.ErrorMatches, `cannot unmarshal token: invalid character 'o' in literal false \(expecting 'a'\)`)
 }
 
-type storeTokenGetterSuite struct {
-	testing.CleanupSuite
-}
+func TestTokenInStore(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
 
-var _ = gc.Suite(&storeTokenGetterSuite{})
-
-func (s *storeTokenGetterSuite) TestTokenInStore(c *gc.C) {
 	testToken := &usso.SSOData{
 		ConsumerKey:    "consumerkey",
 		ConsumerSecret: "consumersecret",
@@ -84,14 +81,17 @@ func (s *storeTokenGetterSuite) TestTokenInStore(c *gc.C) {
 	}
 	ctx := context.Background()
 	tok, err := g.GetToken(ctx)
-	c.Assert(err, gc.Equals, nil)
-	c.Assert(tok, jc.DeepEquals, testToken)
-	st.CheckCalls(c, []testing.StubCall{{
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(tok, qt.DeepEquals, testToken)
+	c.Assert(st.Calls(), qt.DeepEquals, []jt.StubCall{{
 		FuncName: "Get",
 	}})
 }
 
-func (s *storeTokenGetterSuite) TestTokenNotInStore(c *gc.C) {
+func TestTokenNotInStore(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
+
 	testToken := &usso.SSOData{
 		ConsumerKey:    "consumerkey",
 		ConsumerSecret: "consumersecret",
@@ -111,29 +111,26 @@ func (s *storeTokenGetterSuite) TestTokenNotInStore(c *gc.C) {
 	}
 	ctx := context.Background()
 	tok, err := g.GetToken(ctx)
-	c.Assert(err, gc.Equals, nil)
-	c.Assert(tok, jc.DeepEquals, testToken)
-	st.CheckCalls(c, []testing.StubCall{{
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(tok, qt.DeepEquals, testToken)
+	c.Assert(st.Calls(), qt.DeepEquals, []jt.StubCall{{
 		FuncName: "Get",
 	}, {
 		FuncName: "Put",
 		Args:     []interface{}{testToken},
 	}})
-	fg.CheckCalls(c, []testing.StubCall{{
+	c.Assert(fg.Calls(), qt.DeepEquals, []jt.StubCall{{
 		FuncName: "GetToken",
 		Args:     []interface{}{ctx},
 	}})
 }
 
-type formTokenGetterSuite struct {
-	testing.CleanupSuite
-}
+func TestCorrectUserPasswordSentToUSSOServer(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
 
-var _ = gc.Suite(&formTokenGetterSuite{})
-
-func (s *formTokenGetterSuite) TestCorrectUserPasswordSentToUSSOServer(c *gc.C) {
 	ussoStub := &ussoServerStub{}
-	s.PatchValue(ussologin.Server, ussoStub)
+	c.Patch(ussologin.Server, ussoStub)
 	tg := ussologin.FormTokenGetter{
 		Filler: &testFiller{
 			map[string]interface{}{
@@ -144,14 +141,22 @@ func (s *formTokenGetterSuite) TestCorrectUserPasswordSentToUSSOServer(c *gc.C) 
 		Name: "testToken",
 	}
 	_, err := tg.GetToken(context.Background())
-	c.Assert(err, gc.Equals, nil)
-	ussoStub.CheckCall(c, 0, "GetTokenWithOTP", "foobar", "pass", "1234", "testToken")
+	c.Assert(err, qt.Equals, nil)
+	calls := ussoStub.Calls()
+	c.Assert(len(calls) > 0, qt.Equals, true)
+	c.Assert(calls[0], qt.DeepEquals, jt.StubCall{
+		FuncName: "GetTokenWithOTP",
+		Args:     []interface{}{"foobar", "pass", "1234", "testToken"},
+	})
 }
 
-func (s *formTokenGetterSuite) TestLoginFailsToGetToken(c *gc.C) {
+func TestLoginFailsToGetToken(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
+
 	ussoStub := &ussoServerStub{}
 	ussoStub.SetErrors(errgo.New("something failed"))
-	s.PatchValue(ussologin.Server, ussoStub)
+	c.Patch(ussologin.Server, ussoStub)
 	tg := ussologin.FormTokenGetter{
 		Filler: &testFiller{
 			map[string]interface{}{
@@ -162,18 +167,21 @@ func (s *formTokenGetterSuite) TestLoginFailsToGetToken(c *gc.C) {
 		Name: "testToken",
 	}
 	_, err := tg.GetToken(context.Background())
-	c.Assert(err, gc.ErrorMatches, "cannot get token: something failed")
+	c.Assert(err, qt.ErrorMatches, "cannot get token: something failed")
 }
 
-func (s *formTokenGetterSuite) TestFailedToReadLoginParameters(c *gc.C) {
+func TestFailedToReadLoginParameters(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
+
 	ussoStub := &ussoServerStub{}
-	s.PatchValue(ussologin.Server, ussoStub)
+	c.Patch(ussologin.Server, ussoStub)
 	tg := ussologin.FormTokenGetter{
 		Filler: &errFiller{},
 	}
 	_, err := tg.GetToken(context.Background())
-	c.Assert(err, gc.ErrorMatches, "cannot read login parameters: something failed")
-	ussoStub.CheckNoCalls(c)
+	c.Assert(err, qt.ErrorMatches, "cannot read login parameters: something failed")
+	c.Assert(ussoStub.Calls(), qt.HasLen, 0)
 }
 
 type testFiller struct {
@@ -191,7 +199,7 @@ func (t *errFiller) Fill(f form.Form) (map[string]interface{}, error) {
 }
 
 type ussoServerStub struct {
-	testing.Stub
+	jt.Stub
 }
 
 func (u *ussoServerStub) GetTokenWithOTP(email, password, otp, tokenName string) (*usso.SSOData, error) {
@@ -200,7 +208,7 @@ func (u *ussoServerStub) GetTokenWithOTP(email, password, otp, tokenName string)
 }
 
 type testTokenGetter struct {
-	testing.Stub
+	jt.Stub
 	tok *usso.SSOData
 }
 
@@ -210,7 +218,7 @@ func (g *testTokenGetter) GetToken(ctx context.Context) (*usso.SSOData, error) {
 }
 
 type testTokenStore struct {
-	testing.Stub
+	jt.Stub
 	tok *usso.SSOData
 }
 

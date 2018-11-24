@@ -436,8 +436,8 @@ func (s *storageDir) StoragePoolVolumeRename(newName string) error {
 		storagePoolVolumeTypeCustom, s.poolID)
 }
 
-func (s *storageDir) ContainerStorageReady(name string) bool {
-	containerMntPoint := getContainerMountPoint(s.pool.Name, name)
+func (s *storageDir) ContainerStorageReady(container container) bool {
+	containerMntPoint := getContainerMountPoint(s.pool.Name, container.Name())
 	ok, _ := shared.PathIsEmpty(containerMntPoint)
 	return !ok
 }
@@ -715,7 +715,7 @@ func (s *storageDir) ContainerMount(c container) (bool, error) {
 	return s.StoragePoolMount()
 }
 
-func (s *storageDir) ContainerUmount(name string, path string) (bool, error) {
+func (s *storageDir) ContainerUmount(c container, path string) (bool, error) {
 	return true, nil
 }
 
@@ -802,7 +802,7 @@ func (s *storageDir) ContainerRestore(container container, sourceContainer conta
 }
 
 func (s *storageDir) ContainerGetUsage(container container) (int64, error) {
-	return -1, fmt.Errorf("the directory container backend doesn't support quotas")
+	return -1, fmt.Errorf("The directory container backend doesn't support quotas")
 }
 
 func (s *storageDir) ContainerSnapshotCreate(snapshotContainer container, sourceContainer container) error {
@@ -1041,12 +1041,14 @@ func (s *storageDir) MigrationSource(container container, containerOnly bool) (M
 	return rsyncMigrationSource(container, containerOnly)
 }
 
-func (s *storageDir) MigrationSink(live bool, container container, snapshots []*migration.Snapshot, conn *websocket.Conn, srcIdmap *idmap.IdmapSet, op *operation, containerOnly bool) error {
-	return rsyncMigrationSink(live, container, snapshots, conn, srcIdmap, op, containerOnly)
+func (s *storageDir) MigrationSink(live bool, container container, snapshots []*migration.Snapshot, conn *websocket.Conn, srcIdmap *idmap.IdmapSet, op *operation, containerOnly bool, args MigrationSinkArgs) error {
+	return rsyncMigrationSink(live, container, snapshots, conn, srcIdmap, op, containerOnly, args)
 }
 
 func (s *storageDir) StorageEntitySetQuota(volumeType int, size int64, data interface{}) error {
-	return fmt.Errorf("the directory container backend doesn't support quotas")
+	logger.Warnf("Skipping setting disk quota for '%s' as DIR backend doesn't support them", s.volume.Name)
+
+	return nil
 }
 
 func (s *storageDir) StoragePoolResources() (*api.ResourcesStoragePool, error) {
@@ -1106,8 +1108,8 @@ func (s *storageDir) StorageMigrationSource() (MigrationStorageSourceDriver, err
 	return rsyncStorageMigrationSource()
 }
 
-func (s *storageDir) StorageMigrationSink(conn *websocket.Conn, op *operation, storage storage) error {
-	return rsyncStorageMigrationSink(conn, op, storage)
+func (s *storageDir) StorageMigrationSink(conn *websocket.Conn, op *operation, storage storage, args MigrationSinkArgs) error {
+	return rsyncStorageMigrationSink(conn, op, storage, args)
 }
 
 func (s *storageDir) GetStoragePool() *api.StoragePool {

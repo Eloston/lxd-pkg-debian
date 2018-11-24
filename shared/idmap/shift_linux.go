@@ -153,6 +153,7 @@ int shiftowner(char *basepath, char *path, int uid, int gid)
 	return 0;
 }
 */
+// #cgo CFLAGS: -std=gnu11 -Wvla
 import "C"
 
 // ShiftOwner updates uid and gid for a file when entering/exiting a namespace
@@ -298,7 +299,7 @@ func shiftAclType(path string, aclType _Ctype_acl_type_t, shiftIds func(uid int6
 	return nil
 }
 
-func supportsV3Fcaps(prefix string) bool {
+func SupportsVFS3Fscaps(prefix string) bool {
 	tmpfile, err := ioutil.TempFile(prefix, ".lxd_fcaps_v3_")
 	if err != nil {
 		return false

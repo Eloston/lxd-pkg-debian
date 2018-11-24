@@ -16,7 +16,7 @@ ifeq ($(TAG_SQLITE3),)
 endif
 
 	go get -t -v -d ./...
-	go install -v -tags "$(TAG_SQLITE3)" $(DEBUG) ./...
+	CC=$(CC) go install -v -tags "$(TAG_SQLITE3)" $(DEBUG) ./...
 	@echo "LXD built successfully"
 
 .PHONY: client
@@ -24,6 +24,11 @@ client:
 	go get -t -v -d ./...
 	go install -v -tags "$(TAG_SQLITE3)" $(DEBUG) ./lxc
 	@echo "LXD client built successfully"
+
+.PHONY: lxd-p2c
+lxd-p2c:
+	CGO_ENABLED=0 go install -v -tags netgo ./lxd-p2c
+	@echo "LXD-P2C built successfully"
 
 .PHONY: deps
 deps:
@@ -52,7 +57,7 @@ deps:
 	cd "$(GOPATH)/deps/dqlite" && \
 		autoreconf -i && \
 		PKG_CONFIG_PATH="$(GOPATH)/deps/sqlite/" ./configure && \
-		make CFLAGS="-I$(GOPATH)/deps/sqlite/"
+		make CFLAGS="-I$(GOPATH)/deps/sqlite/" LDFLAGS="-L$(GOPATH)/deps/sqlite/.libs/"
 
 	# environment
 	@echo ""
@@ -83,7 +88,7 @@ ifeq ($(TAG_SQLITE3),)
 endif
 
 	go get -t -v -d ./...
-	go install -v -tags "$(TAG_SQLITE3) logdebug" $(DEBUG) ./...
+	CC=$(CC) go install -v -tags "$(TAG_SQLITE3) logdebug" $(DEBUG) ./...
 	@echo "LXD built successfully"
 
 .PHONY: check

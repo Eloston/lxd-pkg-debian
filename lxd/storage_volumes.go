@@ -70,6 +70,12 @@ func storagePoolVolumesGet(d *Daemon, r *http.Request) Response {
 			return InternalError(err)
 		}
 
+		if apiEndpoint == storagePoolVolumeAPIEndpointContainers {
+			apiEndpoint = "container"
+		} else if apiEndpoint == storagePoolVolumeAPIEndpointImages {
+			apiEndpoint = "image"
+		}
+
 		if !recursion {
 			resultString = append(resultString, fmt.Sprintf("/%s/storage-pools/%s/volumes/%s/%s", version.APIVersion, poolName, apiEndpoint, volume.Name))
 		} else {
@@ -132,6 +138,13 @@ func storagePoolVolumesTypeGet(d *Daemon, r *http.Request) Response {
 			if err != nil {
 				return InternalError(err)
 			}
+
+			if apiEndpoint == storagePoolVolumeAPIEndpointContainers {
+				apiEndpoint = "container"
+			} else if apiEndpoint == storagePoolVolumeAPIEndpointImages {
+				apiEndpoint = "image"
+			}
+
 			resultString = append(resultString, fmt.Sprintf("/%s/storage-pools/%s/volumes/%s/%s", version.APIVersion, poolName, apiEndpoint, volume))
 		} else {
 			_, vol, err := d.cluster.StoragePoolNodeVolumeGetType(volume, volumeType, poolID)
@@ -485,10 +498,12 @@ func storagePoolVolumeTypePost(d *Daemon, r *http.Request) Response {
 	// Check that the name isn't already in use.
 	_, err = d.cluster.StoragePoolNodeVolumeGetTypeID(req.Name,
 		storagePoolVolumeTypeCustom, poolID)
-	if err == nil {
+	if err != db.ErrNoSuchObject {
+		if err != nil {
+			return InternalError(err)
+		}
+
 		return Conflict(fmt.Errorf("Name '%s' already in use", req.Name))
-	} else if err != nil && err != db.ErrNoSuchObject {
-		return Conflict(err)
 	}
 
 	doWork := func() error {

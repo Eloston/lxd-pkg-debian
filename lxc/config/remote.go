@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io/ioutil"
 	"strings"
@@ -16,6 +18,7 @@ type Remote struct {
 	Protocol string `yaml:"protocol,omitempty"`
 	AuthType string `yaml:"auth_type,omitempty"`
 	Static   bool   `yaml:"-"`
+	Project  string `yaml:"project,omitempty"`
 }
 
 // ParseRemote splits remote and object
@@ -64,17 +67,33 @@ func (c *Config) GetContainerServer(name string) (lxd.ContainerServer, error) {
 			return nil, err
 		}
 
+		if remote.Project != "" && remote.Project != "default" {
+			d = d.UseProject(remote.Project)
+		}
+
+		if c.ProjectOverride != "" {
+			d = d.UseProject(c.ProjectOverride)
+		}
+
 		return d, nil
 	}
 
 	// HTTPs
-	if args.TLSClientCert == "" || args.TLSClientKey == "" {
+	if remote.AuthType != "candid" && (args.TLSClientCert == "" || args.TLSClientKey == "") {
 		return nil, fmt.Errorf("Missing TLS client certificate and key")
 	}
 
 	d, err := lxd.ConnectLXD(remote.Addr, args)
 	if err != nil {
 		return nil, err
+	}
+
+	if remote.Project != "" && remote.Project != "default" {
+		d = d.UseProject(remote.Project)
+	}
+
+	if c.ProjectOverride != "" {
+		d = d.UseProject(c.ProjectOverride)
 	}
 
 	return d, nil
@@ -99,6 +118,14 @@ func (c *Config) GetImageServer(name string) (lxd.ImageServer, error) {
 		d, err := lxd.ConnectLXDUnix(strings.TrimPrefix(strings.TrimPrefix(remote.Addr, "unix:"), "//"), args)
 		if err != nil {
 			return nil, err
+		}
+
+		if remote.Project != "" && remote.Project != "default" {
+			d = d.UseProject(remote.Project)
+		}
+
+		if c.ProjectOverride != "" {
+			d = d.UseProject(c.ProjectOverride)
 		}
 
 		return d, nil
@@ -130,6 +157,14 @@ func (c *Config) GetImageServer(name string) (lxd.ImageServer, error) {
 		return nil, err
 	}
 
+	if remote.Project != "" && remote.Project != "default" {
+		d = d.UseProject(remote.Project)
+	}
+
+	if c.ProjectOverride != "" {
+		d = d.UseProject(c.ProjectOverride)
+	}
+
 	return d, nil
 }
 
@@ -145,6 +180,26 @@ func (c *Config) getConnectionArgs(name string) (*lxd.ConnectionArgs, error) {
 		args.CookieJar = c.cookiejar
 	}
 
+	// Stop here if no TLS involved
+	if strings.HasPrefix(remote.Addr, "unix:") {
+		return &args, nil
+	}
+
+	// Server certificate
+	if shared.PathExists(c.ServerCertPath(name)) {
+		content, err := ioutil.ReadFile(c.ServerCertPath(name))
+		if err != nil {
+			return nil, err
+		}
+
+		args.TLSServerCert = string(content)
+	}
+
+	// Stop here if no client certificate involved
+	if remote.Protocol == "simplestreams" || remote.AuthType == "candid" {
+		return &args, nil
+	}
+
 	// Client certificate
 	if shared.PathExists(c.ConfigPath("client.crt")) {
 		content, err := ioutil.ReadFile(c.ConfigPath("client.crt"))
@@ -153,16 +208,6 @@ func (c *Config) getConnectionArgs(name string) (*lxd.ConnectionArgs, error) {
 		}
 
 		args.TLSClientCert = string(content)
-	}
-
-	// Client key
-	if shared.PathExists(c.ConfigPath("client.key")) {
-		content, err := ioutil.ReadFile(c.ConfigPath("client.key"))
-		if err != nil {
-			return nil, err
-		}
-
-		args.TLSClientKey = string(content)
 	}
 
 	// Client CA
@@ -175,14 +220,33 @@ func (c *Config) getConnectionArgs(name string) (*lxd.ConnectionArgs, error) {
 		args.TLSCA = string(content)
 	}
 
-	// Server certificate
-	if shared.PathExists(c.ServerCertPath(name)) {
-		content, err := ioutil.ReadFile(c.ServerCertPath(name))
+	// Client key
+	if shared.PathExists(c.ConfigPath("client.key")) {
+		content, err := ioutil.ReadFile(c.ConfigPath("client.key"))
 		if err != nil {
 			return nil, err
 		}
 
-		args.TLSServerCert = string(content)
+		pemKey, _ := pem.Decode(content)
+		if x509.IsEncryptedPEMBlock(pemKey) {
+			if c.PromptPassword == nil {
+				return nil, fmt.Errorf("Private key is password protected and no helper was configured")
+			}
+
+			password, err := c.PromptPassword("client.crt")
+			if err != nil {
+				return nil, err
+			}
+
+			derKey, err := x509.DecryptPEMBlock(pemKey, []byte(password))
+			if err != nil {
+				return nil, err
+			}
+
+			content = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: derKey})
+		}
+
+		args.TLSClientKey = string(content)
 	}
 
 	return &args, nil

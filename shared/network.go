@@ -9,10 +9,13 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
 
+	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
 )
 
@@ -46,7 +49,6 @@ func RFC3493Dialer(network, address string) (net.Conn, error) {
 func InitTLSConfig() *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
-		MaxVersion: tls.VersionTLS12,
 		CipherSuites: []uint16{
 			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 			tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
@@ -66,7 +68,10 @@ func finalizeTLSConfig(tlsConfig *tls.Config, tlsRemoteCert *x509.Certificate) {
 	if tlsRemoteCert != nil {
 		caCertPool := tlsConfig.RootCAs
 		if caCertPool == nil {
-			caCertPool = x509.NewCertPool()
+			caCertPool, _ = x509.SystemCertPool()
+			if caCertPool == nil {
+				caCertPool = x509.NewCertPool()
+			}
 		}
 
 		// Make it a valid RootCA
@@ -442,4 +447,52 @@ func AllocatePort() (int, error) {
 	}
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+func NetworkGetCounters(ifName string) api.NetworkStateCounters {
+	counters := api.NetworkStateCounters{}
+	// Get counters
+	content, err := ioutil.ReadFile("/proc/net/dev")
+	if err == nil {
+		for _, line := range strings.Split(string(content), "\n") {
+			fields := strings.Fields(line)
+
+			if len(fields) != 17 {
+				continue
+			}
+
+			intName := strings.TrimSuffix(fields[0], ":")
+			if intName != ifName {
+				continue
+			}
+
+			rxBytes, err := strconv.ParseInt(fields[1], 10, 64)
+			if err != nil {
+				continue
+			}
+
+			rxPackets, err := strconv.ParseInt(fields[2], 10, 64)
+			if err != nil {
+				continue
+			}
+
+			txBytes, err := strconv.ParseInt(fields[9], 10, 64)
+			if err != nil {
+				continue
+			}
+
+			txPackets, err := strconv.ParseInt(fields[10], 10, 64)
+			if err != nil {
+				continue
+			}
+
+			counters.BytesSent = txBytes
+			counters.BytesReceived = rxBytes
+			counters.PacketsSent = txPackets
+			counters.PacketsReceived = rxPackets
+			break
+		}
+	}
+
+	return counters
 }

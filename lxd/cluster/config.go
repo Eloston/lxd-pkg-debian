@@ -70,6 +70,21 @@ func (c *Config) CandidEndpoint() string {
 	return c.m.GetString("candid.api.url")
 }
 
+// CandidEndpointKey returns the public key for the API endpoint
+func (c *Config) CandidEndpointKey() string {
+	return c.m.GetString("candid.api.key")
+}
+
+// CandidExpiry returns the cookie expiry of the macaroon.
+func (c *Config) CandidExpiry() int64 {
+	return c.m.GetInt64("candid.expiry")
+}
+
+// CandidDomains returns the valid domains.
+func (c *Config) CandidDomains() string {
+	return c.m.GetString("candid.domains")
+}
+
 // AutoUpdateInterval returns the configured images auto update interval.
 func (c *Config) AutoUpdateInterval() time.Duration {
 	n := c.m.GetInt64("images.auto_update_interval")
@@ -210,7 +225,10 @@ var ConfigSchema = config.Schema{
 	"core.proxy_https":               {},
 	"core.proxy_ignore_hosts":        {},
 	"core.trust_password":            {Hidden: true, Setter: passwordSetter},
+	"candid.api.key":                 {},
 	"candid.api.url":                 {},
+	"candid.domains":                 {},
+	"candid.expiry":                  {Type: config.Int64, Default: "3600"},
 	"images.auto_update_cached":      {Type: config.Bool, Default: "true"},
 	"images.auto_update_interval":    {Type: config.Int64, Default: "6"},
 	"images.compression_algorithm":   {Default: "gzip", Validator: validateCompression},

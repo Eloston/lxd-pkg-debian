@@ -335,7 +335,7 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 
 	idmaps := make([]*migration.IDMapType, 0)
 
-	idmapset, err := s.container.IdmapSet()
+	idmapset, err := s.container.LastIdmapSet()
 	if err != nil {
 		return err
 	}
@@ -378,6 +378,7 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 	// The protocol says we have to send a header no matter what, so let's
 	// do that, but then immediately send an error.
 	myType := s.container.Storage().MigrationType()
+	rsyncHasFeature := true
 	header := migration.MigrationHeader{
 		Fs:            &myType,
 		Criu:          criuType,
@@ -385,6 +386,11 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 		SnapshotNames: snapshotNames,
 		Snapshots:     snapshots,
 		Predump:       proto.Bool(use_pre_dumps),
+		RsyncFeatures: &migration.RsyncFeatures{
+			Xattrs:   &rsyncHasFeature,
+			Delete:   &rsyncHasFeature,
+			Compress: &rsyncHasFeature,
+		},
 	}
 
 	err = s.send(&header)
@@ -771,6 +777,20 @@ func (c *migrationSink) Do(migrateOp *operation) error {
 		return err
 	}
 
+	// Handle rsync options
+	c.rsyncArgs = []string{}
+	rsyncFeatures := header.GetRsyncFeatures()
+	if rsyncFeatures.GetXattrs() {
+		c.rsyncArgs = append(c.rsyncArgs, "--xattrs")
+	}
+	if rsyncFeatures.GetDelete() {
+		c.rsyncArgs = append(c.rsyncArgs, "--delete")
+	}
+	if rsyncFeatures.GetCompress() {
+		c.rsyncArgs = append(c.rsyncArgs, "--compress")
+		c.rsyncArgs = append(c.rsyncArgs, "--compress-level=2")
+	}
+
 	live := c.src.live
 	if c.push {
 		live = c.dest.live
@@ -869,9 +889,13 @@ func (c *migrationSink) Do(migrateOp *operation) error {
 				sendFinalFsDelta = true
 			}
 
+			args := MigrationSinkArgs{
+				RsyncArgs: c.rsyncArgs,
+			}
+
 			err = mySink(sendFinalFsDelta, c.src.container,
 				snapshots, fsConn, srcIdmap, migrateOp,
-				c.src.containerOnly)
+				c.src.containerOnly, args)
 			if err != nil {
 				fsTransfer <- err
 				return
@@ -911,7 +935,7 @@ func (c *migrationSink) Do(migrateOp *operation) error {
 				for !sync.GetFinalPreDump() {
 					logger.Debugf("About to receive rsync")
 					// Transfer a CRIU pre-dump
-					err = RsyncRecv(shared.AddSlash(imagesDir), criuConn, nil)
+					err = RsyncRecv(shared.AddSlash(imagesDir), criuConn, nil, c.rsyncArgs)
 					if err != nil {
 						restore <- err
 						return
@@ -939,7 +963,7 @@ func (c *migrationSink) Do(migrateOp *operation) error {
 			}
 
 			// Final CRIU dump
-			err = RsyncRecv(shared.AddSlash(imagesDir), criuConn, nil)
+			err = RsyncRecv(shared.AddSlash(imagesDir), criuConn, nil, c.rsyncArgs)
 			if err != nil {
 				restore <- err
 				return

@@ -1,8 +1,205 @@
-lxd (3.0.2-0ubuntu1~18.04.1~bpo9+1) stretch-backports; urgency=medium
+lxd (3.0.3-0ubuntu1~18.04.1~bpo9+1) stretch-backports; urgency=medium
 
   * Rebuild for stretch-backports.
 
- -- Eloston <eloston@programmer.net>  Tue, 11 Sep 2018 22:56:43 +0000
+ -- Eloston <eloston@programmer.net>  Sat, 24 Nov 2018 06:11:24 +0000
+
+lxd (3.0.3-0ubuntu1~18.04.1) bionic; urgency=medium
+
+  * New upstream bugfix release (LP: #1804876)
+    - doc: add note about ignoring mount options
+    - shared/idmap: test fcaps support
+    - Add a few missing rows.Close() calls
+    - lxd/patches: Profiles are in the cluster db
+    - lxd/storage/ceph: Only freeze container if running
+    - lxc: Only target if --target is passed
+    - shared: Return decompressor in DetectCompression
+    - lxd/containers: Don't return nil on Storage calls
+    - tests: Fix mode of proxy.sh
+    - shared/api: Don't re-define fields
+    - lxd/storage/btrfs: Fix clearing quotas
+    - lxd/containers: Also use apply_quota for CEPH
+    - lxd/containers: Simplify and fix pool update logic
+    - Add NodeIsOutdated() db API to check is a node is outdated
+    - Trigger whatever is in the LXD_CLUSTER_UPDATE var is node is outdated
+    - lxd/images: Add missing cleanup code
+    - lxd/containers: Fix bad function name
+    - tests: Avoid err == nil pattern
+    - lxd: Don't mask database errors
+    - Honor the CC environment variable when invoking go install
+    - client: Avoid err == nil pattern
+    - lxd/profiles: Don't list snapshots in UsedBy
+    - Make database queries timeout after 10s if cluster db is unavail
+    - tests: Fix pki with newer easyrsa
+    - lxd/db: Fix internal DB test
+    - doc: Fix and improve the description
+    - operations: return true if operation is done before timeout
+    - lxd/containers: Avoid root device name conflict
+    - lxd/import: Add root disk if needed
+    - global: Advertise rsync features
+    - lxd/db: Use NoSuchObject consistently
+    - proxy: Only log errors
+    - lxd/import: Don't delete container on import failure
+    - i18n: Update translation templates
+    - Support --domain flag for lxc remote
+    - Add configurable macaroon expiry
+    - Support Candid domain validation
+    - Update Candid docs
+    - Update i18n
+    - lxd: Rename API endpoints
+    - network_linux: add netns_getifaddrs()
+    - main_checkfeature: check kernel for netnsid support
+    - network: add NetworkGetCounters()
+    - container_lxc: switch to NetnsGetifaddrs()
+    - shared: Add network state API
+    - api: Add extended cluster join API
+    - lxd/init: Fix struct conflict
+    - lxc: Identify snapshots when listed
+    - shared/version: Support detecting ChromeOS versions
+    - lxd/containers: Force bring up of SRIOV parent
+    - netns_getifaddrs: fix argument passing
+    - netnsid_getifaddrs: fix check for netnsid support
+    - doc: Fix storage API endpoints
+    - container_lxc: handle network retrieval smarter
+    - shared: Add storage volume snapshot support
+    - client: Add storage volume snapshot support
+    - netns_getifaddrs: don't print useless info
+    - shared/api: Fix StorageVolumeSource struct
+    - Makefile: Set LDFLAGS for dqlite
+    - lxd: Fix handling of CGroup-V2 systems
+    - tree-wide: pass -std=gnu11 -Wvla
+    - lxd/containers: Rework exec FD handling
+    - Added optional ?target=<member> to /containers POST documentation
+    - lxd/storage/lvm: Don't un-necessarily start/stop storage
+    - lxd/storage/ceph: Don't un-necessarily mount snapshots
+    - lxd/containers: Fix cleanup on create failure
+    - shared/network: Don't crash on VPN devices
+    - lxd/containers: Fix bad nvidia information parsing
+    - netns_getifaddrs: fix network stats retrieval
+    - network: Fix counters on non-ethernet interfaces
+    - doc: Add configuration for readthedocs
+    - storage: Fix error strings
+    - lxd/storage/btrfs: Don't fail deleting pools on misisng disk
+    - Split code in 2 seperate files
+    - network: provide #ifdefs for RTM_* requests
+    - Document LVM support for storage quotas
+    - candid: Cleanup code a bit
+    - network: fix netns_get_nsid() signature
+    - apparmor: Allow cgroupv2 in cgns
+    - candid: Fix client when using https candid server
+    - lxd-p2c: Fix static build
+    - config: Add support for PEM encrypted keys
+    - lxc: Setup password helper
+    - lxc/config: Only setup needed connection args
+    - lxc/config: More TLS optimizations
+    - i18n: Update translation templates
+    - macro: add SOL_NETLINK
+    - macro: add NETLINK_DUMP_STRICT_CHK
+    - netns_ifaddrs: check for NETLINK_DUMP_STRICT_CHK
+    - Fix Potential Event Race
+    - devices: Fix bad disk limits
+    - Fix root disk limits on container startup
+    - checkfeature: Rework structure
+    - checkfeature: simplify is_netnsid_aware() check
+    - checkfeature: Avoid double line break
+    - checkfeature: dial logging down from to debug
+    - lxc/progress: Add terminal detection
+    - doc: Rework backup documentation
+    - client: Add GetNetworkState
+    - client: Add extended cluster join API
+    - client: Add UseProject
+    - shared/api: Add projects
+    - client: Add support for projects
+    - lxc/config: Add support for projects
+    - Change query.SelectObjects signature to support a prepared statement
+    - Add query.SelectURIs convenience for getting API resource URIs
+    - Add cluster statements registry
+    - api: Add Project.Config reference
+    - Improve some error messages around container creation
+    - Lookup for the "target" API parameter only in the URL query string
+    - Automatically add ?project=x query param to image server
+    - Improve error reporting when creating a container
+    - Change ContainerStorageRead() to take a container object
+    - Improve error messages around LVM volume creation
+    - Change Storage.ContainerUmount to accept a container vs a container name
+    - lxd/init: Update for current client package
+    - lxc/progress: Don't print empty lines
+    - candid: Improve domain validation and pubkey
+    - lxd/images: Fix parsing of public property
+    - client: Always use the "do()" wrapper
+    - client: Fix URLs with missing project/target
+    - Improve error messages
+    - lxd/containers: Fix cluster shutdown
+    - i18n: Update Japanese translation
+    - idmap: use global variable for vfs3 fcaps support
+    - checkfeature: check for vfs3 fscaps support
+    - lxd/db: Fix bad limits.cpu
+    - shared: Add limits.cpu validator
+    - doc: add the appropriate titles to some documents
+    - shared/network: Allow TLS1.3
+    - global: Implement LXD_INSECURE_TLS env variable
+    - netns_getifaddrs: simplify
+    - Fix bad check for recursive mounts
+    - Prevent event listeners from lying around even after Disconnect()
+    - client: Support creating project-bound container using remote image
+    - client: Filter lifecycle and operations events by project
+    - client: Make container backups code honor projects
+    - client: Make GET /profiles return only profiles for the project
+    - Bump Go versions and use '.x' to always get latest patch versions
+    - Update build instruction
+    - doc: Bump to 1.10 or higher everywhere
+    - Don't expire lxd.log by accident
+    - lxd/storage: Fix importing preseed dump
+    - lxd/migration: Use current idmap instead of next
+    - lxd/db: Send raft/dqlite logging to debug
+    - lxd/daemon: Clarify early loggging
+    - checkfeature: Don't log error on missing feature
+    - lxd/daemon: Improve logging of inherited fds
+    - shared/logging: Improve logfile output
+    - lxd/daemon: Don't mention MAAS unless configured
+    - exec: Expose command, env and mode in metadata
+    - client: Fix cancelation of image download
+    - Detect and shrink large boltdb files
+    - lxd/daemon: Fix build
+    - loop: retry on EBUSY
+    - lxd/storage: Improve loop device errors
+    - lxd/containers: Detect root disk pool changes
+    - doc: Update cloud-init network documentation
+    - client: Fix error handling in operations
+    - lxd/containers: Prevent duplicate profiles
+    - lxc/copy: --container-only is meaningless for snapshots
+    - shared/api: Add support for incremental container copy
+    - client: Add support for incremental container copy
+    - doc: Add kernel.keys.maxkeys to production-setup
+    - lxd/storage/dir: Don't fail when quota are set
+    - lxd: Handle AppArmor policy cache directory
+    - test: Support AppArmor policy cache directory
+    - lxd/containers: Respect optional=true for disks
+    - use empty usb vendorid to pass through all usb devices
+    - doc: Add usb_optional_vendorid API extension
+    - lxc/image: Fix rootfs file handling on snap
+    - lxd/containers: Properly clear static leases
+    - shared/api: Support copy between projects
+    - client: Support copy between projects
+    - lxc/config: Allow overriding the current project
+    - rsync: Tweak transfer options (delete & compress)
+    - lxd/daemon: Improve logging of kernel features
+    - lxd: Register background tasks as operations
+    - lxc: Switch all progress op handling to cancelable
+    - Increase go-dqlite client timeout when not-clustered
+    - lxd: Rework task handling
+    - lxd/migration: Fix CRIU rsync option negotiation
+    - lxd/storage/btrfs: Tweak errors
+    - lxd/init: Better handle disk sizes
+    - lxd/db: Avoid un-needed query on container move
+    - i18n: Update translation templates
+    - Add StorageVolumeIsAvailable to check if a Ceph volume can be attached
+    - Wire StorageVolumeIsAvailable to containerValidDevices
+    - Add integration test
+
+  * Bump standards to 4.2.1
+
+ -- Stéphane Graber <stgraber@ubuntu.com>  Fri, 23 Nov 2018 13:58:51 -0500
 
 lxd (3.0.2-0ubuntu1~18.04.1) bionic; urgency=medium
 

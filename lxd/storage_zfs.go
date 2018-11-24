@@ -160,8 +160,9 @@ func (s *storageZfs) zfsPoolCreate() error {
 
 	zpoolName := s.getOnDiskPoolName()
 	vdev := s.pool.Config["source"]
-	if vdev == "" {
-		vdev = filepath.Join(shared.VarPath("disks"), fmt.Sprintf("%s.img", s.pool.Name))
+	defaultVdev := filepath.Join(shared.VarPath("disks"), fmt.Sprintf("%s.img", s.pool.Name))
+	if vdev == "" || vdev == defaultVdev {
+		vdev = defaultVdev
 		s.pool.Config["source"] = vdev
 
 		if s.pool.Config["zfs.pool_name"] == "" {
@@ -198,7 +199,7 @@ func (s *storageZfs) zfsPoolCreate() error {
 
 		if filepath.IsAbs(vdev) {
 			if !shared.IsBlockdevPath(vdev) {
-				return fmt.Errorf("custom loop file locations are not supported")
+				return fmt.Errorf("Custom loop file locations are not supported")
 			}
 
 			if s.pool.Config["zfs.pool_name"] == "" {
@@ -218,9 +219,10 @@ func (s *storageZfs) zfsPoolCreate() error {
 				return err
 			}
 		} else {
-			if s.pool.Config["zfs.pool_name"] != "" {
-				return fmt.Errorf("invalid combination of \"source\" and \"zfs.pool_name\" property")
+			if s.pool.Config["zfs.pool_name"] != "" && s.pool.Config["zfs.pool_name"] != vdev {
+				return fmt.Errorf("Invalid combination of \"source\" and \"zfs.pool_name\" property")
 			}
+
 			s.pool.Config["zfs.pool_name"] = vdev
 			s.dataset = vdev
 
@@ -694,8 +696,9 @@ func (s *storageZfs) ContainerMount(c container) (bool, error) {
 	return s.doContainerMount(c.Name(), c.IsPrivileged())
 }
 
-func (s *storageZfs) ContainerUmount(name string, path string) (bool, error) {
+func (s *storageZfs) ContainerUmount(c container, path string) (bool, error) {
 	logger.Debugf("Unmounting ZFS storage volume for container \"%s\" on storage pool \"%s\"", s.volume.Name, s.pool.Name)
+	name := c.Name()
 
 	fs := fmt.Sprintf("containers/%s", name)
 	containerPoolVolumeMntPoint := getContainerMountPoint(s.pool.Name, name)
@@ -738,8 +741,8 @@ func (s *storageZfs) ContainerUmount(name string, path string) (bool, error) {
 }
 
 // Things we do have to care about
-func (s *storageZfs) ContainerStorageReady(name string) bool {
-	fs := fmt.Sprintf("containers/%s", name)
+func (s *storageZfs) ContainerStorageReady(container container) bool {
+	fs := fmt.Sprintf("containers/%s", container.Name())
 	return zfsFilesystemEntityExists(s.getOnDiskPoolName(), fs)
 }
 
@@ -755,7 +758,7 @@ func (s *storageZfs) ContainerCreate(container container) error {
 		return err
 	}
 	if ourMount {
-		defer s.ContainerUmount(container.Name(), container.Path())
+		defer s.ContainerUmount(container, container.Path())
 	}
 
 	err = container.TemplateApply("create")
@@ -823,7 +826,7 @@ func (s *storageZfs) ContainerCreateFromImage(container container, fingerprint s
 		return err
 	}
 	if ourMount {
-		defer s.ContainerUmount(containerName, containerPath)
+		defer s.ContainerUmount(container, containerPath)
 	}
 
 	privileged := container.IsPrivileged()
@@ -937,7 +940,7 @@ func (s *storageZfs) copyWithoutSnapshotsSparse(target container, source contain
 			return err
 		}
 		if ourMount {
-			defer s.ContainerUmount(targetContainerName, targetContainerPath)
+			defer s.ContainerUmount(target, targetContainerPath)
 		}
 
 		err = createContainerMountpoint(targetContainerMountPoint, targetContainerPath, target.IsPrivileged())
@@ -1068,7 +1071,7 @@ func (s *storageZfs) copyWithoutSnapshotFull(target container, source container)
 		return err
 	}
 	if ourMount {
-		defer s.ContainerUmount(targetName, targetContainerMountPoint)
+		defer s.ContainerUmount(target, targetContainerMountPoint)
 	}
 
 	err = createContainerMountpoint(targetContainerMountPoint, target.Path(), target.IsPrivileged())
@@ -1262,7 +1265,7 @@ func (s *storageZfs) ContainerRename(container container, newName string) error 
 	oldName := container.Name()
 
 	// Unmount the dataset.
-	_, err := s.ContainerUmount(oldName, "")
+	_, err := s.ContainerUmount(container, "")
 	if err != nil {
 		return err
 	}
@@ -1290,7 +1293,8 @@ func (s *storageZfs) ContainerRename(container container, newName string) error 
 	}
 
 	// Unmount the dataset.
-	_, err = s.ContainerUmount(newName, "")
+	container.(*containerLXC).name = newName
+	_, err = s.ContainerUmount(container, "")
 	if err != nil {
 		return err
 	}
@@ -2057,7 +2061,7 @@ func (s *storageZfs) MigrationSource(ct container, containerOnly bool) (Migratio
 	return &driver, nil
 }
 
-func (s *storageZfs) MigrationSink(live bool, container container, snapshots []*migration.Snapshot, conn *websocket.Conn, srcIdmap *idmap.IdmapSet, op *operation, containerOnly bool) error {
+func (s *storageZfs) MigrationSink(live bool, container container, snapshots []*migration.Snapshot, conn *websocket.Conn, srcIdmap *idmap.IdmapSet, op *operation, containerOnly bool, args MigrationSinkArgs) error {
 	poolName := s.getOnDiskPoolName()
 	zfsRecv := func(zfsName string, writeWrapper func(io.WriteCloser) io.WriteCloser) error {
 		zfsFsName := fmt.Sprintf("%s/%s", poolName, zfsName)
@@ -2407,8 +2411,8 @@ func (s *storageZfs) StorageMigrationSource() (MigrationStorageSourceDriver, err
 	return rsyncStorageMigrationSource()
 }
 
-func (s *storageZfs) StorageMigrationSink(conn *websocket.Conn, op *operation, storage storage) error {
-	return rsyncStorageMigrationSink(conn, op, storage)
+func (s *storageZfs) StorageMigrationSink(conn *websocket.Conn, op *operation, storage storage, args MigrationSinkArgs) error {
+	return rsyncStorageMigrationSink(conn, op, storage, args)
 }
 
 func (s *storageZfs) GetStoragePool() *api.StoragePool {

@@ -6,12 +6,11 @@ package ussologin_test
 import (
 	"net/http"
 	"net/http/httptest"
+	"testing"
 
-	"github.com/juju/testing"
-	jc "github.com/juju/testing/checkers"
+	qt "github.com/frankban/quicktest"
 	"github.com/juju/usso"
 	"golang.org/x/net/context"
-	gc "gopkg.in/check.v1"
 	errgo "gopkg.in/errgo.v1"
 	"gopkg.in/httprequest.v1"
 	"gopkg.in/macaroon-bakery.v2/httpbakery"
@@ -19,42 +18,48 @@ import (
 	"gopkg.in/CanonicalLtd/candidclient.v1/ussologin"
 )
 
-type interactorSuite struct {
-	testing.CleanupSuite
-}
+func TestKind(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
 
-var _ = gc.Suite(&interactorSuite{})
-
-func (s *interactorSuite) TestKind(c *gc.C) {
 	i := ussologin.NewInteractor(nil)
-	c.Assert(i.Kind(), gc.Equals, "usso_oauth")
+	c.Assert(i.Kind(), qt.Equals, "usso_oauth")
 }
 
-func (s *interactorSuite) TestInteractNotSupportedError(c *gc.C) {
+func TestInteractNotSupportedError(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
+
 	i := ussologin.NewInteractor(nil)
 	req, err := http.NewRequest("GET", "", nil)
-	c.Assert(err, gc.Equals, nil)
+	c.Assert(err, qt.Equals, nil)
 	ierr := httpbakery.NewInteractionRequiredError(nil, req)
 	httpbakery.SetLegacyInteraction(ierr, "", "")
 	_, err = i.Interact(context.Background(), nil, "", ierr)
-	c.Assert(errgo.Cause(err), gc.Equals, httpbakery.ErrInteractionMethodNotFound)
+	c.Assert(errgo.Cause(err), qt.Equals, httpbakery.ErrInteractionMethodNotFound)
 }
 
-func (s *interactorSuite) TestInteractGetTokenError(c *gc.C) {
+func TestInteractGetTokenError(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
+
 	terr := errgo.New("test error")
 	i := ussologin.NewInteractor(tokenGetterFunc(func(_ context.Context) (*usso.SSOData, error) {
 		return nil, terr
 	}))
-	ierr := s.interactionRequiredError(c, "")
+	ierr := interactionRequiredError(c, "")
 	_, err := i.Interact(context.Background(), nil, "", ierr)
-	c.Assert(errgo.Cause(err), gc.Equals, terr)
+	c.Assert(errgo.Cause(err), qt.Equals, terr)
 }
 
-func (s *interactorSuite) TestAuthenticatedRequest(c *gc.C) {
+func TestAuthenticatedRequest(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		// Just check the request has a correct looking
 		// Authorization header, we won't check the signature.
-		c.Check(req.Header.Get("Authorization"), gc.Matches, "OAuth .*")
+		c.Check(req.Header.Get("Authorization"), qt.Matches, "OAuth .*")
 		httprequest.WriteJSON(w, http.StatusOK, ussologin.LoginResponse{
 			DischargeToken: &httpbakery.DischargeToken{
 				Kind:  "test",
@@ -74,20 +79,23 @@ func (s *interactorSuite) TestAuthenticatedRequest(c *gc.C) {
 			TokenSecret:    "test-token-secret",
 		}, nil
 	}))
-	ierr := s.interactionRequiredError(c, server.URL)
+	ierr := interactionRequiredError(c, server.URL)
 	dt, err := i.Interact(context.Background(), httpbakery.NewClient(), "", ierr)
-	c.Assert(err, gc.Equals, nil)
-	c.Assert(dt, jc.DeepEquals, &httpbakery.DischargeToken{
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(dt, qt.DeepEquals, &httpbakery.DischargeToken{
 		Kind:  "test",
 		Value: []byte("test-token"),
 	})
 }
 
-func (s *interactorSuite) TestAuthenticatedRequestError(c *gc.C) {
+func TestAuthenticatedRequestError(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		// Just check the request has a correct looking
 		// Authorization header, we won't check the signature.
-		c.Check(req.Header.Get("Authorization"), gc.Matches, "OAuth .*")
+		c.Check(req.Header.Get("Authorization"), qt.Matches, "OAuth .*")
 		code, body := httpbakery.ErrorToResponse(context.Background(), errgo.New("test error"))
 		httprequest.WriteJSON(w, code, body)
 	}))
@@ -103,14 +111,14 @@ func (s *interactorSuite) TestAuthenticatedRequestError(c *gc.C) {
 			TokenSecret:    "test-token-secret",
 		}, nil
 	}))
-	ierr := s.interactionRequiredError(c, server.URL)
+	ierr := interactionRequiredError(c, server.URL)
 	_, err := i.Interact(context.Background(), httpbakery.NewClient(), "", ierr)
-	c.Assert(err, gc.ErrorMatches, `Get http.*: test error`)
+	c.Assert(err, qt.ErrorMatches, `Get http.*: test error`)
 }
 
-func (s *interactorSuite) interactionRequiredError(c *gc.C, url string) *httpbakery.Error {
+func interactionRequiredError(c *qt.C, url string) *httpbakery.Error {
 	req, err := http.NewRequest("GET", "", nil)
-	c.Assert(err, gc.Equals, nil)
+	c.Assert(err, qt.Equals, nil)
 	ierr := httpbakery.NewInteractionRequiredError(nil, req)
 	ussologin.SetInteraction(ierr, url)
 	return ierr

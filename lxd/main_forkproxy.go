@@ -119,8 +119,6 @@ void forkproxy()
 			strerror(errno));
 		_exit(EXIT_FAILURE);
 	}
-	fprintf(stderr, "Created anonymous pair {%d,%d} of unix sockets\n",
-		sk_fds[0], sk_fds[1]);
 
 	pid = fork();
 	if (pid < 0) {
@@ -262,6 +260,7 @@ void forkproxy()
 	}
 }
 */
+// #cgo CFLAGS: -std=gnu11 -Wvla
 import "C"
 
 const forkproxyUDSSockFDNum int = C.FORKPROXY_UDS_SOCK_FD_NUM
@@ -393,7 +392,6 @@ rAgain:
 			fmt.Printf("error: Failed to accept new connection: %v\n", err)
 			continue
 		}
-		fmt.Printf("Accepted a new connection\n")
 
 		// Connect to the target
 		dstConn, err := getDestConn(connectAddr)

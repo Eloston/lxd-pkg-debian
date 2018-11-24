@@ -47,8 +47,14 @@ func (s *migrationSourceWs) DoStorage(migrateOp *operation) error {
 	// The protocol says we have to send a header no matter what, so let's
 	// do that, but then immediately send an error.
 	myType := s.storage.MigrationType()
+	rsyncHasFeature := true
 	header := migration.MigrationHeader{
 		Fs: &myType,
+		RsyncFeatures: &migration.RsyncFeatures{
+			Xattrs:   &rsyncHasFeature,
+			Delete:   &rsyncHasFeature,
+			Compress: &rsyncHasFeature,
+		},
 	}
 
 	err = s.send(&header)
@@ -213,8 +219,14 @@ func (c *migrationSink) DoStorage(migrateOp *operation) error {
 
 	mySink := c.src.storage.StorageMigrationSink
 	myType := c.src.storage.MigrationType()
+	rsyncHasFeature := true
 	resp := migration.MigrationHeader{
 		Fs: &myType,
+		RsyncFeatures: &migration.RsyncFeatures{
+			Xattrs:   &rsyncHasFeature,
+			Delete:   &rsyncHasFeature,
+			Compress: &rsyncHasFeature,
+		},
 	}
 
 	// If the storage type the source has doesn't match what we have, then
@@ -223,6 +235,22 @@ func (c *migrationSink) DoStorage(migrateOp *operation) error {
 		mySink = rsyncStorageMigrationSink
 		myType = migration.MigrationFSType_RSYNC
 		resp.Fs = &myType
+	}
+
+	args := MigrationSinkArgs{}
+	rsyncFeatures := header.GetRsyncFeatures()
+
+	// Handle rsync options
+	args.RsyncArgs = []string{}
+	if rsyncFeatures.GetXattrs() {
+		args.RsyncArgs = append(args.RsyncArgs, "--xattrs")
+	}
+	if rsyncFeatures.GetDelete() {
+		args.RsyncArgs = append(args.RsyncArgs, "--delete")
+	}
+	if rsyncFeatures.GetCompress() {
+		args.RsyncArgs = append(args.RsyncArgs, "--compress")
+		args.RsyncArgs = append(args.RsyncArgs, "--compress-level=2")
 	}
 
 	err = sender(&resp)
@@ -239,7 +267,7 @@ func (c *migrationSink) DoStorage(migrateOp *operation) error {
 		fsConn = c.src.fsConn
 	}
 
-	err = mySink(fsConn, migrateOp, c.dest.storage)
+	err = mySink(fsConn, migrateOp, c.dest.storage, args)
 	if err != nil {
 		logger.Errorf("Failed to start storage volume migration sink")
 		controller(err)

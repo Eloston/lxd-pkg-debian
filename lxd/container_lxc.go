@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/flosch/pongo2"
+	"github.com/pkg/errors"
 	"gopkg.in/lxc/go-lxc.v2"
 	"gopkg.in/yaml.v2"
 
@@ -330,7 +331,7 @@ func containerLXCCreate(s *state.State, args db.ContainerArgs) (container, error
 	if err != nil {
 		c.Delete()
 		logger.Error("Failed creating container", ctxMap)
-		return nil, err
+		return nil, errors.Wrap(err, "Invalid devices")
 	}
 
 	// Retrieve the container's storage pool
@@ -1370,6 +1371,7 @@ func (c *containerLXC) initLXC(config bool) error {
 		}
 
 		hasDiskLimits := false
+		hasRootLimit := false
 		for _, name := range c.expandedDevices.DeviceNames() {
 			m := c.expandedDevices[name]
 			if m["type"] != "disk" {
@@ -1377,15 +1379,34 @@ func (c *containerLXC) initLXC(config bool) error {
 			}
 
 			if m["limits.read"] != "" || m["limits.write"] != "" || m["limits.max"] != "" {
+				if m["path"] == "/" {
+					hasRootLimit = true
+				}
+
 				hasDiskLimits = true
-				break
 			}
 		}
 
 		if hasDiskLimits {
+			ourStart := false
+
+			if hasRootLimit {
+				ourStart, err = c.StorageStart()
+				if err != nil {
+					return err
+				}
+			}
+
 			diskLimits, err := c.getDiskLimits()
 			if err != nil {
 				return err
+			}
+
+			if hasRootLimit && ourStart {
+				_, err = c.StorageStop()
+				if err != nil {
+					return err
+				}
 			}
 
 			for block, limit := range diskLimits {
@@ -1845,7 +1866,7 @@ func (c *containerLXC) startCommon() (string, error) {
 	// Load the go-lxc struct
 	err := c.initLXC(true)
 	if err != nil {
-		return "", err
+		return "", errors.Wrap(err, "Load go-lxc struct")
 	}
 
 	// Check that we're not already running
@@ -1862,7 +1883,7 @@ func (c *containerLXC) startCommon() (string, error) {
 			// the storage volume, not the path where it is mounted.
 			// So do only check for the existence of m["source"]
 			// when m["pool"] is empty.
-			if m["pool"] == "" && m["source"] != "" && !shared.PathExists(shared.HostPath(m["source"])) {
+			if m["pool"] == "" && m["source"] != "" && !shared.IsTrue(m["optional"]) && !shared.PathExists(shared.HostPath(m["source"])) {
 				return "", fmt.Errorf("Missing source '%s' for disk '%s'", m["source"], name)
 			}
 		case "nic":
@@ -1904,7 +1925,7 @@ func (c *containerLXC) startCommon() (string, error) {
 	if ok {
 		err := c.initStorage()
 		if err != nil {
-			return "", err
+			return "", errors.Wrap(err, "Initialize storage")
 		}
 
 		size, err := shared.ParseByteSizeString(newSize)
@@ -1913,13 +1934,13 @@ func (c *containerLXC) startCommon() (string, error) {
 		}
 		err = c.storage.StorageEntitySetQuota(storagePoolVolumeTypeContainer, size, c)
 		if err != nil {
-			return "", err
+			return "", errors.Wrap(err, "Set storage quota")
 		}
 
 		// Remove the volatile key from the DB
 		err = c.state.Cluster.ContainerConfigRemove(c.id, "volatile.apply_quota")
 		if err != nil {
-			return "", err
+			return "", errors.Wrap(err, "Remove volatile.apply_quota config key")
 		}
 
 		// Remove the volatile key from the in-memory configs
@@ -1930,12 +1951,12 @@ func (c *containerLXC) startCommon() (string, error) {
 	/* Deal with idmap changes */
 	idmap, err := c.IdmapSet()
 	if err != nil {
-		return "", err
+		return "", errors.Wrap(err, "Set ID map")
 	}
 
 	lastIdmap, err := c.LastIdmapSet()
 	if err != nil {
-		return "", err
+		return "", errors.Wrap(err, "Set last ID map")
 	}
 
 	var jsonIdmap string
@@ -1955,7 +1976,7 @@ func (c *containerLXC) startCommon() (string, error) {
 
 		ourStart, err = c.StorageStart()
 		if err != nil {
-			return "", err
+			return "", errors.Wrap(err, "Storage start")
 		}
 
 		if lastIdmap != nil {
@@ -2021,7 +2042,7 @@ func (c *containerLXC) startCommon() (string, error) {
 
 	err = c.ConfigKeySet("volatile.last_state.idmap", jsonIdmap)
 	if err != nil {
-		return "", err
+		return "", errors.Wrapf(err, "Set volatile.last_state.idmap config key on container %q (id %d)", c.name, c.id)
 	}
 
 	// Generate the Seccomp profile
@@ -2088,7 +2109,7 @@ func (c *containerLXC) startCommon() (string, error) {
 			}
 
 			for _, usb := range usbs {
-				if usb.vendor != m["vendorid"] || (m["productid"] != "" && usb.product != m["productid"]) {
+				if (m["vendorid"] != "" && usb.vendor != m["vendorid"]) || (m["productid"] != "" && usb.product != m["productid"]) {
 					continue
 				}
 
@@ -2392,7 +2413,7 @@ func (c *containerLXC) Start(stateful bool) error {
 	// Setup a new operation
 	op, err := c.createOperation("start", false, false)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Create container start operation")
 	}
 	defer op.Done(nil)
 
@@ -2404,13 +2425,13 @@ func (c *containerLXC) Start(stateful bool) error {
 	// Run the shared start code
 	configPath, err := c.startCommon()
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Common start logic")
 	}
 
 	// Ensure that the container storage volume is mounted.
 	_, err = c.StorageStart()
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Storage start")
 	}
 
 	ctxMap = log.Ctx{"name": c.name,
@@ -2440,7 +2461,7 @@ func (c *containerLXC) Start(stateful bool) error {
 
 		err := c.Migrate(&criuMigrationArgs)
 		if err != nil && !c.IsRunning() {
-			return err
+			return errors.Wrap(err, "Migrate")
 		}
 
 		os.RemoveAll(c.StatePath())
@@ -2449,7 +2470,7 @@ func (c *containerLXC) Start(stateful bool) error {
 		err = c.state.Cluster.ContainerSetStateful(c.id, false)
 		if err != nil {
 			logger.Error("Failed starting container", ctxMap)
-			return err
+			return errors.Wrap(err, "Start container")
 		}
 
 		logger.Info("Started container", ctxMap)
@@ -2465,7 +2486,7 @@ func (c *containerLXC) Start(stateful bool) error {
 		c.stateful = false
 		err = c.state.Cluster.ContainerSetStateful(c.id, false)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "Persist stateful flag")
 		}
 	}
 
@@ -2712,7 +2733,7 @@ func (c *containerLXC) Stop(stateful bool) error {
 	if c.state.OS.CGroupPidsController {
 		// Attempt to disable forking new processes
 		c.CGroupSet("pids.max", "0")
-	} else {
+	} else if c.state.OS.CGroupFreezerController {
 		// Attempt to freeze the container
 		freezer := make(chan bool, 1)
 		go func() {
@@ -2908,14 +2929,20 @@ func (c *containerLXC) Freeze() error {
 		"ephemeral": c.ephemeral,
 		"used":      c.lastUsedDate}
 
-	// Check that we're not already frozen
-	if c.IsFrozen() {
-		return fmt.Errorf("The container is already frozen")
-	}
-
 	// Check that we're running
 	if !c.IsRunning() {
 		return fmt.Errorf("The container isn't running")
+	}
+
+	// Check if the CGroup is available
+	if !c.state.OS.CGroupFreezerController {
+		logger.Info("Unable to freeze container (lack of kernel support)", ctxMap)
+		return nil
+	}
+
+	// Check that we're not already frozen
+	if c.IsFrozen() {
+		return fmt.Errorf("The container is already frozen")
 	}
 
 	logger.Info("Freezing container", ctxMap)
@@ -2948,14 +2975,20 @@ func (c *containerLXC) Unfreeze() error {
 		"ephemeral": c.ephemeral,
 		"used":      c.lastUsedDate}
 
-	// Check that we're frozen
-	if !c.IsFrozen() {
-		return fmt.Errorf("The container is already running")
-	}
-
 	// Check that we're running
 	if !c.IsRunning() {
 		return fmt.Errorf("The container isn't running")
+	}
+
+	// Check if the CGroup is available
+	if !c.state.OS.CGroupFreezerController {
+		logger.Info("Unable to unfreeze container (lack of kernel support)", ctxMap)
+		return nil
+	}
+
+	// Check that we're frozen
+	if !c.IsFrozen() {
+		return fmt.Errorf("The container is already running")
 	}
 
 	logger.Info("Unfreezing container", ctxMap)
@@ -3283,12 +3316,29 @@ func (c *containerLXC) Delete() error {
 
 	logger.Info("Deleting container", ctxMap)
 
+	// Check if we're dealing with "lxd import"
+	isImport := false
+	if c.storage != nil {
+		_, poolName, _ := c.storage.GetContainerPoolInfo()
+
+		if c.IsSnapshot() {
+			cName, _, _ := containerGetParentAndSnapshotName(c.name)
+			if shared.PathExists(shared.VarPath("storage-pools", poolName, "containers", cName, ".importing")) {
+				isImport = true
+			}
+		} else {
+			if shared.PathExists(shared.VarPath("storage-pools", poolName, "containers", c.name, ".importing")) {
+				isImport = true
+			}
+		}
+	}
+
 	// Attempt to initialize storage interface for the container.
 	c.initStorage()
 
 	if c.IsSnapshot() {
 		// Remove the snapshot
-		if c.storage != nil {
+		if c.storage != nil && !isImport {
 			err := c.storage.ContainerSnapshotDelete(c)
 			if err != nil {
 				logger.Warn("Failed to delete snapshot", log.Ctx{"name": c.Name(), "err": err})
@@ -3307,7 +3357,7 @@ func (c *containerLXC) Delete() error {
 		c.cleanup()
 
 		// Delete the container from disk
-		if c.storage != nil {
+		if c.storage != nil && !isImport {
 			_, poolName, _ := c.storage.GetContainerPoolInfo()
 			containerMountPoint := getContainerMountPoint(poolName, c.Name())
 			if shared.PathExists(c.Path()) ||
@@ -3328,7 +3378,6 @@ func (c *containerLXC) Delete() error {
 		}
 
 		// Update network files
-		networkUpdateStatic(c.state, "")
 		for k, m := range c.expandedDevices {
 			if m["type"] != "nic" || m["nictype"] != "bridged" {
 				continue
@@ -3361,6 +3410,11 @@ func (c *containerLXC) Delete() error {
 		if err != nil {
 			return err
 		}
+	}
+
+	if !c.IsSnapshot() {
+		// Remove any static lease file
+		networkUpdateStatic(c.state, "")
 	}
 
 	logger.Info("Deleted container", ctxMap)
@@ -3590,12 +3644,12 @@ func writeBackupFile(c container) error {
 
 	ci, _, err := c.Render()
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Failed to render container metadata")
 	}
 
 	snapshots, err := c.Snapshots()
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Failed to get snapshots")
 	}
 
 	var sis []*api.ContainerSnapshot
@@ -3675,25 +3729,32 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 	// Validate the new config
 	err := containerValidConfig(c.state.OS, args.Config, false, false)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Invalid config")
 	}
 
 	// Validate the new devices
 	err = containerValidDevices(c.state.Cluster, args.Devices, false, false)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Invalid devices")
 	}
 
 	// Validate the new profiles
 	profiles, err := c.state.Cluster.Profiles()
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Failed to get project profiles")
 	}
 
-	for _, name := range args.Profiles {
-		if !shared.StringInSlice(name, profiles) {
-			return fmt.Errorf("Profile doesn't exist: %s", name)
+	checkedProfiles := []string{}
+	for _, profile := range args.Profiles {
+		if !shared.StringInSlice(profile, profiles) {
+			return fmt.Errorf("Requested profile '%s' doesn't exist", profile)
 		}
+
+		if shared.StringInSlice(profile, checkedProfiles) {
+			return fmt.Errorf("Duplicate profile found in request")
+		}
+
+		checkedProfiles = append(checkedProfiles, profile)
 	}
 
 	// Validate the new architecture
@@ -3804,12 +3865,12 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 	// Expand the config and refresh the LXC config
 	err = c.expandConfig(nil)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Expand config")
 	}
 
 	err = c.expandDevices(nil)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Expand devices")
 	}
 
 	// Diff the configurations
@@ -3836,13 +3897,13 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 	// Do some validation of the config diff
 	err = containerValidConfig(c.state.OS, c.expandedConfig, false, true)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Invalid expanded config")
 	}
 
 	// Do some validation of the devices diff
 	err = containerValidDevices(c.state.Cluster, c.expandedDevices, false, true)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Invalid expanded devices")
 	}
 
 	// Run through initLXC to catch anything we missed
@@ -3850,20 +3911,20 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 	c.cConfig = false
 	err = c.initLXC(true)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Initialize LXC")
 	}
 
 	// Initialize storage interface for the container.
 	err = c.initStorage()
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Initialize storage")
 	}
 
 	// If apparmor changed, re-validate the apparmor profile
 	if shared.StringInSlice("raw.apparmor", changedConfig) || shared.StringInSlice("security.nesting", changedConfig) {
 		err = AAParseProfile(c)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "Parse AppArmor profile")
 		}
 	}
 
@@ -3881,7 +3942,7 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 				c.expandedConfig["raw.idmap"],
 			)
 			if err != nil {
-				return err
+				return errors.Wrap(err, "Failed to get ID map")
 			}
 		}
 
@@ -3902,65 +3963,39 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 		c.idmapset = nil
 	}
 
-	// Retrieve old root disk devices.
-	oldLocalRootDiskDeviceKey, oldLocalRootDiskDevice, _ := shared.GetRootDiskDevice(oldLocalDevices)
-	var oldProfileRootDiskDevices []string
-	for k, v := range oldExpandedDevices {
-		if shared.IsRootDiskDevice(v) && k != oldLocalRootDiskDeviceKey && !shared.StringInSlice(k, oldProfileRootDiskDevices) {
-			oldProfileRootDiskDevices = append(oldProfileRootDiskDevices, k)
-		}
-	}
-
-	// Retrieve new root disk devices.
-	newLocalRootDiskDeviceKey, newLocalRootDiskDevice, _ := shared.GetRootDiskDevice(c.localDevices)
-	var newProfileRootDiskDevices []string
+	// Make sure we have a valid root disk device (and only one)
+	newRootDiskDeviceKey := ""
 	for k, v := range c.expandedDevices {
-		if shared.IsRootDiskDevice(v) && k != newLocalRootDiskDeviceKey && !shared.StringInSlice(k, newProfileRootDiskDevices) {
-			newProfileRootDiskDevices = append(newProfileRootDiskDevices, k)
+		if v["type"] == "disk" && v["path"] == "/" && v["pool"] != "" {
+			if newRootDiskDeviceKey != "" {
+				return fmt.Errorf("Containers may only have one root disk device")
+			}
+
+			newRootDiskDeviceKey = k
 		}
 	}
 
-	// Verify root disk devices. (Be specific with error messages.)
-	var oldRootDiskDeviceKey string
-	var newRootDiskDeviceKey string
-	if oldLocalRootDiskDevice["pool"] != "" {
-		oldRootDiskDeviceKey = oldLocalRootDiskDeviceKey
-		newRootDiskDeviceKey = newLocalRootDiskDeviceKey
+	if newRootDiskDeviceKey == "" {
+		return fmt.Errorf("Containers must have a root disk device (directly or inherited)")
+	}
 
-		if newLocalRootDiskDevice["pool"] == "" {
-			if len(newProfileRootDiskDevices) == 0 {
-				return fmt.Errorf("Update will cause the container to rely on a profile's root disk device but none was found")
-			} else if len(newProfileRootDiskDevices) > 1 {
-				return fmt.Errorf("Update will cause the container to rely on a profile's root disk device but conflicting devices were found")
-			} else if c.expandedDevices[newProfileRootDiskDevices[0]]["pool"] != oldLocalRootDiskDevice["pool"] {
-				newRootDiskDeviceKey = newProfileRootDiskDevices[0]
-				return fmt.Errorf("Using the profile's root disk device would change the storage pool of the container")
-			}
-		}
-	} else {
-		// This branch should allow us to cover cases where a container
-		// didn't have root disk device before for whatever reason. As
-		// long as there is a root disk device in one of the local or
-		// profile devices we're good.
-		if newLocalRootDiskDevice["pool"] != "" {
-			newRootDiskDeviceKey = newLocalRootDiskDeviceKey
-
-			if len(oldProfileRootDiskDevices) > 0 {
-				oldRootDiskDeviceKey = oldProfileRootDiskDevices[0]
-				if oldExpandedDevices[oldRootDiskDeviceKey]["pool"] != newLocalRootDiskDevice["pool"] {
-					return fmt.Errorf("The new local root disk device would change the storage pool of the container")
-				}
-			}
-		} else {
-			if len(newProfileRootDiskDevices) == 0 {
-				return fmt.Errorf("Update will cause the container to rely on a profile's root disk device but none was found")
-			} else if len(newProfileRootDiskDevices) > 1 {
-				return fmt.Errorf("Using the profile's root disk device would change the storage pool of the container")
-			}
-			newRootDiskDeviceKey = newProfileRootDiskDevices[0]
+	// Retrieve the old root disk device
+	oldRootDiskDeviceKey := ""
+	for k, v := range oldExpandedDevices {
+		if v["type"] == "disk" && v["path"] == "/" && v["pool"] != "" {
+			oldRootDiskDeviceKey = k
+			break
 		}
 	}
 
+	// Check for pool change
+	oldRootDiskDevicePool := oldExpandedDevices[oldRootDiskDeviceKey]["pool"]
+	newRootDiskDevicePool := c.expandedDevices[newRootDiskDeviceKey]["pool"]
+	if oldRootDiskDevicePool != newRootDiskDevicePool {
+		return fmt.Errorf("The storage pool of the root disk can only be changed through move")
+	}
+
+	// Deal with quota changes
 	oldRootDiskDeviceSize := oldExpandedDevices[oldRootDiskDeviceKey]["size"]
 	newRootDiskDeviceSize := c.expandedDevices[newRootDiskDeviceKey]["size"]
 
@@ -3968,8 +4003,8 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 	// Apply disk quota changes
 	if newRootDiskDeviceSize != oldRootDiskDeviceSize {
 		storageTypeName := c.storage.GetStorageTypeName()
-		storageIsReady := c.storage.ContainerStorageReady(c.Name())
-		if storageTypeName == "lvm" && isRunning || !storageIsReady {
+		storageIsReady := c.storage.ContainerStorageReady(c)
+		if (storageTypeName == "lvm" || storageTypeName == "ceph") && isRunning || !storageIsReady {
 			c.localConfig["volatile.apply_quota"] = newRootDiskDeviceSize
 		} else {
 			size, err := shared.ParseByteSizeString(newRootDiskDeviceSize)
@@ -4318,7 +4353,7 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 
 				/* if the device isn't present, we don't need to remove it */
 				for _, usb := range usbs {
-					if usb.vendor != m["vendorid"] || (m["productid"] != "" && usb.product != m["productid"]) {
+					if (m["vendorid"] != "" && usb.vendor != m["vendorid"]) || (m["productid"] != "" && usb.product != m["productid"]) {
 						continue
 					}
 
@@ -4454,7 +4489,7 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 				}
 
 				for _, usb := range usbs {
-					if usb.vendor != m["vendorid"] || (m["productid"] != "" && usb.product != m["productid"]) {
+					if (m["vendorid"] != "" && usb.vendor != m["vendorid"]) || (m["productid"] != "" && usb.product != m["productid"]) {
 						continue
 					}
 
@@ -4542,7 +4577,7 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 
 		err = c.addDiskDevices(diskDevices, c.insertDiskDevice)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "Add disk devices")
 		}
 
 		updateDiskLimit := false
@@ -4659,25 +4694,25 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 		err = db.ContainerConfigInsert(tx, c.id, c.localConfig)
 		if err != nil {
 			tx.Rollback()
-			return err
+			return errors.Wrap(err, "Config insert")
 		}
 
 		err = db.ContainerProfilesInsert(tx, c.id, c.profiles)
 		if err != nil {
 			tx.Rollback()
-			return err
+			return errors.Wrap(err, "Profiles insert")
 		}
 
 		err = db.DevicesAdd(tx, "container", int64(c.id), c.localDevices)
 		if err != nil {
 			tx.Rollback()
-			return err
+			return errors.Wrap(err, "Device add")
 		}
 
 		err = db.ContainerUpdate(tx, c.id, c.description, c.architecture, c.ephemeral)
 		if err != nil {
 			tx.Rollback()
-			return err
+			return errors.Wrap(err, "Container update")
 		}
 
 		if err := db.TxCommit(tx); err != nil {
@@ -4686,17 +4721,17 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 		return nil
 	})
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Failed to update database")
 	}
 
 	/* we can call Update in some cases when the directory doesn't exist
 	 * yet before container creation; this is okay, because at the end of
 	 * container creation we write the backup file, so let's not worry about
 	 * ENOENT. */
-	if c.storage.ContainerStorageReady(c.Name()) {
+	if c.storage.ContainerStorageReady(c) {
 		err := writeBackupFile(c)
 		if err != nil && !os.IsNotExist(err) {
-			return err
+			return errors.Wrap(err, "Failed to write backup file")
 		}
 	}
 
@@ -5260,7 +5295,7 @@ func (c *containerLXC) TemplateApply(trigger string) error {
 		// The two events are mutually exclusive so only keep the last one
 		err := c.ConfigKeySet("volatile.apply_template", trigger)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "Failed to set apply_template volatile key")
 		}
 
 		return nil
@@ -5279,14 +5314,14 @@ func (c *containerLXC) templateApplyNow(trigger string) error {
 	// Parse the metadata
 	content, err := ioutil.ReadFile(fname)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "Failed to read metadata")
 	}
 
 	metadata := new(api.ImageMetadata)
 	err = yaml.Unmarshal(content, &metadata)
 
 	if err != nil {
-		return fmt.Errorf("Could not parse %s: %v", fname, err)
+		return errors.Wrapf(err, "Could not parse %s", fname)
 	}
 
 	// Go through the templates
@@ -5316,7 +5351,7 @@ func (c *containerLXC) templateApplyNow(trigger string) error {
 			// Open the existing file
 			w, err = os.Create(fullpath)
 			if err != nil {
-				return err
+				return errors.Wrap(err, "Failed to create template file")
 			}
 		} else {
 			// Create a new one
@@ -5327,7 +5362,7 @@ func (c *containerLXC) templateApplyNow(trigger string) error {
 			if !c.IsPrivileged() {
 				idmapset, err := c.IdmapSet()
 				if err != nil {
-					return err
+					return errors.Wrap(err, "Failed to set ID map")
 				}
 
 				uid, gid = idmapset.ShiftIntoNs(0, 0)
@@ -5353,7 +5388,7 @@ func (c *containerLXC) templateApplyNow(trigger string) error {
 		// Read the template
 		tplString, err := ioutil.ReadFile(filepath.Join(c.TemplatesPath(), tpl.Template))
 		if err != nil {
-			return err
+			return errors.Wrap(err, "Failed to read template file")
 		}
 
 		// Restrict filesystem access to within the container's rootfs
@@ -5361,7 +5396,7 @@ func (c *containerLXC) templateApplyNow(trigger string) error {
 
 		tplRender, err := tplSet.FromString("{% autoescape off %}" + string(tplString) + "{% endautoescape %}")
 		if err != nil {
-			return err
+			return errors.Wrap(err, "Failed to render template")
 		}
 
 		// Figure out the architecture
@@ -5369,7 +5404,7 @@ func (c *containerLXC) templateApplyNow(trigger string) error {
 		if err != nil {
 			arch, err = osarch.ArchitectureName(c.state.OS.Architectures[0])
 			if err != nil {
-				return err
+				return errors.Wrap(err, "Failed to detect system architecture")
 			}
 		}
 
@@ -5759,12 +5794,21 @@ func (c *containerLXC) ConsoleLog(opts lxc.ConsoleLogOptions) (string, error) {
 }
 
 func (c *containerLXC) Exec(command []string, env map[string]string, stdin *os.File, stdout *os.File, stderr *os.File, wait bool) (*exec.Cmd, int, int, error) {
+	// Prepare the environment
 	envSlice := []string{}
 
 	for k, v := range env {
 		envSlice = append(envSlice, fmt.Sprintf("%s=%s", k, v))
 	}
 
+	// Setup logfile
+	logPath := filepath.Join(c.LogPath(), "forkexec.log")
+	logFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_SYNC, 0644)
+	if err != nil {
+		return nil, -1, -1, err
+	}
+
+	// Prepare the subcommand
 	args := []string{c.state.OS.ExecPath, "forkexec", c.name, c.state.OS.LxcPath, filepath.Join(c.LogPath(), "lxc.conf")}
 
 	args = append(args, "--")
@@ -5778,26 +5822,28 @@ func (c *containerLXC) Exec(command []string, env map[string]string, stdin *os.F
 	cmd := exec.Cmd{}
 	cmd.Path = c.state.OS.ExecPath
 	cmd.Args = args
-	cmd.Stdin = stdin
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
 
-	r, w, err := shared.Pipe()
-	defer r.Close()
+	cmd.Stdin = nil
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
+	// Setup communication PIPE
+	rStatus, wStatus, err := shared.Pipe()
+	defer rStatus.Close()
 	if err != nil {
 		return nil, -1, -1, err
 	}
 
-	cmd.ExtraFiles = []*os.File{w}
+	cmd.ExtraFiles = []*os.File{stdin, stdout, stderr, wStatus}
 	err = cmd.Start()
 	if err != nil {
-		w.Close()
+		wStatus.Close()
 		return nil, -1, -1, err
 	}
-	w.Close()
+	wStatus.Close()
 
 	attachedPid := -1
-	if err := json.NewDecoder(r).Decode(&attachedPid); err != nil {
+	if err := json.NewDecoder(rStatus).Decode(&attachedPid); err != nil {
 		logger.Errorf("Failed to retrieve PID of executing child process: %s", err)
 		return nil, -1, -1, err
 	}
@@ -5929,35 +5975,54 @@ func (c *containerLXC) memoryState() api.ContainerStateMemory {
 
 func (c *containerLXC) networkState() map[string]api.ContainerStateNetwork {
 	result := map[string]api.ContainerStateNetwork{}
+	var networks *map[string]api.ContainerStateNetwork
 
 	pid := c.InitPID()
 	if pid < 1 {
 		return result
 	}
 
-	// Get the network state from the container
-	out, err := shared.RunCommand(
-		c.state.OS.ExecPath,
-		"forknet",
-		"info",
-		fmt.Sprintf("%d", pid))
-
-	// Process forkgetnet response
-	if err != nil {
-		logger.Error("Error calling 'lxd forkgetnet", log.Ctx{"container": c.name, "output": out, "pid": pid})
-		return result
+	couldUseNetnsGetifaddrs := c.state.OS.NetnsGetifaddrs
+	if couldUseNetnsGetifaddrs {
+		nw, err := shared.NetnsGetifaddrs(int32(pid))
+		if err != nil {
+			couldUseNetnsGetifaddrs = false
+			logger.Error("Failed to retrieve network information via netlink", log.Ctx{"container": c.name, "pid": pid})
+		} else {
+			networks = &nw
+		}
 	}
 
-	networks := map[string]api.ContainerStateNetwork{}
+	if !couldUseNetnsGetifaddrs {
+		// Get the network state from the container
+		out, err := shared.RunCommand(
+			c.state.OS.ExecPath,
+			"forknet",
+			"info",
+			fmt.Sprintf("%d", pid))
 
-	err = json.Unmarshal([]byte(out), &networks)
-	if err != nil {
-		logger.Error("Failure to read forkgetnet json", log.Ctx{"container": c.name, "err": err})
-		return result
+		// Process forkgetnet response
+		if err != nil {
+			logger.Error("Error calling 'lxd forkgetnet", log.Ctx{"container": c.name, "output": out, "pid": pid})
+			return result
+		}
+
+		// If we can use netns_getifaddrs() but it failed and the setns() +
+		// netns_getifaddrs() succeeded we should just always fallback to the
+		// setns() + netns_getifaddrs() style retrieval.
+		c.state.OS.NetnsGetifaddrs = false
+
+		nw := map[string]api.ContainerStateNetwork{}
+		err = json.Unmarshal([]byte(out), &nw)
+		if err != nil {
+			logger.Error("Failure to read forkgetnet json", log.Ctx{"container": c.name, "err": err})
+			return result
+		}
+		networks = &nw
 	}
 
 	// Add HostName field
-	for netName, net := range networks {
+	for netName, net := range *networks {
 		net.HostName = c.getHostInterface(netName)
 		result[netName] = net
 	}
@@ -6104,6 +6169,10 @@ func (c *containerLXC) tarStoreFile(linkmap map[uint64]string, offset int, tw *t
 
 // Storage functions
 func (c *containerLXC) Storage() storage {
+	if c.storage == nil {
+		c.initStorage()
+	}
+
 	return c.storage
 }
 
@@ -6152,7 +6221,7 @@ func (c *containerLXC) StorageStop() (bool, error) {
 	if c.IsSnapshot() {
 		isOurOperation, err = c.storage.ContainerSnapshotStop(c)
 	} else {
-		isOurOperation, err = c.storage.ContainerUmount(c.Name(), c.Path())
+		isOurOperation, err = c.storage.ContainerUmount(c, c.Path())
 	}
 
 	return isOurOperation, err
@@ -7082,6 +7151,12 @@ func (c *containerLXC) fillSriovNetworkDevice(name string, m types.Device, reser
 	}
 	sriovTotalVfsStr := strings.TrimSpace(string(sriovTotalVfsBuf))
 	sriovTotal, err := strconv.Atoi(sriovTotalVfsStr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Ensure parent is up (needed for Intel at least)
+	_, err = shared.RunCommand("ip", "link", "set", "dev", m["parent"], "up")
 	if err != nil {
 		return nil, err
 	}

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/CanonicalLtd/go-dqlite"
 	"github.com/gorilla/mux"
@@ -124,7 +125,24 @@ func clusterPut(d *Daemon, r *http.Request) Response {
 
 func clusterPutBootstrap(d *Daemon, req api.ClusterPut) Response {
 	run := func(op *operation) error {
-		return cluster.Bootstrap(d.State(), d.gateway, req.ServerName)
+		// The default timeout when non-clustered is one minute, let's
+		// lower it down now that we'll likely have to make requests
+		// over the network.
+		//
+		// FIXME: this is a workaround for #5234.
+		d.cluster.SetDefaultTimeout(5 * time.Second)
+
+		// Start clustering tasks
+		d.startClusterTasks()
+
+		err := cluster.Bootstrap(d.State(), d.gateway, req.ServerName)
+		if err != nil {
+			d.cluster.SetDefaultTimeout(time.Minute)
+			d.stopClusterTasks()
+			return err
+		}
+
+		return nil
 	}
 	resources := map[string][]string{}
 	resources["cluster"] = []string{}
@@ -224,15 +242,31 @@ func clusterPutJoin(d *Daemon, req api.ClusterPut) Response {
 			nodes[i].Address = node.Address
 		}
 
+		// The default timeout when non-clustered is one minute, let's
+		// lower it down now that we'll likely have to make requests
+		// over the network.
+		//
+		// FIXME: this is a workaround for #5234.
+		d.cluster.SetDefaultTimeout(5 * time.Second)
+
+		// Start clustering tasks
+		d.startClusterTasks()
+
 		err = cluster.Join(d.State(), d.gateway, cert, req.ServerName, nodes)
 		if err != nil {
+			d.cluster.SetDefaultTimeout(time.Minute)
+			d.stopClusterTasks()
 			return err
 		}
 
 		// Remove the our old server certificate from the trust store,
 		// since it's not needed anymore.
 		_, err = d.cluster.CertificateGet(fingerprint)
-		if err == nil {
+		if err != db.ErrNoSuchObject {
+			if err != nil {
+				return err
+			}
+
 			err := d.cluster.CertDelete(fingerprint)
 			if err != nil {
 				return errors.Wrap(err, "failed to delete joining node's certificate")
@@ -349,12 +383,16 @@ func clusterPutDisable(d *Daemon) Response {
 	store := d.gateway.ServerStore()
 	d.cluster, err = db.OpenCluster(
 		"db.bin", store, address, "/unused/db/dir",
+		d.config.DqliteSetupTimeout,
 		dqlite.WithDialFunc(d.gateway.DialFunc()),
 		dqlite.WithContext(d.gateway.Context()),
 	)
 	if err != nil {
 		return SmartError(err)
 	}
+
+	// Stop the clustering tasks
+	d.stopClusterTasks()
 
 	// Remove the cluster flag from the agent
 	version.UserAgentFeatures(nil)

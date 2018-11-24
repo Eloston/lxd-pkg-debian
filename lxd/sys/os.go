@@ -52,11 +52,14 @@ type OS struct {
 	CGroupCPUacctController bool
 	CGroupCPUsetController  bool
 	CGroupDevicesController bool
+	CGroupFreezerController bool
 	CGroupMemoryController  bool
 	CGroupNetPrioController bool
 	CGroupPidsController    bool
 	CGroupSwapAccounting    bool
 	InotifyWatch            InotifyInfo
+	NetnsGetifaddrs         bool
+	VFS3Fscaps              bool
 
 	MockMode bool // If true some APIs will be mocked (for testing)
 }

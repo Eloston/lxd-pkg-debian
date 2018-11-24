@@ -5,42 +5,50 @@ package ussodischarge_test
 
 import (
 	"encoding/json"
+	"testing"
 
-	gc "gopkg.in/check.v1"
+	qt "github.com/frankban/quicktest"
 
 	"gopkg.in/CanonicalLtd/candidclient.v1/ussodischarge"
 )
 
-type paramsSuite struct {
-}
+func TestUnmarshalUSSOMacaroon(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
 
-var _ = gc.Suite(&paramsSuite{})
-
-func (s *paramsSuite) TestUnmarshalUSSOMacaroon(c *gc.C) {
 	data := []byte(`"MDAxYmxvY2F0aW9uIHRlc3QgbG9jYXRpb24KMDAxZGlkZW50aWZpZXIgdGVzdCBtYWNhcm9vbgowMDJmc2lnbmF0dXJlICaaplwsJeHwPuBK6er_d3DnEnSJ2b85-V9SXsiL6xWOCg"`)
 	var m ussodischarge.USSOMacaroon
 	err := json.Unmarshal(data, &m)
-	c.Assert(err, gc.Equals, nil)
-	c.Assert(string(m.Macaroon.Id()), gc.Equals, "test macaroon")
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(string(m.Macaroon.Id()), qt.Equals, "test macaroon")
 }
 
-func (s *paramsSuite) TestUnmarshalUSSOMacaroonNotJSONString(c *gc.C) {
+func TestUnmarshalUSSOMacaroonNotJSONString(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
+
 	data := []byte(`123`)
 	var m ussodischarge.USSOMacaroon
 	err := json.Unmarshal(data, &m)
-	c.Assert(err, gc.ErrorMatches, `cannot unmarshal macaroon: json: cannot unmarshal number into Go value of type string`)
+	c.Assert(err, qt.ErrorMatches, `cannot unmarshal macaroon: json: cannot unmarshal number into Go value of type string`)
 }
 
-func (s *paramsSuite) TestUnmarshalUSSOMacaroonBadBase64(c *gc.C) {
+func TestUnmarshalUSSOMacaroonBadBase64(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
+
 	data := []byte(`"MDAxYmxvY2F0aW9uIHRlc3QgbG9jYXRpb24KMDAxZGlkZW50aWZpZXIgdGVzdCBtYWNhcm9vbgowMDJmc2lnbmF0dXJlICaaplwsJeHwPuBK6er/d3DnEnSJ2b85+V9SXsiL6xWOCg"`)
 	var m ussodischarge.USSOMacaroon
 	err := json.Unmarshal(data, &m)
-	c.Assert(err, gc.ErrorMatches, `cannot unmarshal macaroon: illegal base64 data at input byte 111`)
+	c.Assert(err, qt.ErrorMatches, `cannot unmarshal macaroon: illegal base64 data at input byte 111`)
 }
 
-func (s *paramsSuite) TestUnmarshalUSSOMacaroonBadBinary(c *gc.C) {
+func TestUnmarshalUSSOMacaroonBadBinary(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
+
 	data := []byte(`"NDAxYmxvY2F0aW9uIHRlc3QgbG9jYXRpb24KMDAxZGlkZW50aWZpZXIgdGVzdCBtYWNhcm9vbgowMDJmc2lnbmF0dXJlICaaplwsJeHwPuBK6er_d3DnEnSJ2b85-V9SXsiL6xWOCg"`)
 	var m ussodischarge.USSOMacaroon
 	err := json.Unmarshal(data, &m)
-	c.Assert(err, gc.ErrorMatches, `cannot unmarshal macaroon: unmarshal v1: packet size too big`)
+	c.Assert(err, qt.ErrorMatches, `cannot unmarshal macaroon: unmarshal v1: packet size too big`)
 }

@@ -1,11 +1,13 @@
 package lxd
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/lxc/lxd/shared"
@@ -16,6 +18,11 @@ func tlsHTTPClient(client *http.Client, tlsClientCert string, tlsClientKey strin
 	tlsConfig, err := shared.GetTLSConfigMem(tlsClientCert, tlsClientKey, tlsCA, tlsServerCert, insecureSkipVerify)
 	if err != nil {
 		return nil, err
+	}
+
+	// Support disabling of strict ciphers
+	if shared.IsTrue(os.Getenv("LXD_INSECURE_TLS")) {
+		tlsConfig.CipherSuites = nil
 	}
 
 	// Define the http transport
@@ -29,6 +36,54 @@ func tlsHTTPClient(client *http.Client, tlsClientCert string, tlsClientKey strin
 	// Allow overriding the proxy
 	if proxy != nil {
 		transport.Proxy = proxy
+	}
+
+	// Special TLS handling
+	transport.DialTLS = func(network string, addr string) (net.Conn, error) {
+		tlsDial := func(network string, addr string, config *tls.Config, resetName bool) (net.Conn, error) {
+			// TCP connection
+			conn, err := transport.Dial(network, addr)
+			if err != nil {
+				return nil, err
+			}
+
+			// Setup TLS
+			if resetName {
+				hostName, _, err := net.SplitHostPort(addr)
+				if err != nil {
+					hostName = addr
+				}
+
+				config = config.Clone()
+				config.ServerName = hostName
+			}
+			tlsConn := tls.Client(conn, config)
+
+			// Validate the connection
+			err = tlsConn.Handshake()
+			if err != nil {
+				conn.Close()
+				return nil, err
+			}
+
+			if !config.InsecureSkipVerify {
+				err := tlsConn.VerifyHostname(config.ServerName)
+				if err != nil {
+					conn.Close()
+					return nil, err
+				}
+			}
+
+			return tlsConn, nil
+		}
+
+		conn, err := tlsDial(network, addr, transport.TLSClientConfig, false)
+		if err != nil {
+			// We may have gotten redirected to a non-LXD machine
+			return tlsDial(network, addr, transport.TLSClientConfig, true)
+		}
+
+		return conn, nil
 	}
 
 	// Define the http client
@@ -110,9 +165,24 @@ func remoteOperationError(msg string, errors map[string]error) error {
 	}
 
 	// Check if successful
-	if err == nil {
-		return nil
+	if err != nil {
+		return fmt.Errorf("%s: %s", msg, err)
 	}
 
-	return fmt.Errorf("%s: %s", msg, err)
+	return nil
+}
+
+// Set the value of a query parameter in the given URI.
+func setQueryParam(uri, param, value string) (string, error) {
+	fields, err := url.Parse(uri)
+	if err != nil {
+		return "", err
+	}
+
+	values := fields.Query()
+	values.Set(param, url.QueryEscape(value))
+
+	fields.RawQuery = values.Encode()
+
+	return fields.String(), nil
 }

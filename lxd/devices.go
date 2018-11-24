@@ -146,7 +146,7 @@ func findNvidiaMinor(pci string) (string, error) {
 		idx += len("Device Minor:")
 		strBuf = strBuf[idx:]
 		strBuf = strings.TrimSpace(strBuf)
-		parts := strings.SplitN(strBuf, "\n", 1)
+		parts := strings.SplitN(strBuf, "\n", 2)
 		_, err = strconv.Atoi(parts[0])
 		if err == nil {
 			return parts[0], nil
@@ -847,7 +847,7 @@ func deviceUSBEvent(s *state.State, usb usbDevice) {
 				continue
 			}
 
-			if m["vendorid"] != usb.vendor || (m["productid"] != "" && m["productid"] != usb.product) {
+			if (m["vendorid"] != "" && m["vendorid"] != usb.vendor) || (m["productid"] != "" && m["productid"] != usb.product) {
 				continue
 			}
 
@@ -1277,7 +1277,7 @@ func deviceParseDiskLimit(readSpeed string, writeSpeed string) (int64, int64, in
 		bps := int64(0)
 		iops := int64(0)
 
-		if readSpeed == "" {
+		if value == "" {
 			return bps, iops, nil
 		}
 

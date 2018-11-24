@@ -69,6 +69,7 @@ type ContainerServer interface {
 	RequireAuthenticated(authenticated bool)
 	IsClustered() (clustered bool)
 	UseTarget(name string) (client ContainerServer)
+	UseProject(name string) (client ContainerServer)
 
 	// Certificate functions
 	GetCertificateFingerprints() (fingerprints []string, err error)
@@ -154,6 +155,7 @@ type ContainerServer interface {
 	GetNetworks() (networks []api.Network, err error)
 	GetNetwork(name string) (network *api.Network, ETag string, err error)
 	GetNetworkLeases(name string) (leases []api.NetworkLease, err error)
+	GetNetworkState(name string) (state *api.NetworkState, err error)
 	CreateNetwork(network api.NetworksPost) (err error)
 	UpdateNetwork(name string, network api.NetworkPut, ETag string) (err error)
 	RenameNetwork(name string, network api.NetworkPost) (err error)
@@ -176,6 +178,15 @@ type ContainerServer interface {
 	RenameProfile(name string, profile api.ProfilePost) (err error)
 	DeleteProfile(name string) (err error)
 
+	// Project functions
+	GetProjectNames() (names []string, err error)
+	GetProjects() (projects []api.Project, err error)
+	GetProject(name string) (project *api.Project, ETag string, err error)
+	CreateProject(project api.ProjectsPost) (err error)
+	UpdateProject(name string, project api.ProjectPut, ETag string) (err error)
+	RenameProject(name string, project api.ProjectPost) (op Operation, err error)
+	DeleteProject(name string) (err error)
+
 	// Storage pool functions ("storage" API extension)
 	GetStoragePoolNames() (names []string, err error)
 	GetStoragePools() (pools []api.StoragePool, err error)
@@ -196,6 +207,15 @@ type ContainerServer interface {
 	CopyStoragePoolVolume(pool string, source ContainerServer, sourcePool string, volume api.StorageVolume, args *StoragePoolVolumeCopyArgs) (op RemoteOperation, err error)
 	MoveStoragePoolVolume(pool string, source ContainerServer, sourcePool string, volume api.StorageVolume, args *StoragePoolVolumeMoveArgs) (op RemoteOperation, err error)
 	MigrateStoragePoolVolume(pool string, volume api.StorageVolumePost) (op Operation, err error)
+
+	// Storage volume snapshot functions ("storage_api_volume_snapshots" API extension)
+	CreateStoragePoolVolumeSnapshot(pool string, volumeType string, volumeName string, snapshot api.StorageVolumeSnapshotsPost) (op Operation, err error)
+	DeleteStoragePoolVolumeSnapshot(pool string, volumeType string, volumeName string, snapshotName string) (op Operation, err error)
+	GetStoragePoolVolumeSnapshotNames(pool string, volumeType string, volumeName string) (names []string, err error)
+	GetStoragePoolVolumeSnapshots(pool string, volumeType string, volumeName string) (snapshots []api.StorageVolumeSnapshot, err error)
+	GetStoragePoolVolumeSnapshot(pool string, volumeType string, volumeName string, snapshotName string) (snapshot *api.StorageVolumeSnapshot, ETag string, err error)
+	RenameStoragePoolVolumeSnapshot(pool string, volumeType string, volumeName string, snapshotName string, snapshot api.StorageVolumeSnapshotPost) (op Operation, err error)
+	UpdateStoragePoolVolumeSnapshot(pool string, volumeType string, volumeName string, snapshotName string, volume api.StorageVolumeSnapshotPut, ETag string) (err error)
 
 	// Cluster functions ("cluster" API extensions)
 	GetCluster() (cluster *api.Cluster, ETag string, err error)
@@ -218,6 +238,7 @@ type ConnectionInfo struct {
 	Certificate string
 	Protocol    string
 	URL         string
+	Project     string
 }
 
 // The ContainerBackupArgs struct is used when creating a container from a backup
@@ -319,6 +340,9 @@ type StoragePoolVolumeCopyArgs struct {
 
 	// The transfer mode, can be "pull" (default), "push" or "relay"
 	Mode string
+
+	// API extension: storage_api_volume_snapshots
+	VolumeOnly bool
 }
 
 // The StoragePoolVolumeMoveArgs struct is used to pass additional options
@@ -340,6 +364,10 @@ type ContainerCopyArgs struct {
 
 	// The transfer mode, can be "pull" (default), "push" or "relay"
 	Mode string
+
+	// API extension: container_incremental_copy
+	// Perform an incremental copy
+	Refresh bool
 }
 
 // The ContainerSnapshotCopyArgs struct is used to pass additional options during container copy

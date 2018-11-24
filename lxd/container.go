@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pkg/errors"
 	"gopkg.in/lxc/go-lxc.v2"
 
 	"github.com/lxc/lxd/lxd/cluster"
@@ -310,7 +311,7 @@ func containerValidConfig(sysOS *sys.OS, config map[string]string, profile bool,
 	return nil
 }
 
-func containerValidDevices(db *db.Cluster, devices types.Devices, profile bool, expanded bool) error {
+func containerValidDevices(cluster *db.Cluster, devices types.Devices, profile bool, expanded bool) error {
 	// Empty device list
 	if devices == nil {
 		return nil
@@ -380,7 +381,7 @@ func containerValidDevices(db *db.Cluster, devices types.Devices, profile bool, 
 				return fmt.Errorf("Only the root disk may have a size quota")
 			}
 
-			if (m["path"] == "/" || !shared.IsDir(m["source"])) && m["recursive"] != "" {
+			if (m["path"] == "/" || !shared.IsDir(shared.HostPath(m["source"]))) && m["recursive"] != "" {
 				return fmt.Errorf("The recursive option is only supported for additional bind-mounted paths")
 			}
 
@@ -389,9 +390,22 @@ func containerValidDevices(db *db.Cluster, devices types.Devices, profile bool, 
 					return fmt.Errorf("Storage volumes cannot be specified as absolute paths")
 				}
 
-				_, err := db.StoragePoolGetID(m["pool"])
+				_, err := cluster.StoragePoolGetID(m["pool"])
 				if err != nil {
 					return fmt.Errorf("The \"%s\" storage pool doesn't exist", m["pool"])
+				}
+
+				if !profile && expanded && m["source"] != "" && m["path"] != "/" {
+					isAvailable, err := cluster.StorageVolumeIsAvailable(
+						m["pool"], m["source"])
+					if err != nil {
+						return errors.Wrap(err, "Check if volume is available")
+					}
+					if !isAvailable {
+						return fmt.Errorf(
+							"Storage volume %q is already attached to a container "+
+								"on a different node", m["source"])
+					}
 				}
 			}
 
@@ -423,9 +437,7 @@ func containerValidDevices(db *db.Cluster, devices types.Devices, profile bool, 
 				}
 			}
 		} else if m["type"] == "usb" {
-			if m["vendorid"] == "" {
-				return fmt.Errorf("Missing vendorid for USB device")
-			}
+			// Nothing needed for usb.
 		} else if m["type"] == "gpu" {
 			if m["pci"] != "" && !shared.PathExists(fmt.Sprintf("/sys/bus/pci/devices/%s", m["pci"])) {
 				return fmt.Errorf("Invalid PCI address (no device found): %s", m["pci"])
@@ -457,7 +469,7 @@ func containerValidDevices(db *db.Cluster, devices types.Devices, profile bool, 
 	if expanded {
 		_, _, err := shared.GetRootDiskDevice(devices)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "Detect root disk device")
 		}
 	}
 
@@ -588,7 +600,7 @@ func containerCreateAsEmpty(d *Daemon, args db.ContainerArgs) (container, error)
 	// Now create the empty storage
 	err = c.Storage().ContainerCreate(c)
 	if err != nil {
-		d.cluster.ContainerRemove(args.Name)
+		c.Delete()
 		return nil, err
 	}
 
@@ -612,7 +624,7 @@ func containerCreateEmptySnapshot(s *state.State, args db.ContainerArgs) (contai
 	// Now create the empty snapshot
 	err = c.Storage().ContainerSnapshotCreateEmpty(c)
 	if err != nil {
-		s.Cluster.ContainerRemove(args.Name)
+		c.Delete()
 		return nil, err
 	}
 
@@ -669,14 +681,14 @@ func containerCreateFromImage(d *Daemon, args db.ContainerArgs, hash string) (co
 
 	err = s.Cluster.ImageLastAccessUpdate(hash, time.Now().UTC())
 	if err != nil {
-		s.Cluster.ContainerRemove(args.Name)
+		c.Delete()
 		return nil, fmt.Errorf("Error updating image last use date: %s", err)
 	}
 
 	// Now create the storage from an image
 	err = c.Storage().ContainerCreateFromImage(c, hash)
 	if err != nil {
-		s.Cluster.ContainerRemove(args.Name)
+		c.Delete()
 		return nil, err
 	}
 
@@ -711,7 +723,7 @@ func containerCreateAsCopy(s *state.State, args db.ContainerArgs, sourceContaine
 	if !containerOnly {
 		snapshots, err := sourceContainer.Snapshots()
 		if err != nil {
-			s.Cluster.ContainerRemove(args.Name)
+			ct.Delete()
 			return nil, err
 		}
 
@@ -752,6 +764,7 @@ func containerCreateAsCopy(s *state.State, args db.ContainerArgs, sourceContaine
 			// Create the snapshots.
 			cs, err := containerCreateInternal(s, csArgs)
 			if err != nil {
+				ct.Delete()
 				return nil, err
 			}
 
@@ -762,10 +775,7 @@ func containerCreateAsCopy(s *state.State, args db.ContainerArgs, sourceContaine
 	// Now clone the storage.
 	err = ct.Storage().ContainerCopy(ct, sourceContainer, containerOnly)
 	if err != nil {
-		for _, v := range csList {
-			s.Cluster.ContainerRemove((*v).Name())
-		}
-		s.Cluster.ContainerRemove(args.Name)
+		ct.Delete()
 		return nil, err
 	}
 
@@ -781,7 +791,7 @@ func containerCreateAsCopy(s *state.State, args db.ContainerArgs, sourceContaine
 			// Apply any post-storage configuration.
 			err = containerConfigureInternal(*cs)
 			if err != nil {
-				(*cs).Delete()
+				ct.Delete()
 				return nil, err
 			}
 		}
@@ -844,12 +854,13 @@ func containerCreateAsSnapshot(s *state.State, args db.ContainerArgs, sourceCont
 	// Clone the container
 	err = sourceContainer.Storage().ContainerSnapshotCreate(c, sourceContainer)
 	if err != nil {
-		s.Cluster.ContainerRemove(args.Name)
+		c.Delete()
 		return nil, err
 	}
 
 	ourStart, err := c.StorageStart()
 	if err != nil {
+		c.Delete()
 		return nil, err
 	}
 	if ourStart {
@@ -915,7 +926,7 @@ func containerCreateInternal(s *state.State, args db.ContainerArgs) (container, 
 	// Validate container devices
 	err = containerValidDevices(s.Cluster, args.Devices, false, false)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "Invalid devices")
 	}
 
 	// Validate architecture
@@ -978,7 +989,7 @@ func containerCreateInternal(s *state.State, args db.ContainerArgs) (container, 
 	c, err := containerLXCCreate(s, args)
 	if err != nil {
 		s.Cluster.ContainerRemove(args.Name)
-		return nil, err
+		return nil, errors.Wrap(err, "Create LXC container")
 	}
 
 	return c, nil

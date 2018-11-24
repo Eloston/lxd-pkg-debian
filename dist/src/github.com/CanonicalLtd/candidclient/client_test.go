@@ -2,10 +2,10 @@ package candidclient_test
 
 import (
 	"sort"
+	"testing"
 
-	jc "github.com/juju/testing/checkers"
+	qt "github.com/frankban/quicktest"
 	"golang.org/x/net/context"
-	gc "gopkg.in/check.v1"
 	"gopkg.in/errgo.v1"
 	"gopkg.in/macaroon-bakery.v2/bakery"
 	"gopkg.in/macaroon-bakery.v2/bakery/identchecker"
@@ -15,11 +15,9 @@ import (
 	"gopkg.in/CanonicalLtd/candidclient.v1/candidtest"
 )
 
-type clientSuite struct{}
-
-var _ = gc.Suite(&clientSuite{})
-
-func (*clientSuite) TestIdentityClient(c *gc.C) {
+func TestIdentityClient(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
 	srv := candidtest.NewServer()
 	srv.AddUser("bob", "alice", "charlie")
 	testIdentityClient(c,
@@ -29,7 +27,9 @@ func (*clientSuite) TestIdentityClient(c *gc.C) {
 	)
 }
 
-func (*clientSuite) TestIdentityClientWithDomainStrip(c *gc.C) {
+func TestIdentityClientWithDomainStrip(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
 	srv := candidtest.NewServer()
 	srv.AddUser("bob@usso", "alice@usso", "charlie@elsewhere")
 	testIdentityClient(c,
@@ -39,7 +39,9 @@ func (*clientSuite) TestIdentityClientWithDomainStrip(c *gc.C) {
 	)
 }
 
-func (*clientSuite) TestIdentityClientWithDomainStripNoDomains(c *gc.C) {
+func TestIdentityClientWithDomainStripNoDomains(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
 	srv := candidtest.NewServer()
 	srv.AddUser("bob", "alice", "charlie")
 	testIdentityClient(c,
@@ -52,7 +54,7 @@ func (*clientSuite) TestIdentityClientWithDomainStripNoDomains(c *gc.C) {
 // testIdentityClient tests that the given identity client can be used to
 // create a third party caveat that when discharged provides
 // an Identity with the given id, user name and groups.
-func testIdentityClient(c *gc.C, candidClient identchecker.IdentityClient, bclient *httpbakery.Client, expectId, expectUser string, expectGroups []string) {
+func testIdentityClient(c *qt.C, candidClient identchecker.IdentityClient, bclient *httpbakery.Client, expectId, expectUser string, expectGroups []string) {
 	kr := httpbakery.NewThirdPartyLocator(nil, nil)
 	kr.AllowInsecure()
 	b := identchecker.NewBakery(identchecker.BakeryParams{
@@ -64,31 +66,31 @@ func testIdentityClient(c *gc.C, candidClient identchecker.IdentityClient, bclie
 	derr := errgo.Cause(authErr).(*bakery.DischargeRequiredError)
 
 	m, err := b.Oven.NewMacaroon(context.TODO(), bakery.LatestVersion, derr.Caveats, derr.Ops...)
-	c.Assert(err, gc.IsNil)
+	c.Assert(err, qt.Equals, nil)
 
 	ms, err := bclient.DischargeAll(context.TODO(), m)
-	c.Assert(err, gc.IsNil)
+	c.Assert(err, qt.Equals, nil)
 
 	// Make sure that the macaroon discharged correctly and that it
 	// has the right declared caveats.
 	authInfo, err := b.Checker.Auth(ms).Allow(context.TODO(), identchecker.LoginOp)
-	c.Assert(err, gc.IsNil)
+	c.Assert(err, qt.Equals, nil)
 
-	c.Assert(authInfo.Identity, gc.NotNil)
-	c.Assert(authInfo.Identity.Id(), gc.Equals, expectId)
-	c.Assert(authInfo.Identity.Domain(), gc.Equals, "")
+	c.Assert(authInfo.Identity, qt.Not(qt.IsNil))
+	c.Assert(authInfo.Identity.Id(), qt.Equals, expectId)
+	c.Assert(authInfo.Identity.Domain(), qt.Equals, "")
 
 	user := authInfo.Identity.(candidclient.Identity)
 
 	u, err := user.Username()
-	c.Assert(err, gc.IsNil)
-	c.Assert(u, gc.Equals, expectUser)
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(u, qt.Equals, expectUser)
 	ok, err := user.Allow(context.TODO(), []string{expectGroups[0]})
-	c.Assert(err, gc.IsNil)
-	c.Assert(ok, gc.Equals, true)
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(ok, qt.Equals, true)
 
 	groups, err := user.Groups()
-	c.Assert(err, gc.IsNil)
+	c.Assert(err, qt.Equals, nil)
 	sort.Strings(groups)
-	c.Assert(groups, jc.DeepEquals, expectGroups)
+	c.Assert(groups, qt.DeepEquals, expectGroups)
 }

@@ -6,10 +6,13 @@ package ussodischarge_test
 import (
 	"net/http"
 	"net/http/httptest"
+	"testing"
 
-	jc "github.com/juju/testing/checkers"
+	qt "github.com/frankban/quicktest"
+	"github.com/frankban/quicktest/qtsuite"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"golang.org/x/net/context"
-	gc "gopkg.in/check.v1"
 	errgo "gopkg.in/errgo.v1"
 	"gopkg.in/httprequest.v1"
 	"gopkg.in/macaroon-bakery.v2/bakery"
@@ -25,6 +28,15 @@ var _ httpbakery.LegacyInteractor = (*ussodischarge.Interactor)(nil)
 
 var testContext = context.Background()
 
+var macaroonEquals = qt.CmpEquals(cmp.AllowUnexported(macaroon.Macaroon{}), cmpopts.EquateEmpty())
+
+func TestClient(t *testing.T) {
+	c := qt.New(t)
+	defer c.Done()
+
+	qtsuite.Run(c, &clientSuite{})
+}
+
 type clientSuite struct {
 	testMacaroon          *bakery.Macaroon
 	testDischargeMacaroon *macaroon.Macaroon
@@ -34,8 +46,6 @@ type clientSuite struct {
 	// If this is nil, an error will be returned instead.
 	macaroon *bakery.Macaroon
 }
-
-var _ = gc.Suite(&clientSuite{})
 
 // ServeHTTP allows us to use the test suite as a handler to test the
 // client methods against.
@@ -52,84 +62,81 @@ func (s *clientSuite) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *clientSuite) SetUpTest(c *gc.C) {
+func (s *clientSuite) Init(c *qt.C) {
 	var err error
 	s.testMacaroon, err = bakery.NewMacaroon([]byte("test rootkey"), []byte("test macaroon"), "test location", bakery.LatestVersion, nil)
-	c.Assert(err, gc.Equals, nil)
+	c.Assert(err, qt.Equals, nil)
 	// Discharge macaroons from Ubuntu SSO will be binary encoded in the version 1 format.
 	s.testDischargeMacaroon, err = macaroon.New([]byte("test discharge rootkey"), []byte("test discharge macaroon"), "test discharge location", macaroon.V1)
-	c.Assert(err, gc.Equals, nil)
+	c.Assert(err, qt.Equals, nil)
 
 	s.srv = httptest.NewServer(s)
+	c.Defer(s.srv.Close)
 	s.macaroon = nil
 }
 
-func (s *clientSuite) TearDownTest(c *gc.C) {
-	s.srv.Close()
-}
-
-func (s *clientSuite) TestMacaroon(c *gc.C) {
+func (s *clientSuite) TestMacaroon(c *qt.C) {
 	s.macaroon = s.testMacaroon
 	m, err := ussodischarge.Macaroon(testContext, nil, s.srv.URL+"/macaroon")
-	c.Assert(err, gc.Equals, nil)
-	c.Assert(m.M(), jc.DeepEquals, s.testMacaroon.M())
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(m.M(), macaroonEquals, s.testMacaroon.M())
 }
 
-func (s *clientSuite) TestMacaroonError(c *gc.C) {
+func (s *clientSuite) TestMacaroonError(c *qt.C) {
 	m, err := ussodischarge.Macaroon(testContext, nil, s.srv.URL+"/macaroon")
-	c.Assert(m, gc.IsNil)
-	c.Assert(err, gc.ErrorMatches, `cannot get macaroon: Get http.*: test error`)
+	c.Assert(m, qt.IsNil)
+	c.Assert(err, qt.ErrorMatches, `cannot get macaroon: Get http.*: test error`)
 }
 
-func (s *clientSuite) TestVisitor(c *gc.C) {
+func (s *clientSuite) TestVisitor(c *qt.C) {
 	v := ussodischarge.NewInteractor(func(_ *httpbakery.Client, url string) (macaroon.Slice, error) {
-		c.Assert(url, gc.Equals, s.srv.URL+"/login")
+		c.Assert(url, qt.Equals, s.srv.URL+"/login")
 		return macaroon.Slice{s.testMacaroon.M()}, nil
 	})
 
 	client := httpbakery.NewClient()
 	req, err := http.NewRequest("GET", "", nil)
-	c.Assert(err, gc.Equals, nil)
+	c.Assert(err, qt.Equals, nil)
 	ierr := httpbakery.NewInteractionRequiredError(nil, req)
 	ussodischarge.SetInteraction(ierr, s.srv.URL+"/login")
 	dt, err := v.Interact(testContext, client, "", ierr)
-	c.Assert(err, gc.Equals, nil)
-	c.Assert(dt, jc.DeepEquals, &httpbakery.DischargeToken{
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(dt, qt.DeepEquals, &httpbakery.DischargeToken{
 		Kind:  "test-kind",
 		Value: []byte("test-value"),
 	})
 }
 
-func (s *clientSuite) TestVisitorMethodNotSupported(c *gc.C) {
+func (s *clientSuite) TestVisitorMethodNotSupported(c *qt.C) {
 	v := ussodischarge.NewInteractor(func(_ *httpbakery.Client, url string) (macaroon.Slice, error) {
 		return nil, errgo.New("function called unexpectedly")
 	})
 	client := httpbakery.NewClient()
 	req, err := http.NewRequest("GET", "", nil)
-	c.Assert(err, gc.Equals, nil)
+	c.Assert(err, qt.Equals, nil)
 	ierr := httpbakery.NewInteractionRequiredError(nil, req)
 	ierr.SetInteraction("other", nil)
 	dt, err := v.Interact(testContext, client, "", ierr)
-	c.Assert(errgo.Cause(err), gc.Equals, httpbakery.ErrInteractionMethodNotFound)
-	c.Assert(dt, gc.IsNil)
+	c.Assert(errgo.Cause(err), qt.Equals, httpbakery.ErrInteractionMethodNotFound)
+	c.Assert(dt, qt.IsNil)
 }
 
-func (s *clientSuite) TestVisitorFunctionError(c *gc.C) {
+func (s *clientSuite) TestVisitorFunctionError(c *qt.C) {
 	v := ussodischarge.NewInteractor(func(_ *httpbakery.Client, url string) (macaroon.Slice, error) {
 		return nil, errgo.WithCausef(nil, testCause, "test error")
 	})
 	client := httpbakery.NewClient()
 	req, err := http.NewRequest("GET", "", nil)
-	c.Assert(err, gc.Equals, nil)
+	c.Assert(err, qt.Equals, nil)
 	ierr := httpbakery.NewInteractionRequiredError(nil, req)
 	ussodischarge.SetInteraction(ierr, s.srv.URL+"/login")
 	dt, err := v.Interact(testContext, client, "", ierr)
-	c.Assert(errgo.Cause(err), gc.Equals, testCause)
-	c.Assert(err, gc.ErrorMatches, "test error")
-	c.Assert(dt, gc.IsNil)
+	c.Assert(errgo.Cause(err), qt.Equals, testCause)
+	c.Assert(err, qt.ErrorMatches, "test error")
+	c.Assert(dt, qt.IsNil)
 }
 
-func (s *clientSuite) TestAcquireDischarge(c *gc.C) {
+func (s *clientSuite) TestAcquireDischarge(c *qt.C) {
 	d := &ussodischarge.Discharger{
 		Email:    "user@example.com",
 		Password: "secret",
@@ -139,11 +146,11 @@ func (s *clientSuite) TestAcquireDischarge(c *gc.C) {
 		Location: s.srv.URL,
 		Id:       []byte("test caveat id"),
 	}, nil)
-	c.Assert(err, gc.Equals, nil)
-	c.Assert(m.M(), jc.DeepEquals, s.testDischargeMacaroon)
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(m.M(), macaroonEquals, s.testDischargeMacaroon)
 }
 
-func (s *clientSuite) TestAcquireDischargeError(c *gc.C) {
+func (s *clientSuite) TestAcquireDischargeError(c *qt.C) {
 	d := &ussodischarge.Discharger{
 		Email:    "user@example.com",
 		Password: "bad-secret",
@@ -153,38 +160,38 @@ func (s *clientSuite) TestAcquireDischargeError(c *gc.C) {
 		Location: s.srv.URL,
 		Id:       []byte("test caveat id"),
 	}, nil)
-	c.Assert(err, gc.ErrorMatches, `Post http.*: Provided email/password is not correct.`)
-	c.Assert(m, gc.IsNil)
+	c.Assert(err, qt.ErrorMatches, `Post http.*: Provided email/password is not correct.`)
+	c.Assert(m, qt.IsNil)
 }
 
-func (s *clientSuite) TestDischargeAll(c *gc.C) {
+func (s *clientSuite) TestDischargeAll(c *qt.C) {
 	m := s.testMacaroon.Clone()
 	err := m.M().AddThirdPartyCaveat([]byte("third party root key"), []byte("third party caveat id"), s.srv.URL)
-	c.Assert(err, gc.Equals, nil)
+	c.Assert(err, qt.Equals, nil)
 	d := &ussodischarge.Discharger{
 		Email:    "user@example.com",
 		Password: "secret",
 		OTP:      "123456",
 	}
 	ms, err := d.DischargeAll(testContext, m)
-	c.Assert(err, gc.Equals, nil)
+	c.Assert(err, qt.Equals, nil)
 	md := s.testDischargeMacaroon.Clone()
 	md.Bind(m.M().Signature())
-	c.Assert(ms, jc.DeepEquals, macaroon.Slice{m.M(), md})
+	c.Assert(ms, macaroonEquals, macaroon.Slice{m.M(), md})
 }
 
-func (s *clientSuite) TestDischargeAllError(c *gc.C) {
+func (s *clientSuite) TestDischargeAllError(c *qt.C) {
 	m := s.testMacaroon.Clone()
 	err := m.M().AddThirdPartyCaveat([]byte("third party root key"), []byte("third party caveat id"), s.srv.URL)
-	c.Assert(err, gc.Equals, nil)
+	c.Assert(err, qt.Equals, nil)
 	d := &ussodischarge.Discharger{
 		Email:    "user@example.com",
 		Password: "bad-secret",
 		OTP:      "123456",
 	}
 	ms, err := d.DischargeAll(testContext, m)
-	c.Assert(err, gc.ErrorMatches, `cannot get discharge from ".*": Post http.*: Provided email/password is not correct.`)
-	c.Assert(ms, gc.IsNil)
+	c.Assert(err, qt.ErrorMatches, `cannot get discharge from ".*": Post http.*: Provided email/password is not correct.`)
+	c.Assert(ms, qt.IsNil)
 }
 
 func (s *clientSuite) serveMacaroon(w http.ResponseWriter, r *http.Request) {
