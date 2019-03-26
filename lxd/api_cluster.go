@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/CanonicalLtd/go-dqlite"
@@ -75,12 +76,80 @@ func clusterGet(d *Daemon, r *http.Request) Response {
 		name = ""
 	}
 
+	memberConfig, err := clusterGetMemberConfig(d.cluster)
+	if err != nil {
+		return SmartError(err)
+	}
+
 	cluster := api.Cluster{
-		ServerName: name,
-		Enabled:    name != "",
+		ServerName:   name,
+		Enabled:      name != "",
+		MemberConfig: memberConfig,
 	}
 
 	return SyncResponseETag(true, cluster, cluster)
+}
+
+// Fetch information about all node-specific configuration keys set on the
+// storage pools and networks of this cluster.
+func clusterGetMemberConfig(cluster *db.Cluster) ([]api.ClusterMemberConfigKey, error) {
+	var pools map[string]map[string]string
+	var networks map[string]map[string]string
+
+	keys := []api.ClusterMemberConfigKey{}
+
+	err := cluster.Transaction(func(tx *db.ClusterTx) error {
+		var err error
+
+		pools, err = tx.StoragePoolsNodeConfig()
+		if err != nil {
+			return errors.Wrapf(err, "Failed to fetch storage pools configuration")
+		}
+
+		networks, err = tx.NetworksNodeConfig()
+		if err != nil {
+			return errors.Wrapf(err, "Failed to fetch networks configuration")
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	for pool, config := range pools {
+		for key := range config {
+			if strings.HasPrefix(key, "volatile.") {
+				continue
+			}
+
+			key := api.ClusterMemberConfigKey{
+				Entity:      "storage-pool",
+				Name:        pool,
+				Key:         key,
+				Description: fmt.Sprintf("\"%s\" property for storage pool \"%s\"", key, pool),
+			}
+			keys = append(keys, key)
+		}
+	}
+
+	for network, config := range networks {
+		for key := range config {
+			if strings.HasPrefix(key, "volatile.") {
+				continue
+			}
+
+			key := api.ClusterMemberConfigKey{
+				Entity:      "network",
+				Name:        network,
+				Key:         key,
+				Description: fmt.Sprintf("\"%s\" property for network \"%s\"", key, network),
+			}
+			keys = append(keys, key)
+		}
+	}
+
+	return keys, nil
 }
 
 // Depending on the parameters passed and on local state this endpoint will
@@ -147,7 +216,32 @@ func clusterPutBootstrap(d *Daemon, req api.ClusterPut) Response {
 	resources := map[string][]string{}
 	resources["cluster"] = []string{}
 
-	op, err := operationCreate(d.cluster, operationClassTask, "Creating bootstrap node", resources, nil, run, nil, nil)
+	// If there's no cluster.https_address set, but core.https_address is,
+	// let's default to it.
+	d.db.Transaction(func(tx *db.NodeTx) error {
+		config, err := node.ConfigLoad(tx)
+		if err != nil {
+			return errors.Wrap(err, "Fetch node configuration")
+		}
+
+		clusterAddress := config.ClusterAddress()
+		if clusterAddress != "" {
+			return nil
+		}
+
+		address := config.HTTPSAddress()
+
+		_, err = config.Patch(map[string]interface{}{
+			"cluster.https_address": address,
+		})
+		if err != nil {
+			return errors.Wrap(err, "Copy core.https_address to cluster.https_address")
+		}
+
+		return nil
+	})
+
+	op, err := operationCreate(d.cluster, "", operationClassTask, db.OperationClusterBootstrap, resources, nil, run, nil, nil)
 	if err != nil {
 		return InternalError(err)
 	}
@@ -163,39 +257,82 @@ func clusterPutJoin(d *Daemon, req api.ClusterPut) Response {
 	if len(req.ClusterCertificate) == 0 {
 		return BadRequest(fmt.Errorf("No target cluster node certificate provided"))
 	}
+
+	clusterAddress, err := node.ClusterAddress(d.db)
+	if err != nil {
+		return SmartError(err)
+	}
+	if clusterAddress != "" {
+		return BadRequest(fmt.Errorf("This server is already clustered"))
+	}
+
 	address, err := node.HTTPSAddress(d.db)
 	if err != nil {
 		return SmartError(err)
 	}
-	if address == "" {
-		return BadRequest(fmt.Errorf("No core.https_address config key is set on this node"))
-	}
 
-	// Get all defined storage pools and networks, so they can be compared
-	// to the ones in the cluster.
-	pools := []api.StoragePool{}
-	poolNames, err := d.cluster.StoragePools()
-	if err != nil && err != db.ErrNoSuchObject {
-		return SmartError(err)
-	}
-	for _, name := range poolNames {
-		_, pool, err := d.cluster.StoragePoolGet(name)
+	if address == "" {
+		if req.ServerAddress == "" {
+			return BadRequest(fmt.Errorf("No core.https_address config key is set on this node"))
+		}
+
+		// The user has provided a server address, and no networking
+		// was setup on this node, let's do the job and open the
+		// port. We'll use the same address both for the REST API and
+		// for clustering.
+
+		// First try to listen to the provided address. If we fail, we
+		// won't actually update the database config.
+		err = d.endpoints.NetworkUpdateAddress(req.ServerAddress)
 		if err != nil {
 			return SmartError(err)
 		}
-		pools = append(pools, *pool)
-	}
-	networks := []api.Network{}
-	networkNames, err := d.cluster.Networks()
-	if err != nil && err != db.ErrNoSuchObject {
-		return SmartError(err)
-	}
-	for _, name := range networkNames {
-		_, network, err := d.cluster.NetworkGet(name)
+
+		err := d.db.Transaction(func(tx *db.NodeTx) error {
+			config, err := node.ConfigLoad(tx)
+			if err != nil {
+				return errors.Wrap(err, "Failed to load cluster config")
+			}
+
+			_, err = config.Patch(map[string]interface{}{
+				"core.https_address":    req.ServerAddress,
+				"cluster.https_address": req.ServerAddress,
+			})
+			return err
+		})
 		if err != nil {
 			return SmartError(err)
 		}
-		networks = append(networks, *network)
+
+		address = req.ServerAddress
+	} else {
+		if req.ServerAddress != "" {
+			// The user has previously set core.https_address and
+			// is now providing a cluster address as well. If they
+			// differ we need to listen to it.
+			if !util.IsAddressCovered(req.ServerAddress, address) {
+				err := d.endpoints.ClusterUpdateAddress(req.ServerAddress)
+				if err != nil {
+					return SmartError(err)
+				}
+				address = req.ServerAddress
+			}
+		}
+
+		// Update the cluster.https_address config key.
+		err := d.db.Transaction(func(tx *db.NodeTx) error {
+			config, err := node.ConfigLoad(tx)
+			if err != nil {
+				return errors.Wrap(err, "Failed to load cluster config")
+			}
+			_, err = config.Patch(map[string]interface{}{
+				"cluster.https_address": address,
+			})
+			return err
+		})
+		if err != nil {
+			return SmartError(err)
+		}
 	}
 
 	// Client parameters to connect to the target cluster node.
@@ -210,12 +347,71 @@ func clusterPutJoin(d *Daemon, req api.ClusterPut) Response {
 	// Asynchronously join the cluster.
 	run := func(op *operation) error {
 		logger.Debug("Running cluster join operation")
-		// First request for this node to be added to the list of
-		// cluster nodes.
+
+		// If the user has provided a cluster password, setup the trust
+		// relationship by adding our own certificate to the cluster.
+		if req.ClusterPassword != "" {
+			err = cluster.SetupTrust(string(cert.PublicKey()), req.ClusterAddress,
+				string(req.ClusterCertificate), req.ClusterPassword)
+			if err != nil {
+				return errors.Wrap(err, "Failed to setup cluster trust")
+			}
+		}
+
+		// Connect to the target cluster node.
 		client, err := lxd.ConnectLXD(fmt.Sprintf("https://%s", req.ClusterAddress), args)
 		if err != nil {
 			return err
 		}
+
+		// If the ServerAddress field is set it means that we're using
+		// the new join API introduced with the 'clustering_join'
+		// extension.
+		if req.ServerAddress != "" {
+			// Connect to ourselves to initialize storage pools and
+			// networks using the API.
+			d, err := lxd.ConnectLXDUnix(d.UnixSocket(), nil)
+			if err != nil {
+				return errors.Wrap(err, "Failed to connect to local LXD")
+			}
+
+			err = clusterInitMember(d, client, req.MemberConfig)
+			if err != nil {
+				return errors.Wrap(err, "Failed to initialize member")
+			}
+		}
+
+		// Get all defined storage pools and networks, so they can be compared
+		// to the ones in the cluster.
+		pools := []api.StoragePool{}
+		poolNames, err := d.cluster.StoragePools()
+		if err != nil && err != db.ErrNoSuchObject {
+			return err
+		}
+
+		for _, name := range poolNames {
+			_, pool, err := d.cluster.StoragePoolGet(name)
+			if err != nil {
+				return err
+			}
+			pools = append(pools, *pool)
+		}
+
+		networks := []api.Network{}
+		networkNames, err := d.cluster.Networks()
+		if err != nil && err != db.ErrNoSuchObject {
+			return err
+		}
+
+		for _, name := range networkNames {
+			_, network, err := d.cluster.NetworkGet(name)
+			if err != nil {
+				return err
+			}
+			networks = append(networks, *network)
+		}
+
+		// Now request for this node to be added to the list of cluster nodes.
 		info, err := clusterAcceptMember(
 			client, req.ServerName, address, cluster.SchemaVersion,
 			version.APIExtensionsCount(), pools, networks)
@@ -274,7 +470,7 @@ func clusterPutJoin(d *Daemon, req api.ClusterPut) Response {
 		}
 
 		// For ceph pools we have to create the mount points too.
-		poolNames, err := d.cluster.StoragePools()
+		poolNames, err = d.cluster.StoragePools()
 		if err != nil && err != db.ErrNoSuchObject {
 			return err
 		}
@@ -327,6 +523,56 @@ func clusterPutJoin(d *Daemon, req api.ClusterPut) Response {
 			return err
 		}
 
+		// Re-use the client handler and import the images from the leader node which
+		// owns all available images to the joined node
+		go func() {
+			leader, err := d.gateway.LeaderAddress()
+			if err != nil {
+				logger.Errorf("Failed to get current leader node: %v", err)
+				return
+			}
+			var nodeInfo db.NodeInfo
+			err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
+				var err error
+				nodeInfo, err = tx.NodeByAddress(leader)
+				return err
+			})
+			if err != nil {
+				logger.Errorf("Failed to retrieve the information of leader node: %v", err)
+				return
+			}
+			imageProjectInfo, err := d.cluster.ImagesGetByNodeID(nodeInfo.ID)
+			if err != nil {
+				logger.Errorf("Failed to retrieve the image fingerprints of leader node: %v", err)
+				return
+			}
+
+			imageImport := func(client lxd.ContainerServer, fingerprint string, projects []string) error {
+				err := imageImportFromNode(filepath.Join(d.os.VarDir, "images"), client, fingerprint)
+				if err != nil {
+					return err
+				}
+
+				for _, project := range projects {
+					err := d.cluster.ImageAssociateNode(project, fingerprint)
+					if err != nil {
+						return err
+					}
+				}
+
+				return nil
+			}
+
+			for f, ps := range imageProjectInfo {
+				go func(fingerprint string, projects []string) {
+					err := imageImport(client, fingerprint, projects)
+					if err != nil {
+						logger.Errorf("Failed to import an image %s from %s: %v", fingerprint, leader, err)
+					}
+				}(f, ps)
+			}
+		}()
+
 		// Add the cluster flag from the agent
 		version.UserAgentFeatures([]string{"cluster"})
 
@@ -336,7 +582,7 @@ func clusterPutJoin(d *Daemon, req api.ClusterPut) Response {
 	resources := map[string][]string{}
 	resources["cluster"] = []string{}
 
-	op, err := operationCreate(d.cluster, operationClassTask, "Joining cluster", resources, nil, run, nil, nil)
+	op, err := operationCreate(d.cluster, "", operationClassTask, db.OperationClusterJoin, resources, nil, run, nil, nil)
 	if err != nil {
 		return InternalError(err)
 	}
@@ -398,6 +644,117 @@ func clusterPutDisable(d *Daemon) Response {
 	version.UserAgentFeatures(nil)
 
 	return EmptySyncResponse
+}
+
+// Initialize storage pools and networks on this node.
+//
+// We pass to LXD client instances, one connected to ourselves (the joining
+// node) and one connected to the target cluster node to join.
+func clusterInitMember(d, client lxd.ContainerServer, memberConfig []api.ClusterMemberConfigKey) error {
+	data := initDataNode{}
+
+	// Fetch all pools currently defined in the cluster.
+	pools, err := client.GetStoragePools()
+	if err != nil {
+		return errors.Wrap(err, "Failed to fetch information about cluster storage pools")
+	}
+
+	// Merge the returned storage pools configs with the node-specific
+	// configs provided by the user.
+	for _, pool := range pools {
+		// Skip pending pools.
+		if pool.Status == "Pending" {
+			continue
+		}
+
+		// Skip ceph pools since they have no node-specific key and
+		// don't need to be defined on joining nodes.
+		if pool.Driver == "ceph" {
+			continue
+		}
+
+		logger.Debugf("Populating init data for storage pool %s", pool.Name)
+
+		post := api.StoragePoolsPost{
+			StoragePoolPut: pool.StoragePoolPut,
+			Driver:         pool.Driver,
+			Name:           pool.Name,
+		}
+
+		// Delete config keys that are automatically populated by LXD
+		delete(post.Config, "volatile.initial_source")
+		delete(post.Config, "zfs.pool_name")
+
+		// Apply the node-specific config supplied by the user.
+		for _, config := range memberConfig {
+			if config.Entity != "storage-pool" {
+				continue
+			}
+
+			if config.Name != pool.Name {
+				continue
+			}
+
+			if !shared.StringInSlice(config.Key, db.StoragePoolNodeConfigKeys) {
+				logger.Warnf("Ignoring config key %s for storage pool %s", config.Key, config.Name)
+				continue
+			}
+
+			post.Config[config.Key] = config.Value
+		}
+
+		data.StoragePools = append(data.StoragePools, post)
+	}
+
+	// Fetch all networks currently defined in the cluster.
+	networks, err := client.GetNetworks()
+	if err != nil {
+		return errors.Wrap(err, "Failed to fetch information about cluster networks")
+	}
+
+	// Merge the returned storage networks configs with the node-specific
+	// configs provided by the user.
+	for _, network := range networks {
+		// Skip not-managed or pending networks
+		if !network.Managed || network.Status == "Pending" {
+			continue
+		}
+
+		post := api.NetworksPost{
+			NetworkPut: network.NetworkPut,
+			Managed:    true,
+			Name:       network.Name,
+			Type:       network.Type,
+		}
+
+		// Apply the node-specific config supplied by the user.
+		for _, config := range memberConfig {
+			if config.Entity != "network" {
+				continue
+			}
+
+			if config.Name != network.Name {
+				continue
+			}
+
+			if !shared.StringInSlice(config.Key, db.NetworkNodeConfigKeys) {
+				logger.Warnf("Ignoring config key %s for network %s", config.Key, config.Name)
+				continue
+			}
+
+			post.Config[config.Key] = config.Value
+		}
+
+		data.Networks = append(data.Networks, post)
+	}
+
+	revert, err := initDataNodeApply(d, data)
+	if err != nil {
+		revert()
+		return errors.Wrap(err, "Failed to initialize storage pools and networks")
+	}
+
+	return nil
 }
 
 // Perform a request to the /internal/cluster/accept endpoint to check if a new
@@ -605,7 +962,7 @@ func internalClusterPostAccept(d *Daemon, r *http.Request) Response {
 
 	// Redirect all requests to the leader, which is the one with
 	// knowning what nodes are part of the raft cluster.
-	address, err := node.HTTPSAddress(d.db)
+	address, err := node.ClusterAddress(d.db)
 	if err != nil {
 		return SmartError(err)
 	}
@@ -676,7 +1033,7 @@ type internalRaftNode struct {
 func internalClusterPostRebalance(d *Daemon, r *http.Request) Response {
 	// Redirect all requests to the leader, which is the one with with
 	// up-to-date knowledge of what nodes are part of the raft cluster.
-	localAddress, err := node.HTTPSAddress(d.db)
+	localAddress, err := node.ClusterAddress(d.db)
 	if err != nil {
 		return SmartError(err)
 	}

@@ -26,7 +26,19 @@ func zfsIsEnabled() bool {
 	return true
 }
 
-// zfsModuleVersionGet returhs the ZFS module version
+// zfsToolVersionGet returns the ZFS tools version
+func zfsToolVersionGet() (string, error) {
+	// This function is only really ever relevant on Ubuntu as the only
+	// distro that ships out of sync tools and kernel modules
+	out, err := shared.RunCommand("dpkg-query", "--showformat=${Version}", "--show", "zfsutils-linux")
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(out)), nil
+}
+
+// zfsModuleVersionGet returns the ZFS module version
 func zfsModuleVersionGet() (string, error) {
 	var zfsVersion string
 
@@ -75,6 +87,23 @@ func zfsPoolCheck(pool string) error {
 	}
 
 	return nil
+}
+
+// zfsPoolVolumeExists verifies if a specific ZFS pool or volume exists.
+func zfsPoolVolumeExists(dataset string) (bool, error) {
+	output, err := shared.RunCommand(
+		"zfs", "list", "-Ho", "name")
+
+	if err != nil {
+		return false, err
+	}
+
+	for _, name := range strings.Split(output, "\n") {
+		if name == dataset {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func zfsPoolCreate(pool string, vdev string) error {
@@ -144,7 +173,7 @@ func zfsPoolApplyDefaults(dataset string) error {
 	return nil
 }
 
-func zfsPoolVolumeClone(pool string, source string, name string, dest string, mountpoint string) error {
+func zfsPoolVolumeClone(project, pool string, source string, name string, dest string, mountpoint string) error {
 	output, err := shared.RunCommand(
 		"zfs",
 		"clone",
@@ -174,7 +203,7 @@ func zfsPoolVolumeClone(pool string, source string, name string, dest string, mo
 		}
 
 		destSubvol := dest + strings.TrimPrefix(sub, source)
-		snapshotMntPoint := getSnapshotMountPoint(pool, destSubvol)
+		snapshotMntPoint := getSnapshotMountPoint(project, pool, destSubvol)
 
 		output, err := shared.RunCommand(
 			"zfs",
@@ -594,11 +623,12 @@ func zfsFilesystemEntityExists(pool string, path string) bool {
 	return detectedName == vdev
 }
 
-func (s *storageZfs) doContainerMount(name string, privileged bool) (bool, error) {
+func (s *storageZfs) doContainerMount(project, name string, privileged bool) (bool, error) {
 	logger.Debugf("Mounting ZFS storage volume for container \"%s\" on storage pool \"%s\"", s.volume.Name, s.pool.Name)
 
-	fs := fmt.Sprintf("containers/%s", name)
-	containerPoolVolumeMntPoint := getContainerMountPoint(s.pool.Name, name)
+	volumeName := projectPrefix(project, name)
+	fs := fmt.Sprintf("containers/%s", volumeName)
+	containerPoolVolumeMntPoint := getContainerMountPoint(project, s.pool.Name, name)
 
 	containerMountLockID := getContainerMountLockID(s.pool.Name, name)
 	lxdStorageMapLock.Lock()
@@ -629,7 +659,7 @@ func (s *storageZfs) doContainerMount(name string, privileged bool) (bool, error
 	// Since we're using mount() directly zfs will not automatically create
 	// the mountpoint for us. So let's check and do it if needed.
 	if !shared.PathExists(containerPoolVolumeMntPoint) {
-		err := createContainerMountpoint(containerPoolVolumeMntPoint, shared.VarPath("containers", name), privileged)
+		err := createContainerMountpoint(containerPoolVolumeMntPoint, shared.VarPath(fs), privileged)
 		if err != nil {
 			return false, err
 		}
@@ -642,7 +672,7 @@ func (s *storageZfs) doContainerMount(name string, privileged bool) (bool, error
 		mounterr := tryMount(source, containerPoolVolumeMntPoint, "zfs", 0, zfsMountOptions)
 		if mounterr != nil {
 			if mounterr != syscall.EBUSY {
-				logger.Errorf("Failed to mount ZFS dataset \"%s\" onto \"%s\"", source, containerPoolVolumeMntPoint)
+				logger.Errorf("Failed to mount ZFS dataset \"%s\" onto \"%s\": %v", source, containerPoolVolumeMntPoint, mounterr)
 				return false, mounterr
 			}
 			// EBUSY error in zfs are related to a bug we're
@@ -658,13 +688,13 @@ func (s *storageZfs) doContainerMount(name string, privileged bool) (bool, error
 	return ourMount, nil
 }
 
-func (s *storageZfs) doContainerDelete(name string) error {
+func (s *storageZfs) doContainerDelete(project, name string) error {
 	logger.Debugf("Deleting ZFS storage volume for container \"%s\" on storage pool \"%s\"", s.volume.Name, s.pool.Name)
 
 	poolName := s.getOnDiskPoolName()
 	containerName := name
-	fs := fmt.Sprintf("containers/%s", containerName)
-	containerPoolVolumeMntPoint := getContainerMountPoint(s.pool.Name, containerName)
+	fs := fmt.Sprintf("containers/%s", projectPrefix(project, containerName))
+	containerPoolVolumeMntPoint := getContainerMountPoint(project, s.pool.Name, containerName)
 
 	if zfsFilesystemEntityExists(poolName, fs) {
 		removable := true
@@ -715,7 +745,7 @@ func (s *storageZfs) doContainerDelete(name string) error {
 		}
 	}
 
-	err := deleteContainerMountpoint(containerPoolVolumeMntPoint, shared.VarPath("containers", name), s.GetStorageTypeName())
+	err := deleteContainerMountpoint(containerPoolVolumeMntPoint, shared.VarPath("containers", projectPrefix(project, name)), s.GetStorageTypeName())
 	if err != nil {
 		return err
 	}
@@ -724,7 +754,7 @@ func (s *storageZfs) doContainerDelete(name string) error {
 	zfsPoolVolumeDestroy(poolName, snapshotZfsDataset)
 
 	// Delete potential leftover snapshot mountpoints.
-	snapshotMntPoint := getSnapshotMountPoint(s.pool.Name, containerName)
+	snapshotMntPoint := getSnapshotMountPoint(project, s.pool.Name, containerName)
 	if shared.PathExists(snapshotMntPoint) {
 		err := os.RemoveAll(snapshotMntPoint)
 		if err != nil {
@@ -734,7 +764,7 @@ func (s *storageZfs) doContainerDelete(name string) error {
 
 	// Delete potential leftover snapshot symlinks:
 	// ${LXD_DIR}/snapshots/<container_name> to ${POOL}/snapshots/<container_name>
-	snapshotSymlink := shared.VarPath("snapshots", containerName)
+	snapshotSymlink := shared.VarPath("snapshots", projectPrefix(project, containerName))
 	if shared.PathExists(snapshotSymlink) {
 		err := os.Remove(snapshotSymlink)
 		if err != nil {
@@ -746,15 +776,15 @@ func (s *storageZfs) doContainerDelete(name string) error {
 	return nil
 }
 
-func (s *storageZfs) doContainerCreate(name string, privileged bool) error {
+func (s *storageZfs) doContainerCreate(project, name string, privileged bool) error {
 	logger.Debugf("Creating empty ZFS storage volume for container \"%s\" on storage pool \"%s\"", s.volume.Name, s.pool.Name)
 
-	containerPath := shared.VarPath("containers", name)
+	containerPath := shared.VarPath("containers", projectPrefix(project, name))
 	containerName := name
-	fs := fmt.Sprintf("containers/%s", containerName)
+	fs := fmt.Sprintf("containers/%s", projectPrefix(project, containerName))
 	poolName := s.getOnDiskPoolName()
 	dataset := fmt.Sprintf("%s/%s", poolName, fs)
-	containerPoolVolumeMntPoint := getContainerMountPoint(s.pool.Name, containerName)
+	containerPoolVolumeMntPoint := getContainerMountPoint(project, s.pool.Name, containerName)
 
 	// Create volume.
 	msg, err := zfsPoolVolumeCreate(dataset, "mountpoint=none", "canmount=noauto")

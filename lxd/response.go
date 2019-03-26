@@ -191,9 +191,9 @@ func ForwardedResponseIfTargetIsRemote(d *Daemon, request *http.Request) Respons
 // ForwardedResponseIfContainerIsRemote redirects a request to the node running
 // the container with the given name. If the container is local, nothing gets
 // done and nil is returned.
-func ForwardedResponseIfContainerIsRemote(d *Daemon, r *http.Request, name string) (Response, error) {
+func ForwardedResponseIfContainerIsRemote(d *Daemon, r *http.Request, project, name string) (Response, error) {
 	cert := d.endpoints.NetworkCert()
-	client, err := cluster.ConnectIfContainerIsRemote(d.cluster, name, cert)
+	client, err := cluster.ConnectIfContainerIsRemote(d.cluster, project, name, cert)
 	if err != nil {
 		return nil, err
 	}
@@ -386,11 +386,15 @@ func OperationResponse(op *operation) Response {
 //
 // Returned when the operation has been created on another node
 type forwardedOperationResponse struct {
-	op *api.Operation
+	op      *api.Operation
+	project string
 }
 
 func (r *forwardedOperationResponse) Render(w http.ResponseWriter) error {
 	url := fmt.Sprintf("/%s/operations/%s", version.APIVersion, r.op.ID)
+	if r.project != "" {
+		url += fmt.Sprintf("?project=%s", r.project)
+	}
 
 	body := api.ResponseRaw{
 		Type:       api.AsyncResponse,
@@ -412,8 +416,11 @@ func (r *forwardedOperationResponse) String() string {
 
 // ForwardedOperationResponse creates a response that forwards the metadata of
 // an operation created on another node.
-func ForwardedOperationResponse(op *api.Operation) Response {
-	return &forwardedOperationResponse{op}
+func ForwardedOperationResponse(project string, op *api.Operation) Response {
+	return &forwardedOperationResponse{
+		op:      op,
+		project: project,
+	}
 }
 
 // Error response

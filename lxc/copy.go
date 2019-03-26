@@ -10,6 +10,7 @@ import (
 	"github.com/lxc/lxd/lxc/config"
 	"github.com/lxc/lxd/lxc/utils"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
 	cli "github.com/lxc/lxd/shared/cmd"
 	"github.com/lxc/lxd/shared/i18n"
 )
@@ -25,7 +26,10 @@ type cmdCopy struct {
 	flagContainerOnly bool
 	flagMode          string
 	flagStateless     bool
+	flagStorage       string
 	flagTarget        string
+	flagTargetProject string
+	flagRefresh       bool
 }
 
 func (c *cmdCopy) Command() *cobra.Command {
@@ -44,15 +48,18 @@ func (c *cmdCopy) Command() *cobra.Command {
 	cmd.Flags().StringVar(&c.flagMode, "mode", "pull", i18n.G("Transfer mode. One of pull (default), push or relay")+"``")
 	cmd.Flags().BoolVar(&c.flagContainerOnly, "container-only", false, i18n.G("Copy the container without its snapshots"))
 	cmd.Flags().BoolVar(&c.flagStateless, "stateless", false, i18n.G("Copy a stateful container stateless"))
+	cmd.Flags().StringVarP(&c.flagStorage, "storage", "s", "", i18n.G("Storage pool name")+"``")
 	cmd.Flags().StringVar(&c.flagTarget, "target", "", i18n.G("Cluster member name")+"``")
+	cmd.Flags().StringVar(&c.flagTargetProject, "target-project", "", i18n.G("Copy to a project different from the source")+"``")
 	cmd.Flags().BoolVar(&c.flagNoProfiles, "no-profiles", false, i18n.G("Create the container with no profiles applied"))
+	cmd.Flags().BoolVar(&c.flagRefresh, "refresh", false, i18n.G("Perform an incremental copy"))
 
 	return cmd
 }
 
 func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 	destResource string, keepVolatile bool, ephemeral int, stateful bool,
-	containerOnly bool, mode string) error {
+	containerOnly bool, mode string, pool string) error {
 	// Parse the source
 	sourceRemote, sourceName, err := conf.ParseRemote(sourceResource)
 	if err != nil {
@@ -98,6 +105,12 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 			return err
 		}
 	}
+
+	// Project copies
+	if c.flagTargetProject != "" {
+		dest = dest.UseProject(c.flagTargetProject)
+	}
+
 	// Confirm that --target is only used with a cluster
 	if c.flagTarget != "" && !dest.IsClustered() {
 		return fmt.Errorf(i18n.G("To use --target, the destination remote must be a cluster"))
@@ -132,6 +145,8 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 	}
 
 	var op lxd.RemoteOperation
+	var writable api.ContainerPut
+
 	if shared.IsSnapshot(sourceName) {
 		if containerOnly {
 			return fmt.Errorf(i18n.G("--container-only can't be passed when the source is a snapshot"))
@@ -142,6 +157,10 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 			Name: destName,
 			Mode: mode,
 			Live: stateful,
+		}
+
+		if c.flagRefresh {
+			return fmt.Errorf(i18n.G("--refresh can only be used with containers"))
 		}
 
 		// Copy of a snapshot into a new container
@@ -186,6 +205,21 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 			entry.Ephemeral = false
 		}
 
+		rootDiskDeviceKey, _, _ := shared.GetRootDiskDevice(entry.Devices)
+		if err != nil {
+			return err
+		}
+
+		if rootDiskDeviceKey != "" && pool != "" {
+			entry.Devices[rootDiskDeviceKey]["pool"] = pool
+		} else if pool != "" {
+			entry.Devices["root"] = map[string]string{
+				"type": "disk",
+				"path": "/",
+				"pool": pool,
+			}
+		}
+
 		// Strip the volatile keys if requested
 		if !keepVolatile {
 			for k := range entry.Config {
@@ -215,6 +249,7 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 			Live:          stateful,
 			ContainerOnly: containerOnly,
 			Mode:          mode,
+			Refresh:       c.flagRefresh,
 		}
 
 		// Copy of a container into a new container
@@ -258,6 +293,21 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 			entry.Ephemeral = false
 		}
 
+		rootDiskDeviceKey, _, _ := shared.GetRootDiskDevice(entry.Devices)
+		if err != nil {
+			return err
+		}
+
+		if rootDiskDeviceKey != "" && pool != "" {
+			entry.Devices[rootDiskDeviceKey]["pool"] = pool
+		} else if pool != "" {
+			entry.Devices["root"] = map[string]string{
+				"type": "disk",
+				"path": "/",
+				"pool": pool,
+			}
+		}
+
 		// Strip the volatile keys if requested
 		if !keepVolatile {
 			for k := range entry.Config {
@@ -280,10 +330,16 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 		if err != nil {
 			return err
 		}
+
+		writable = entry.Writable()
 	}
 
 	// Watch the background operation
-	progress := utils.ProgressRenderer{Format: i18n.G("Transferring container: %s")}
+	progress := utils.ProgressRenderer{
+		Format: i18n.G("Transferring container: %s"),
+		Quiet:  c.global.flagQuiet,
+	}
+
 	_, err = op.AddHandler(progress.UpdateOp)
 	if err != nil {
 		progress.Done("")
@@ -297,6 +353,38 @@ func (c *cmdCopy) copyContainer(conf *config.Config, sourceResource string,
 		return err
 	}
 	progress.Done("")
+
+	if c.flagRefresh {
+		_, etag, err := dest.GetContainer(destName)
+		if err != nil {
+			return fmt.Errorf("Failed to refresh target container '%s': %v", destName, err)
+		}
+
+		op, err := dest.UpdateContainer(destName, writable, etag)
+		if err != nil {
+			return err
+		}
+
+		// Watch the background operation
+		progress := utils.ProgressRenderer{
+			Format: i18n.G("Refreshing container: %s"),
+			Quiet:  c.global.flagQuiet,
+		}
+
+		_, err = op.AddHandler(progress.UpdateOp)
+		if err != nil {
+			progress.Done("")
+			return err
+		}
+
+		// Wait for the copy to complete
+		err = utils.CancelableWait(op, &progress)
+		if err != nil {
+			progress.Done("")
+			return err
+		}
+		progress.Done("")
+	}
 
 	// If choosing a random name, show it to the user
 	if destResource == "" {
@@ -341,15 +429,15 @@ func (c *cmdCopy) Run(cmd *cobra.Command, args []string) error {
 		mode = c.flagMode
 	}
 
-	stateful := !c.flagStateless
+	stateful := !c.flagStateless && !c.flagRefresh
 
 	// If not target name is specified, one will be chosed by the server
 	if len(args) < 2 {
 		return c.copyContainer(conf, args[0], "", false, ephem,
-			stateful, c.flagContainerOnly, mode)
+			stateful, c.flagContainerOnly, mode, c.flagStorage)
 	}
 
 	// Normal copy with a pre-determined name
 	return c.copyContainer(conf, args[0], args[1], false, ephem,
-		stateful, c.flagContainerOnly, mode)
+		stateful, c.flagContainerOnly, mode, c.flagStorage)
 }

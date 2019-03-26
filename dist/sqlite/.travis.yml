@@ -16,6 +16,7 @@ script:
   - make amalgamation-tarball
   - tar cfz build-amd64.tar.gz --transform 's|.libs/||g' sqlite3.h .libs/libsqlite3.so*
   - mkdir deploy
+  - git fetch origin refs/tags/version-$(cat VERSION):refs/tags/version-$(cat VERSION)
   - git diff -r version-$(cat VERSION) > patch
   - mv build-amd64.tar.gz deploy/sqlite-amd64${DEBUG}-$(cat VERSION).tar.gz
   - \[ -n "$DEBUG" \] || mv sqlite-autoconf-*.tar.gz deploy/sqlite-src-$(cat VERSION).tar.gz

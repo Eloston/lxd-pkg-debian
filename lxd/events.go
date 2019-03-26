@@ -42,16 +42,16 @@ func logContextMap(ctx []interface{}) map[string]string {
 }
 
 func (h eventsHandler) Log(r *log.Record) error {
-	eventSend("logging", api.EventLogging{
+	eventSend("", "logging", api.EventLogging{
 		Message: r.Msg,
 		Level:   r.Lvl.String(),
 		Context: logContextMap(r.Ctx)})
 	return nil
 }
 
-func eventSendLifecycle(action, source string,
+func eventSendLifecycle(project, action, source string,
 	context map[string]interface{}) error {
-	eventSend("lifecycle", api.EventLifecycle{
+	eventSend(project, "lifecycle", api.EventLifecycle{
 		Action:  action,
 		Source:  source,
 		Context: context})
@@ -62,6 +62,7 @@ var eventsLock sync.Mutex
 var eventListeners map[string]*eventListener = make(map[string]*eventListener)
 
 type eventListener struct {
+	project      string
 	connection   *websocket.Conn
 	messageTypes []string
 	active       chan bool
@@ -88,6 +89,7 @@ func (r *eventsServe) String() string {
 }
 
 func eventsSocket(r *http.Request, w http.ResponseWriter) error {
+	project := projectParam(r)
 	typeStr := r.FormValue("type")
 	if typeStr == "" {
 		typeStr = "logging,operation,lifecycle"
@@ -99,6 +101,7 @@ func eventsSocket(r *http.Request, w http.ResponseWriter) error {
 	}
 
 	listener := eventListener{
+		project:      project,
 		active:       make(chan bool, 1),
 		connection:   c,
 		id:           uuid.NewRandom().String(),
@@ -125,30 +128,38 @@ func eventsGet(d *Daemon, r *http.Request) Response {
 	return &eventsServe{req: r}
 }
 
-func eventSend(eventType string, eventMessage interface{}) error {
-	event := shared.Jmap{}
-	event["type"] = eventType
-	event["timestamp"] = time.Now()
-	event["metadata"] = eventMessage
+func eventSend(project, eventType string, eventMessage interface{}) error {
+	encodedMessage, err := json.Marshal(eventMessage)
+	if err != nil {
+		return err
+	}
+	event := api.Event{
+		Type:      eventType,
+		Timestamp: time.Now(),
+		Metadata:  encodedMessage,
+	}
 
-	return eventBroadcast(event)
+	return eventBroadcast(project, event, false)
 }
 
-func eventBroadcast(event shared.Jmap) error {
+func eventBroadcast(project string, event api.Event, isForward bool) error {
 	body, err := json.Marshal(event)
 	if err != nil {
 		return err
 	}
 
-	_, isForward := event["node"]
 	eventsLock.Lock()
 	listeners := eventListeners
 	for _, listener := range listeners {
+		if project != "" && listener.project != "*" && project != listener.project {
+			continue
+		}
+
 		if isForward && listener.noForward {
 			continue
 		}
 
-		if !shared.StringInSlice(event["type"].(string), listener.messageTypes) {
+		if !shared.StringInSlice(event.Type, listener.messageTypes) {
 			continue
 		}
 
@@ -167,7 +178,7 @@ func eventBroadcast(event shared.Jmap) error {
 				return
 			}
 
-			err = listener.connection.WriteMessage(websocket.TextMessage, body)
+			err := listener.connection.WriteMessage(websocket.TextMessage, body)
 			if err != nil {
 				// Remove the listener from the list
 				eventsLock.Lock()
@@ -188,11 +199,8 @@ func eventBroadcast(event shared.Jmap) error {
 }
 
 // Forward to the local events dispatcher an event received from another node .
-func eventForward(id int64, data interface{}) {
-	event := data.(map[string]interface{})
-	event["node"] = id
-
-	err := eventBroadcast(event)
+func eventForward(id int64, event api.Event) {
+	err := eventBroadcast("", event, true)
 	if err != nil {
 		logger.Warnf("Failed to forward event from node %d: %v", id, err)
 	}

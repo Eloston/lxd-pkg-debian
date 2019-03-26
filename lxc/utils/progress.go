@@ -15,6 +15,7 @@ import (
 // ProgressRenderer tracks the progress information
 type ProgressRenderer struct {
 	Format string
+	Quiet  bool
 
 	maxLength int
 	wait      time.Time
@@ -51,6 +52,11 @@ func (p *ProgressRenderer) Done(msg string) {
 
 	// Mark this renderer as done
 	p.done = true
+
+	// Handle quiet mode
+	if p.Quiet {
+		msg = ""
+	}
 
 	// Truncate msg to terminal length
 	msg = p.truncate(msg)
@@ -89,6 +95,11 @@ func (p *ProgressRenderer) Update(status string) {
 
 	// Check if we're already done
 	if p.done {
+		return
+	}
+
+	// Handle quiet mode
+	if p.Quiet {
 		return
 	}
 

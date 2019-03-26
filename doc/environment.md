@@ -1,4 +1,5 @@
 # Environment variables
+
 ## Introduction
 The LXD client and daemon respect some environment variables to adapt to
 the user's environment and to turn some advanced features on and off.

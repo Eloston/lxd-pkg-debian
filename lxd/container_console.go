@@ -16,6 +16,7 @@ import (
 	"gopkg.in/lxc/go-lxc.v2"
 
 	"github.com/lxc/lxd/lxd/cluster"
+	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
@@ -252,6 +253,7 @@ func (s *consoleWs) Do(op *operation) error {
 }
 
 func containerConsolePost(d *Daemon, r *http.Request) Response {
+	project := projectParam(r)
 	name := mux.Vars(r)["name"]
 
 	post := api.ContainerConsolePost{}
@@ -267,23 +269,23 @@ func containerConsolePost(d *Daemon, r *http.Request) Response {
 
 	// Forward the request if the container is remote.
 	cert := d.endpoints.NetworkCert()
-	client, err := cluster.ConnectIfContainerIsRemote(d.cluster, name, cert)
+	client, err := cluster.ConnectIfContainerIsRemote(d.cluster, project, name, cert)
 	if err != nil {
 		return SmartError(err)
 	}
 
 	if client != nil {
-		url := fmt.Sprintf("/containers/%s/console", name)
+		url := fmt.Sprintf("/containers/%s/console?project=%s", name, project)
 		op, _, err := client.RawOperation("POST", url, post, "")
 		if err != nil {
 			return SmartError(err)
 		}
 
 		opAPI := op.Get()
-		return ForwardedOperationResponse(&opAPI)
+		return ForwardedOperationResponse(project, &opAPI)
 	}
 
-	c, err := containerLoadByName(d.State(), name)
+	c, err := containerLoadByProjectAndName(d.State(), project, name)
 	if err != nil {
 		return SmartError(err)
 	}
@@ -330,7 +332,7 @@ func containerConsolePost(d *Daemon, r *http.Request) Response {
 	resources := map[string][]string{}
 	resources["containers"] = []string{ws.container.Name()}
 
-	op, err := operationCreate(d.cluster, operationClassWebsocket, "Showing console",
+	op, err := operationCreate(d.cluster, project, operationClassWebsocket, db.OperationConsoleShow,
 		resources, ws.Metadata(), ws.Do, nil, ws.Connect)
 	if err != nil {
 		return InternalError(err)
@@ -340,10 +342,11 @@ func containerConsolePost(d *Daemon, r *http.Request) Response {
 }
 
 func containerConsoleLogGet(d *Daemon, r *http.Request) Response {
+	project := projectParam(r)
 	name := mux.Vars(r)["name"]
 
 	// Forward the request if the container is remote.
-	response, err := ForwardedResponseIfContainerIsRemote(d, r, name)
+	response, err := ForwardedResponseIfContainerIsRemote(d, r, project, name)
 	if err != nil {
 		return SmartError(err)
 	}
@@ -355,7 +358,7 @@ func containerConsoleLogGet(d *Daemon, r *http.Request) Response {
 		return BadRequest(fmt.Errorf("Querying the console buffer requires liblxc >= 3.0"))
 	}
 
-	c, err := containerLoadByName(d.State(), name)
+	c, err := containerLoadByProjectAndName(d.State(), project, name)
 	if err != nil {
 		return SmartError(err)
 	}
@@ -402,7 +405,9 @@ func containerConsoleLogDelete(d *Daemon, r *http.Request) Response {
 	}
 
 	name := mux.Vars(r)["name"]
-	c, err := containerLoadByName(d.State(), name)
+	project := projectParam(r)
+
+	c, err := containerLoadByProjectAndName(d.State(), project, name)
 	if err != nil {
 		return SmartError(err)
 	}

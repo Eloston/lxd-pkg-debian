@@ -74,7 +74,7 @@ func certificatesGet(d *Daemon, r *http.Request) Response {
 }
 
 func readSavedClientCAList(d *Daemon) {
-	d.clientCerts = []x509.Certificate{}
+	d.clientCerts = map[string]x509.Certificate{}
 
 	dbCerts, err := d.cluster.CertificatesGet()
 	if err != nil {
@@ -94,7 +94,8 @@ func readSavedClientCAList(d *Daemon) {
 			logger.Infof("Error reading certificate for %s: %s", dbCert.Name, err)
 			continue
 		}
-		d.clientCerts = append(d.clientCerts, *cert)
+
+		d.clientCerts[shared.CertFingerprint(cert)] = *cert
 	}
 }
 
@@ -201,7 +202,11 @@ func certificatesPost(d *Daemon, r *http.Request) Response {
 		}
 	}
 
-	d.clientCerts = append(d.clientCerts, *cert)
+	if d.clientCerts == nil {
+		d.clientCerts = map[string]x509.Certificate{}
+	}
+
+	d.clientCerts[shared.CertFingerprint(cert)] = *cert
 
 	return SyncResponseLocation(true, nil, fmt.Sprintf("/%s/certificates/%s", version.APIVersion, fingerprint))
 }

@@ -4,6 +4,7 @@ import (
 	"io/ioutil"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,6 +55,7 @@ var containerSnapshotCmd = Command{
 	get:    snapshotHandler,
 	post:   snapshotHandler,
 	delete: snapshotHandler,
+	put:    snapshotHandler,
 }
 
 var containerConsoleCmd = Command{
@@ -80,6 +82,24 @@ var containerMetadataTemplatesCmd = Command{
 	post:   containerMetadataTemplatesPostPut,
 	put:    containerMetadataTemplatesPostPut,
 	delete: containerMetadataTemplatesDelete,
+}
+
+var containerBackupsCmd = Command{
+	name: "containers/{name}/backups",
+	get:  containerBackupsGet,
+	post: containerBackupsPost,
+}
+
+var containerBackupCmd = Command{
+	name:   "containers/{name}/backups/{backupName}",
+	get:    containerBackupGet,
+	post:   containerBackupPost,
+	delete: containerBackupDelete,
+}
+
+var containerBackupExportCmd = Command{
+	name: "containers/{name}/backups/{backupName}/export",
+	get:  containerBackupExportGet,
 }
 
 type containerAutostartList []container
@@ -190,9 +210,18 @@ func containersShutdown(s *state.State) error {
 		}
 
 		for _, file := range files {
+			project := "default"
+			name := file.Name()
+			if strings.Contains(name, "_") {
+				fields := strings.Split(file.Name(), "_")
+				project = fields[0]
+				name = fields[1]
+			}
+
 			c, err := containerLXCLoad(s, db.ContainerArgs{
-				Name:   file.Name(),
-				Config: make(map[string]string),
+				Project: project,
+				Name:    name,
+				Config:  make(map[string]string),
 			}, nil)
 			if err != nil {
 				return err
@@ -261,14 +290,14 @@ func containersShutdown(s *state.State) error {
 	return nil
 }
 
-func containerDeleteSnapshots(s *state.State, cname string) error {
-	results, err := s.Cluster.ContainerGetSnapshots(cname)
+func containerDeleteSnapshots(s *state.State, project, cname string) error {
+	results, err := s.Cluster.ContainerGetSnapshots(project, cname)
 	if err != nil {
 		return err
 	}
 
 	for _, sname := range results {
-		sc, err := containerLoadByName(s, sname)
+		sc, err := containerLoadByProjectAndName(s, project, sname)
 		if err != nil {
 			logger.Error(
 				"containerDeleteSnapshots: Failed to load the snapshotcontainer",

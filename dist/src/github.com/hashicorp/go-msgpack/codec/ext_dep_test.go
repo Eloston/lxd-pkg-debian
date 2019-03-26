@@ -1,9 +1,16 @@
 // //+build ignore
 
+// NOTE (Jeff Mitchell): I'm disabling this for now as this package never
+// changes, but leaving this file active causes go mod to pull in some very
+// ugly deps. This can be run manually if further changes are ever made to this
+// lib.
+
 // Copyright (c) 2012, 2013 Ugorji Nwoke. All rights reserved.
 // Use of this source code is governed by a BSD-style license found in the LICENSE file.
 
 package codec
+
+/*
 
 // This file includes benchmarks which have dependencies on 3rdparty
 // packages (bson and vmihailenco/msgpack) which must be installed locally.
@@ -73,3 +80,4 @@ func TestMsgpackRpcSpecGoClientToPythonSvc(t *testing.T) {
 func TestMsgpackRpcSpecPythonClientToGoSvc(t *testing.T) {
 	doTestMsgpackRpcSpecPythonClientToGoSvc(t)
 }
+*/

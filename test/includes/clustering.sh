@@ -9,16 +9,7 @@ setup_clustering_bridge() {
   ip addr add 10.1.1.1/16 dev "${name}"
 
   # shellcheck disable=SC2039
-  for i in {1..5}; do
-      # Retry a few times since the xtables lock might be hold.
-      if iptables -t nat -A POSTROUTING -s 10.1.0.0/16 -d 0.0.0.0/0 -j MASQUERADE; then
-        break
-      fi
-      if [ "$i" -eq 5 ]; then
-        return 1
-      fi
-      sleep 0.1
-  done
+  iptables -w -t nat -A POSTROUTING -s 10.1.0.0/16 -d 0.0.0.0/0 -j MASQUERADE
   echo 1 > /proc/sys/net/ipv4/ip_forward
 }
 
@@ -28,17 +19,7 @@ teardown_clustering_bridge() {
   if [ -e "/sys/class/net/${name}" ]; then
       echo "==> Teardown clustering bridge ${name}"
       echo 0 > /proc/sys/net/ipv4/ip_forward
-      # shellcheck disable=SC2039
-      for i in {1..5}; do
-          # Retry a few times since the xtables lock might be hold.
-          if iptables -t nat -A POSTROUTING -s 10.1.0.0/16 -d 0.0.0.0/0 -j MASQUERADE; then
-              break
-          fi
-          if [ "$i" -eq 5 ]; then
-              return 1
-          fi
-          sleep 0.1
-      done
+      iptables -w -t nat -A POSTROUTING -s 10.1.0.0/16 -d 0.0.0.0/0 -j MASQUERADE
       ip link del dev "${name}"
   fi
 }
@@ -138,14 +119,17 @@ spawn_lxd_and_bootstrap_cluster() {
   bridge="${2}"
   LXD_DIR="${3}"
   driver="dir"
-  if [ "$#" -eq  "4" ]; then
+  port=""
+  if [ "$#" -ge  "4" ]; then
       driver="${4}"
+  fi
+  if [ "$#" -ge  "5" ]; then
+      port="${5}"
   fi
 
   echo "==> Spawn bootstrap cluster node in ${ns} with storage driver ${driver}"
 
   LXD_NETNS="${ns}" spawn_lxd "${LXD_DIR}" false
-  sleep 1
   (
     set -e
 
@@ -153,6 +137,13 @@ spawn_lxd_and_bootstrap_cluster() {
 config:
   core.trust_password: sekret
   core.https_address: 10.1.1.101:8443
+EOF
+    if [ "${port}" != "" ]; then
+      cat >> "${LXD_DIR}/preseed.yaml" <<EOF
+  cluster.https_address: 10.1.1.101:${port}
+EOF
+    fi
+    cat >> "${LXD_DIR}/preseed.yaml" <<EOF
   images.auto_update_interval: 0
 storage_pools:
 - name: data
@@ -216,65 +207,55 @@ spawn_lxd_and_join_cluster() {
   target="${5}"
   LXD_DIR="${6}"
   driver="dir"
-  if [ "$#" -eq  "7" ]; then
+  port="8443"
+  if [ "$#" -ge  "7" ]; then
       driver="${7}"
+  fi
+  if [ "$#" -ge  "8" ]; then
+      port="${8}"
   fi
 
   echo "==> Spawn additional cluster node in ${ns} with storage driver ${driver}"
 
   LXD_ALT_CERT=1 LXD_NETNS="${ns}" spawn_lxd "${LXD_DIR}" false
-  sleep 1
   (
     set -e
 
+    # If a custom cluster port was given, we need to first set the REST
+    # API address.
+    if [ "${port}" != "8443" ]; then
+      lxc config set core.https_address "10.1.1.10${index}:8443"
+    fi
+
     cat > "${LXD_DIR}/preseed.yaml" <<EOF
-config:
-  core.https_address: 10.1.1.10${index}:8443
-  images.auto_update_interval: 0
+cluster:
+  enabled: true
+  server_name: node${index}
+  server_address: 10.1.1.10${index}:${port}
+  cluster_address: 10.1.1.10${target}:8443
+  cluster_certificate: "$cert"
+  cluster_password: sekret
+  member_config:
 EOF
     # Declare the pool only if the driver is not ceph, because
     # the ceph pool doesn't need to be created on the joining
     # node (it's shared with the bootstrap one).
     if [ "${driver}" != "ceph" ]; then
       cat >> "${LXD_DIR}/preseed.yaml" <<EOF
-storage_pools:
-- name: data
-  driver: $driver
+  - entity: storage-pool
+    name: data
+    key: source
+    value: ""
 EOF
-      if [ "${driver}" = "btrfs" ]; then
-        cat >> "${LXD_DIR}/preseed.yaml" <<EOF
-  config:
-    size: 100GB
-EOF
-      fi
       if [ "${driver}" = "zfs" ]; then
         cat >> "${LXD_DIR}/preseed.yaml" <<EOF
-  config:
-    size: 100GB
-    zfs.pool_name: lxdtest-$(basename "${TEST_DIR}")-${ns}
-EOF
-      fi
-      if [ "${driver}" = "lvm" ]; then
-        cat >> "${LXD_DIR}/preseed.yaml" <<EOF
-  config:
-    volume.size: 25MB
+  - entity: storage-pool
+    name: data
+    key: zfs.pool_name
+    value: lxdtest-$(basename "${TEST_DIR}")-${ns}
 EOF
       fi
     fi
-    cat >> "${LXD_DIR}/preseed.yaml" <<EOF
-networks:
-- name: $bridge
-  type: bridge
-  config:
-    ipv4.address: none
-    ipv6.address: none
-cluster:
-  server_name: node${index}
-  enabled: true
-  cluster_address: 10.1.1.10${target}:8443
-  cluster_certificate: "$cert"
-  cluster_password: sekret
-EOF
-  lxd init --preseed < "${LXD_DIR}/preseed.yaml"
+    lxd init --preseed < "${LXD_DIR}/preseed.yaml"
   )
 }

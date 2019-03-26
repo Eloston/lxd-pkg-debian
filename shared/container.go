@@ -5,6 +5,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/pkg/errors"
+	"gopkg.in/robfig/cron.v2"
 )
 
 type ContainerAction string
@@ -25,6 +29,19 @@ func IsInt64(value string) error {
 	_, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
 		return fmt.Errorf("Invalid value for an integer: %s", value)
+	}
+
+	return nil
+}
+
+func IsUint8(value string) error {
+	if value == "" {
+		return nil
+	}
+
+	_, err := strconv.ParseUint(value, 10, 8)
+	if err != nil {
+		return fmt.Errorf("Invalid value for an integer: %s. Must be between 0 and 255", value)
 	}
 
 	return nil
@@ -229,11 +246,18 @@ var KnownContainerConfigKeys = map[string]func(value string) error{
 	"migration.incremental.memory.iterations": IsUint32,
 	"migration.incremental.memory.goal":       IsUint32,
 
-	"nvidia.runtime": IsBool,
+	"nvidia.runtime":             IsBool,
+	"nvidia.driver.capabilities": IsAny,
+	"nvidia.require.cuda":        IsAny,
+	"nvidia.require.driver":      IsAny,
 
-	"security.nesting":    IsBool,
-	"security.privileged": IsBool,
-	"security.devlxd":     IsBool,
+	"security.nesting":       IsBool,
+	"security.privileged":    IsBool,
+	"security.devlxd":        IsBool,
+	"security.devlxd.images": IsBool,
+
+	"security.protection.delete": IsBool,
+	"security.protection.shift":  IsBool,
 
 	"security.idmap.base":     IsUint32,
 	"security.idmap.isolated": IsBool,
@@ -243,6 +267,30 @@ var KnownContainerConfigKeys = map[string]func(value string) error{
 	"security.syscalls.blacklist_compat":  IsBool,
 	"security.syscalls.blacklist":         IsAny,
 	"security.syscalls.whitelist":         IsAny,
+
+	"snapshots.schedule": func(value string) error {
+		if value == "" {
+			return nil
+		}
+
+		if len(strings.Split(value, " ")) != 5 {
+			return fmt.Errorf("Schedule must be of the form: <minute> <hour> <day-of-month> <month> <day-of-week>")
+		}
+
+		_, err := cron.Parse(fmt.Sprintf("* %s", value))
+		if err != nil {
+			return errors.Wrap(err, "Error parsing schedule")
+		}
+
+		return nil
+	},
+	"snapshots.schedule.stopped": IsBool,
+	"snapshots.pattern":          IsAny,
+	"snapshots.expiry": func(value string) error {
+		// Validate expression
+		_, err := GetSnapshotExpiry(time.Time{}, value)
+		return err
+	},
 
 	// Caller is responsible for full validation of any raw.* value
 	"raw.apparmor": IsAny,

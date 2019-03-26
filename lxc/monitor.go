@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v2"
@@ -93,33 +92,22 @@ func (c *cmdMonitor) Run(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	handler := func(message interface{}) {
+	chError := make(chan error, 1)
+
+	handler := func(event api.Event) {
 		// Special handling for logging only output
 		if c.flagPretty && len(c.flagType) == 1 && shared.StringInSlice("logging", c.flagType) {
-			render, err := json.Marshal(&message)
-			if err != nil {
-				fmt.Printf("error: %s\n", err)
-				os.Exit(1)
-			}
-
-			event := api.Event{}
-			err = json.Unmarshal(render, &event)
-			if err != nil {
-				fmt.Printf("error: %s\n", err)
-				os.Exit(1)
-			}
-
 			logEntry := api.EventLogging{}
 			err = json.Unmarshal(event.Metadata, &logEntry)
 			if err != nil {
-				fmt.Printf("error: %s\n", err)
-				os.Exit(1)
+				chError <- err
+				return
 			}
 
 			lvl, err := log15.LvlFromString(logEntry.Level)
 			if err != nil {
-				fmt.Printf("error: %s\n", err)
-				os.Exit(1)
+				chError <- err
+				return
 			}
 
 			if lvl > logLvl {
@@ -144,10 +132,26 @@ func (c *cmdMonitor) Run(cmd *cobra.Command, args []string) error {
 			return
 		}
 
-		render, err := yaml.Marshal(&message)
+		// Render as JSON (to expand RawMessage)
+		jsonRender, err := json.Marshal(&event)
 		if err != nil {
-			fmt.Printf("error: %s\n", err)
-			os.Exit(1)
+			chError <- err
+			return
+		}
+
+		// Read back to a clean interface
+		var rawEvent interface{}
+		err = json.Unmarshal(jsonRender, &rawEvent)
+		if err != nil {
+			chError <- err
+			return
+		}
+
+		// And now print as YAML
+		render, err := yaml.Marshal(&rawEvent)
+		if err != nil {
+			chError <- err
+			return
 		}
 
 		fmt.Printf("%s\n\n", render)
@@ -158,5 +162,9 @@ func (c *cmdMonitor) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	return listener.Wait()
+	go func() {
+		chError <- listener.Wait()
+	}()
+
+	return <-chError
 }

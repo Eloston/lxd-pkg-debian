@@ -47,14 +47,21 @@ func (s *migrationSourceWs) DoStorage(migrateOp *operation) error {
 	// The protocol says we have to send a header no matter what, so let's
 	// do that, but then immediately send an error.
 	myType := s.storage.MigrationType()
-	rsyncHasFeature := true
+	hasFeature := true
 	header := migration.MigrationHeader{
 		Fs: &myType,
 		RsyncFeatures: &migration.RsyncFeatures{
-			Xattrs:   &rsyncHasFeature,
-			Delete:   &rsyncHasFeature,
-			Compress: &rsyncHasFeature,
+			Xattrs:        &hasFeature,
+			Delete:        &hasFeature,
+			Compress:      &hasFeature,
+			Bidirectional: &hasFeature,
 		},
+	}
+
+	if len(zfsVersion) >= 3 && zfsVersion[0:3] != "0.6" {
+		header.ZfsFeatures = &migration.ZfsFeatures{
+			Compress: &hasFeature,
+		}
 	}
 
 	err = s.send(&header)
@@ -64,13 +71,6 @@ func (s *migrationSourceWs) DoStorage(migrateOp *operation) error {
 		return err
 	}
 
-	driver, fsErr := s.storage.StorageMigrationSource()
-	if fsErr != nil {
-		logger.Errorf("Failed to initialize new storage volume migration driver")
-		s.sendControl(fsErr)
-		return fsErr
-	}
-
 	err = s.recv(&header)
 	if err != nil {
 		logger.Errorf("Failed to receive storage volume migration header")
@@ -78,12 +78,36 @@ func (s *migrationSourceWs) DoStorage(migrateOp *operation) error {
 		return err
 	}
 
+	// Handle rsync options
+	rsyncFeatures := header.GetRsyncFeaturesSlice()
+	if !shared.StringInSlice("bidirectional", rsyncFeatures) {
+		// If no bi-directional support, assume LXD 3.7 level
+		// NOTE: Do NOT extend this list of arguments
+		rsyncFeatures = []string{"xattrs", "delete", "compress"}
+	}
+
+	// Handle zfs options
+	zfsFeatures := header.GetZfsFeaturesSlice()
+
+	// Set source args
+	sourceArgs := MigrationSourceArgs{
+		RsyncFeatures: rsyncFeatures,
+		ZfsFeatures:   zfsFeatures,
+	}
+
+	driver, fsErr := s.storage.StorageMigrationSource(sourceArgs)
+	if fsErr != nil {
+		logger.Errorf("Failed to initialize new storage volume migration driver")
+		s.sendControl(fsErr)
+		return fsErr
+	}
+
 	bwlimit := ""
 	if *header.Fs != myType {
 		myType = migration.MigrationFSType_RSYNC
 		header.Fs = &myType
 
-		driver, _ = rsyncStorageMigrationSource()
+		driver, _ = rsyncStorageMigrationSource(sourceArgs)
 
 		// Check if this storage pool has a rate limit set for rsync.
 		poolwritable := s.storage.GetStoragePoolWritable()
@@ -219,14 +243,21 @@ func (c *migrationSink) DoStorage(migrateOp *operation) error {
 
 	mySink := c.src.storage.StorageMigrationSink
 	myType := c.src.storage.MigrationType()
-	rsyncHasFeature := true
+	hasFeature := true
 	resp := migration.MigrationHeader{
 		Fs: &myType,
 		RsyncFeatures: &migration.RsyncFeatures{
-			Xattrs:   &rsyncHasFeature,
-			Delete:   &rsyncHasFeature,
-			Compress: &rsyncHasFeature,
+			Xattrs:        &hasFeature,
+			Delete:        &hasFeature,
+			Compress:      &hasFeature,
+			Bidirectional: &hasFeature,
 		},
+	}
+
+	if len(zfsVersion) >= 3 && zfsVersion[0:3] != "0.6" {
+		resp.ZfsFeatures = &migration.ZfsFeatures{
+			Compress: &hasFeature,
+		}
 	}
 
 	// If the storage type the source has doesn't match what we have, then
@@ -237,20 +268,12 @@ func (c *migrationSink) DoStorage(migrateOp *operation) error {
 		resp.Fs = &myType
 	}
 
-	args := MigrationSinkArgs{}
-	rsyncFeatures := header.GetRsyncFeatures()
-
 	// Handle rsync options
-	args.RsyncArgs = []string{}
-	if rsyncFeatures.GetXattrs() {
-		args.RsyncArgs = append(args.RsyncArgs, "--xattrs")
-	}
-	if rsyncFeatures.GetDelete() {
-		args.RsyncArgs = append(args.RsyncArgs, "--delete")
-	}
-	if rsyncFeatures.GetCompress() {
-		args.RsyncArgs = append(args.RsyncArgs, "--compress")
-		args.RsyncArgs = append(args.RsyncArgs, "--compress-level=2")
+	rsyncFeatures := header.GetRsyncFeaturesSlice()
+
+	args := MigrationSinkArgs{
+		Storage:       c.dest.storage,
+		RsyncFeatures: rsyncFeatures,
 	}
 
 	err = sender(&resp)
@@ -267,7 +290,7 @@ func (c *migrationSink) DoStorage(migrateOp *operation) error {
 		fsConn = c.src.fsConn
 	}
 
-	err = mySink(fsConn, migrateOp, c.dest.storage, args)
+	err = mySink(fsConn, migrateOp, args)
 	if err != nil {
 		logger.Errorf("Failed to start storage volume migration sink")
 		controller(err)

@@ -6,22 +6,30 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
+	"golang.org/x/net/context"
 	"gopkg.in/lxc/go-lxc.v2"
+	"gopkg.in/robfig/cron.v2"
 
+	"github.com/flosch/pongo2"
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/lxd/sys"
+	"github.com/lxc/lxd/lxd/task"
 	"github.com/lxc/lxd/lxd/types"
+	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/idmap"
+	"github.com/lxc/lxd/shared/ioprogress"
+	log "github.com/lxc/lxd/shared/log15"
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/osarch"
+	"github.com/pkg/errors"
 )
 
 // Helper functions
@@ -169,6 +177,8 @@ func containerValidDeviceConfigKey(t, k string) bool {
 			return true
 		case "pool":
 			return true
+		case "propagation":
+			return true
 		default:
 			return false
 		}
@@ -225,11 +235,25 @@ func containerValidDeviceConfigKey(t, k string) bool {
 		}
 	case "proxy":
 		switch k {
-		case "listen":
+		case "bind":
 			return true
 		case "connect":
 			return true
-		case "bind":
+		case "gid":
+			return true
+		case "listen":
+			return true
+		case "mode":
+			return true
+		case "proxy_protocol":
+			return true
+		case "nat":
+			return true
+		case "security.gid":
+			return true
+		case "security.uid":
+			return true
+		case "uid":
 			return true
 		default:
 			return false
@@ -346,6 +370,20 @@ func containerValidDevices(cluster *db.Cluster, devices types.Devices, profile b
 			if shared.StringInSlice(m["nictype"], []string{"bridged", "macvlan", "physical", "sriov"}) && m["parent"] == "" {
 				return fmt.Errorf("Missing parent for %s type nic", m["nictype"])
 			}
+
+			if m["ipv4.address"] != "" {
+				err := networkValidAddressV4(m["ipv4.address"])
+				if err != nil {
+					return err
+				}
+			}
+
+			if m["ipv6.address"] != "" {
+				err := networkValidAddressV6(m["ipv6.address"])
+				if err != nil {
+					return err
+				}
+			}
 		} else if m["type"] == "infiniband" {
 			if m["nictype"] == "" {
 				return fmt.Errorf("Missing nic type")
@@ -409,6 +447,15 @@ func containerValidDevices(cluster *db.Cluster, devices types.Devices, profile b
 				}
 			}
 
+			if m["propagation"] != "" {
+				if !util.RuntimeLiblxcVersionAtLeast(3, 0, 0) {
+					return fmt.Errorf("liblxc 3.0 is required for mount propagation configuration")
+				}
+
+				if !shared.StringInSlice(m["propagation"], []string{"private", "shared", "slave", "unbindable", "rprivate", "rshared", "rslave", "runbindable"}) {
+					return fmt.Errorf("Invalid propagation mode '%s'", m["propagation"])
+				}
+			}
 		} else if shared.StringInSlice(m["type"], []string{"unix-char", "unix-block"}) {
 			if m["source"] == "" && m["path"] == "" {
 				return fmt.Errorf("Unix device entry is missing the required \"source\" or \"path\" property")
@@ -458,6 +505,44 @@ func containerValidDevices(cluster *db.Cluster, devices types.Devices, profile b
 			if m["connect"] == "" {
 				return fmt.Errorf("Proxy device entry is missing the required \"connect\" property")
 			}
+
+			listenAddr, err := parseAddr(m["listen"])
+			if err != nil {
+				return err
+			}
+
+			connectAddr, err := parseAddr(m["connect"])
+			if err != nil {
+				return err
+			}
+
+			if len(connectAddr.addr) > len(listenAddr.addr) {
+				// Cannot support single port -> multiple port
+				return fmt.Errorf("Cannot map a single port to multiple ports")
+			}
+
+			if shared.IsTrue(m["proxy_protocol"]) && !strings.HasPrefix(m["connect"], "tcp") {
+				return fmt.Errorf("The PROXY header can only be sent to tcp servers")
+			}
+
+			if (!strings.HasPrefix(m["listen"], "unix:") || strings.HasPrefix(m["listen"], "unix:@")) &&
+				(m["uid"] != "" || m["gid"] != "" || m["mode"] != "") {
+				return fmt.Errorf("Only proxy devices for non-abstract unix sockets can carry uid, gid, or mode properties")
+			}
+
+			if shared.IsTrue(m["nat"]) {
+				if m["bind"] != "" && m["bind"] != "host" {
+					return fmt.Errorf("Only host-bound proxies can use NAT")
+				}
+
+				// Support TCP <-> TCP and UDP <-> UDP
+				if listenAddr.connType == "unix" || connectAddr.connType == "unix" ||
+					listenAddr.connType != connectAddr.connType {
+					return fmt.Errorf("Proxying %s <-> %s is not supported when using NAT",
+						listenAddr.connType, connectAddr.connType)
+				}
+			}
+
 		} else if m["type"] == "none" {
 			continue
 		} else {
@@ -485,13 +570,14 @@ type container interface {
 	Stop(stateful bool) error
 	Unfreeze() error
 
-	// Snapshots & migration
+	// Snapshots & migration & backups
 	Restore(sourceContainer container, stateful bool) error
 	/* actionScript here is a script called action.sh in the stateDir, to
 	 * be passed to CRIU as --action-script
 	 */
 	Migrate(args *CriuMigrationArgs) error
 	Snapshots() ([]container, error)
+	Backups() ([]backup, error)
 
 	// Config handling
 	Rename(newName string) error
@@ -535,6 +621,7 @@ type container interface {
 
 	// Status
 	Render() (interface{}, interface{}, error)
+	RenderFull() (*api.ContainerFull, interface{}, error)
 	RenderState() (*api.ContainerState, error)
 	IsPrivileged() bool
 	IsRunning() bool
@@ -550,6 +637,7 @@ type container interface {
 
 	// Properties
 	Id() int
+	Project() string
 	Name() string
 	Description() string
 	Architecture() int
@@ -562,6 +650,7 @@ type container interface {
 	Profiles() []string
 	InitPID() int
 	State() string
+	ExpiryDate() time.Time
 
 	// Paths
 	Path() string
@@ -614,6 +703,69 @@ func containerCreateAsEmpty(d *Daemon, args db.ContainerArgs) (container, error)
 	return c, nil
 }
 
+func containerCreateFromBackup(s *state.State, info backupInfo, data io.ReadSeeker,
+	customPool bool) error {
+	var pool storage
+	var fixBackupFile = false
+
+	// Get storage pool from index.yaml
+	pool, storageErr := storagePoolInit(s, info.Pool)
+	if storageErr != nil && errors.Cause(storageErr) != db.ErrNoSuchObject {
+		// Unexpected error
+		return storageErr
+	}
+
+	if errors.Cause(storageErr) == db.ErrNoSuchObject {
+		// The pool doesn't exist, and the backup is in binary format so we
+		// cannot alter the backup.yaml.
+		if info.HasBinaryFormat {
+			return storageErr
+		}
+
+		// Get the default profile
+		_, profile, err := s.Cluster.ProfileGet(info.Project, "default")
+		if err != nil {
+			return errors.Wrap(err, "Failed to get default profile")
+		}
+
+		_, v, err := shared.GetRootDiskDevice(profile.Devices)
+		if err != nil {
+			return errors.Wrap(err, "Failed to get root disk device")
+		}
+
+		// Use the default-profile's root pool
+		pool, err = storagePoolInit(s, v["pool"])
+		if err != nil {
+			return errors.Wrap(err, "Failed to initialize storage pool")
+		}
+
+		fixBackupFile = true
+	}
+
+	// Find the compression algorithm
+	tarArgs, _, _, err := shared.DetectCompressionFile(data)
+	if err != nil {
+		return err
+	}
+	data.Seek(0, 0)
+
+	// Unpack tarball
+	err = pool.ContainerBackupLoad(info, data, tarArgs)
+	if err != nil {
+		return err
+	}
+
+	if fixBackupFile || customPool {
+		// Update the pool
+		err = backupFixStoragePool(s.Cluster, info, !customPool)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func containerCreateEmptySnapshot(s *state.State, args db.ContainerArgs) (container, error) {
 	// Create the snapshot
 	c, err := containerCreateInternal(s, args)
@@ -631,19 +783,19 @@ func containerCreateEmptySnapshot(s *state.State, args db.ContainerArgs) (contai
 	return c, nil
 }
 
-func containerCreateFromImage(d *Daemon, args db.ContainerArgs, hash string) (container, error) {
+func containerCreateFromImage(d *Daemon, args db.ContainerArgs, hash string, tracker *ioprogress.ProgressTracker) (container, error) {
 	s := d.State()
 
 	// Get the image properties
-	_, img, err := s.Cluster.ImageGet(hash, false, false)
+	_, img, err := s.Cluster.ImageGet(args.Project, hash, false, false)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "Fetch image %s from database", hash)
 	}
 
 	// Check if the image is available locally or it's on another node.
 	nodeAddress, err := s.Cluster.ImageLocate(hash)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "Locate image %s in the cluster", hash)
 	}
 	if nodeAddress != "" {
 		// The image is available from another node, let's try to
@@ -653,11 +805,15 @@ func containerCreateFromImage(d *Daemon, args db.ContainerArgs, hash string) (co
 		if err != nil {
 			return nil, err
 		}
+
+		client = client.UseProject(args.Project)
+
 		err = imageImportFromNode(filepath.Join(d.os.VarDir, "images"), client, hash)
 		if err != nil {
 			return nil, err
 		}
-		err = d.cluster.ImageAssociateNode(hash)
+
+		err = d.cluster.ImageAssociateNode(args.Project, hash)
 		if err != nil {
 			return nil, err
 		}
@@ -676,7 +832,7 @@ func containerCreateFromImage(d *Daemon, args db.ContainerArgs, hash string) (co
 	// Create the container
 	c, err := containerCreateInternal(s, args)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "Create container")
 	}
 
 	err = s.Cluster.ImageLastAccessUpdate(hash, time.Now().UTC())
@@ -686,27 +842,44 @@ func containerCreateFromImage(d *Daemon, args db.ContainerArgs, hash string) (co
 	}
 
 	// Now create the storage from an image
-	err = c.Storage().ContainerCreateFromImage(c, hash)
+	err = c.Storage().ContainerCreateFromImage(c, hash, tracker)
 	if err != nil {
 		c.Delete()
-		return nil, err
+		return nil, errors.Wrap(err, "Create container from image")
 	}
 
 	// Apply any post-storage configuration
 	err = containerConfigureInternal(c)
 	if err != nil {
 		c.Delete()
-		return nil, err
+		return nil, errors.Wrap(err, "Configure container")
 	}
 
 	return c, nil
 }
 
-func containerCreateAsCopy(s *state.State, args db.ContainerArgs, sourceContainer container, containerOnly bool) (container, error) {
-	// Create the container.
-	ct, err := containerCreateInternal(s, args)
-	if err != nil {
-		return nil, err
+func containerCreateAsCopy(s *state.State, args db.ContainerArgs, sourceContainer container, containerOnly bool, refresh bool) (container, error) {
+	var ct container
+	var err error
+
+	if refresh {
+		// Load the target container
+		ct, err = containerLoadByProjectAndName(s, args.Project, args.Name)
+		if err != nil {
+			refresh = false
+		}
+	}
+
+	if !refresh {
+		// Create the container.
+		ct, err = containerCreateInternal(s, args)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if refresh && ct.IsRunning() {
+		return nil, fmt.Errorf("Cannot refresh a running container")
 	}
 
 	// At this point we have already figured out the parent
@@ -720,15 +893,39 @@ func containerCreateAsCopy(s *state.State, args db.ContainerArgs, sourceContaine
 	}
 
 	csList := []*container{}
+	var snapshots []container
+
 	if !containerOnly {
-		snapshots, err := sourceContainer.Snapshots()
-		if err != nil {
-			ct.Delete()
-			return nil, err
+		if refresh {
+			// Compare snapshots
+			syncSnapshots, deleteSnapshots, err := containerCompareSnapshots(sourceContainer, ct)
+			if err != nil {
+				return nil, err
+			}
+
+			// Delete extra snapshots
+			for _, snap := range deleteSnapshots {
+				err := snap.Delete()
+				if err != nil {
+					return nil, err
+				}
+			}
+
+			// Only care about the snapshots that need updating
+			snapshots = syncSnapshots
+		} else {
+			// Get snapshots of source container
+			snapshots, err = sourceContainer.Snapshots()
+			if err != nil {
+				ct.Delete()
+
+				return nil, err
+			}
 		}
 
-		csList = make([]*container, len(snapshots))
-		for i, snap := range snapshots {
+		for _, snap := range snapshots {
+			fields := strings.SplitN(snap.Name(), shared.SnapshotDelimiter, 2)
+
 			// Ensure that snapshot and parent container have the
 			// same storage pool in their local root disk device.
 			// If the root disk device for the snapshot comes from a
@@ -748,7 +945,6 @@ func containerCreateAsCopy(s *state.State, args db.ContainerArgs, sourceContaine
 				}
 			}
 
-			fields := strings.SplitN(snap.Name(), shared.SnapshotDelimiter, 2)
 			newSnapName := fmt.Sprintf("%s/%s", ct.Name(), fields[1])
 			csArgs := db.ContainerArgs{
 				Architecture: snap.Architecture(),
@@ -759,30 +955,57 @@ func containerCreateAsCopy(s *state.State, args db.ContainerArgs, sourceContaine
 				Ephemeral:    snap.IsEphemeral(),
 				Name:         newSnapName,
 				Profiles:     snap.Profiles(),
+				Project:      args.Project,
 			}
 
 			// Create the snapshots.
 			cs, err := containerCreateInternal(s, csArgs)
 			if err != nil {
-				ct.Delete()
+				if !refresh {
+					ct.Delete()
+				}
+
 				return nil, err
 			}
 
-			csList[i] = &cs
+			// Restore snapshot creation date
+			err = s.Cluster.ContainerCreationUpdate(cs.Id(), snap.CreationDate())
+			if err != nil {
+				if !refresh {
+					ct.Delete()
+				}
+
+				return nil, err
+			}
+
+			csList = append(csList, &cs)
 		}
 	}
 
-	// Now clone the storage.
-	err = ct.Storage().ContainerCopy(ct, sourceContainer, containerOnly)
-	if err != nil {
-		ct.Delete()
-		return nil, err
+	// Now clone or refresh the storage
+	if refresh {
+		err = ct.Storage().ContainerRefresh(ct, sourceContainer, snapshots)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		err = ct.Storage().ContainerCopy(ct, sourceContainer, containerOnly)
+		if err != nil {
+			if !refresh {
+				ct.Delete()
+			}
+
+			return nil, err
+		}
 	}
 
 	// Apply any post-storage configuration.
 	err = containerConfigureInternal(ct)
 	if err != nil {
-		ct.Delete()
+		if !refresh {
+			ct.Delete()
+		}
+
 		return nil, err
 	}
 
@@ -791,7 +1014,10 @@ func containerCreateAsCopy(s *state.State, args db.ContainerArgs, sourceContaine
 			// Apply any post-storage configuration.
 			err = containerConfigureInternal(*cs)
 			if err != nil {
-				ct.Delete()
+				if !refresh {
+					ct.Delete()
+				}
+
 				return nil, err
 			}
 		}
@@ -878,7 +1104,7 @@ func containerCreateAsSnapshot(s *state.State, args db.ContainerArgs, sourceCont
 		os.RemoveAll(sourceContainer.StatePath())
 	}
 
-	eventSendLifecycle("container-snapshot-created",
+	eventSendLifecycle(sourceContainer.Project(), "container-snapshot-created",
 		fmt.Sprintf("/1.0/containers/%s", sourceContainer.Name()),
 		map[string]interface{}{
 			"snapshot_name": args.Name,
@@ -889,6 +1115,10 @@ func containerCreateAsSnapshot(s *state.State, args db.ContainerArgs, sourceCont
 
 func containerCreateInternal(s *state.State, args db.ContainerArgs) (container, error) {
 	// Set default values
+	if args.Project == "" {
+		args.Project = "default"
+	}
+
 	if args.Profiles == nil {
 		args.Profiles = []string{"default"}
 	}
@@ -915,6 +1145,9 @@ func containerCreateInternal(s *state.State, args db.ContainerArgs) (container, 
 		if err != nil {
 			return nil, err
 		}
+
+		// Unset expiry date since containers don't expire
+		args.ExpiryDate = time.Time{}
 	}
 
 	// Validate container config
@@ -940,7 +1173,7 @@ func containerCreateInternal(s *state.State, args db.ContainerArgs) (container, 
 	}
 
 	// Validate profiles
-	profiles, err := s.Cluster.Profiles()
+	profiles, err := s.Cluster.Profiles(args.Project)
 	if err != nil {
 		return nil, err
 	}
@@ -958,8 +1191,68 @@ func containerCreateInternal(s *state.State, args db.ContainerArgs) (container, 
 		checkedProfiles = append(checkedProfiles, profile)
 	}
 
-	// Create the container entry
-	id, err := s.Cluster.ContainerCreate(args)
+	if args.CreationDate.IsZero() {
+		args.CreationDate = time.Now().UTC()
+	}
+
+	if args.LastUsedDate.IsZero() {
+		args.LastUsedDate = time.Unix(0, 0).UTC()
+	}
+
+	var container db.Container
+	err = s.Cluster.Transaction(func(tx *db.ClusterTx) error {
+		node, err := tx.NodeName()
+		if err != nil {
+			return err
+		}
+
+		// TODO: this check should probably be performed by the db
+		// package itself.
+		exists, err := tx.ProjectExists(args.Project)
+		if err != nil {
+			return errors.Wrapf(err, "Check if project %q exists", args.Project)
+		}
+		if !exists {
+			return fmt.Errorf("Project %q does not exist", args.Project)
+		}
+
+		// Create the container entry
+		container = db.Container{
+			Project:      args.Project,
+			Name:         args.Name,
+			Node:         node,
+			Type:         int(args.Ctype),
+			Architecture: args.Architecture,
+			Ephemeral:    args.Ephemeral,
+			CreationDate: args.CreationDate,
+			Stateful:     args.Stateful,
+			LastUseDate:  args.LastUsedDate,
+			Description:  args.Description,
+			Config:       args.Config,
+			Devices:      args.Devices,
+			Profiles:     args.Profiles,
+			ExpiryDate:   args.ExpiryDate,
+		}
+
+		_, err = tx.ContainerCreate(container)
+		if err != nil {
+			return errors.Wrap(err, "Add container info to the database")
+		}
+
+		// Read back the container, to get ID and creation time.
+		c, err := tx.ContainerGet(args.Project, args.Name)
+		if err != nil {
+			return errors.Wrap(err, "Fetch created container from the database")
+		}
+
+		container = *c
+
+		if container.ID < 1 {
+			return errors.Wrapf(err, "Unexpected container database ID %d", container.ID)
+		}
+
+		return nil
+	})
 	if err != nil {
 		if err == db.ErrAlreadyDefined {
 			thing := "Container"
@@ -974,21 +1267,12 @@ func containerCreateInternal(s *state.State, args db.ContainerArgs) (container, 
 	// Wipe any existing log for this container name
 	os.RemoveAll(shared.LogPath(args.Name))
 
-	args.ID = id
-
-	// Read the timestamp from the database
-	dbArgs, err := s.Cluster.ContainerGet(args.Name)
-	if err != nil {
-		s.Cluster.ContainerRemove(args.Name)
-		return nil, err
-	}
-	args.CreationDate = dbArgs.CreationDate
-	args.LastUsedDate = dbArgs.LastUsedDate
+	args = db.ContainerToArgs(&container)
 
 	// Setup the container struct and finish creation (storage and idmap)
 	c, err := containerLXCCreate(s, args)
 	if err != nil {
-		s.Cluster.ContainerRemove(args.Name)
+		s.Cluster.ContainerRemove(args.Project, args.Name)
 		return nil, errors.Wrap(err, "Create LXC container")
 	}
 
@@ -1043,30 +1327,51 @@ func containerConfigureInternal(c container) error {
 
 func containerLoadById(s *state.State, id int) (container, error) {
 	// Get the DB record
-	name, err := s.Cluster.ContainerName(id)
+	project, name, err := s.Cluster.ContainerProjectAndName(id)
 	if err != nil {
 		return nil, err
 	}
 
-	return containerLoadByName(s, name)
+	return containerLoadByProjectAndName(s, project, name)
 }
 
-func containerLoadByName(s *state.State, name string) (container, error) {
+func containerLoadByProjectAndName(s *state.State, project, name string) (container, error) {
 	// Get the DB record
-	args, err := s.Cluster.ContainerGet(name)
-	if err != nil {
-		return nil, err
-	}
-
-	return containerLXCLoad(s, args, nil)
-}
-
-func containerLoadAll(s *state.State) ([]container, error) {
-	// Get all the container arguments
-	var cts []db.ContainerArgs
+	var container *db.Container
 	err := s.Cluster.Transaction(func(tx *db.ClusterTx) error {
 		var err error
-		cts, err = tx.ContainerArgsList()
+
+		container, err = tx.ContainerGet(project, name)
+		if err != nil {
+			return errors.Wrapf(err, "Failed to fetch container %q in project %q", name, project)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	args := db.ContainerToArgs(container)
+
+	c, err := containerLXCLoad(s, args, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to load container")
+	}
+
+	return c, nil
+}
+
+func containerLoadByProject(s *state.State, project string) ([]container, error) {
+	// Get all the containers
+	var cts []db.Container
+	err := s.Cluster.Transaction(func(tx *db.ClusterTx) error {
+		filter := db.ContainerFilter{
+			Project: project,
+			Type:    int(db.CTypeRegular),
+		}
+		var err error
+		cts, err = tx.ContainerList(filter)
 		if err != nil {
 			return err
 		}
@@ -1080,12 +1385,43 @@ func containerLoadAll(s *state.State) ([]container, error) {
 	return containerLoadAllInternal(cts, s)
 }
 
+// Load all containers across all projects.
+func containerLoadFromAllProjects(s *state.State) ([]container, error) {
+	var projects []string
+
+	err := s.Cluster.Transaction(func(tx *db.ClusterTx) error {
+		var err error
+		projects, err = tx.ProjectNames()
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	containers := []container{}
+	for _, project := range projects {
+		projectContainers, err := containerLoadByProject(s, project)
+		if err != nil {
+			return nil, errors.Wrapf(nil, "Load containers in project %s", project)
+		}
+		containers = append(containers, projectContainers...)
+	}
+
+	return containers, nil
+}
+
+// Legacy interface.
+func containerLoadAll(s *state.State) ([]container, error) {
+	return containerLoadByProject(s, "default")
+}
+
+// Load all containers of this nodes.
 func containerLoadNodeAll(s *state.State) ([]container, error) {
 	// Get all the container arguments
-	var cts []db.ContainerArgs
+	var cts []db.Container
 	err := s.Cluster.Transaction(func(tx *db.ClusterTx) error {
 		var err error
-		cts, err = tx.ContainerArgsNodeList()
+		cts, err = tx.ContainerNodeList()
 		if err != nil {
 			return err
 		}
@@ -1099,36 +1435,65 @@ func containerLoadNodeAll(s *state.State) ([]container, error) {
 	return containerLoadAllInternal(cts, s)
 }
 
-func containerLoadAllInternal(cts []db.ContainerArgs, s *state.State) ([]container, error) {
+// Load all containers of this nodes under the given project.
+func containerLoadNodeProjectAll(s *state.State, project string) ([]container, error) {
+	// Get all the container arguments
+	var cts []db.Container
+	err := s.Cluster.Transaction(func(tx *db.ClusterTx) error {
+		var err error
+		cts, err = tx.ContainerNodeProjectList(project)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return containerLoadAllInternal(cts, s)
+}
+
+func containerLoadAllInternal(cts []db.Container, s *state.State) ([]container, error) {
 	// Figure out what profiles are in use
-	profiles := map[string]api.Profile{}
+	profiles := map[string]map[string]api.Profile{}
 	for _, cArgs := range cts {
+		projectProfiles, ok := profiles[cArgs.Project]
+		if !ok {
+			projectProfiles = map[string]api.Profile{}
+			profiles[cArgs.Project] = projectProfiles
+		}
 		for _, profile := range cArgs.Profiles {
-			_, ok := profiles[profile]
+			_, ok := projectProfiles[profile]
 			if !ok {
-				profiles[profile] = api.Profile{}
+				projectProfiles[profile] = api.Profile{}
 			}
 		}
 	}
 
 	// Get the profile data
-	for name := range profiles {
-		_, profile, err := s.Cluster.ProfileGet(name)
-		if err != nil {
-			return nil, err
-		}
+	for project, projectProfiles := range profiles {
+		for name := range projectProfiles {
+			_, profile, err := s.Cluster.ProfileGet(project, name)
+			if err != nil {
+				return nil, err
+			}
 
-		profiles[name] = *profile
+			projectProfiles[name] = *profile
+		}
 	}
 
 	// Load the container structs
 	containers := []container{}
-	for _, args := range cts {
+	for _, container := range cts {
 		// Figure out the container's profiles
 		cProfiles := []api.Profile{}
-		for _, name := range args.Profiles {
-			cProfiles = append(cProfiles, profiles[name])
+		for _, name := range container.Profiles {
+			cProfiles = append(cProfiles, profiles[container.Project][name])
 		}
+
+		args := db.ContainerToArgs(&container)
 
 		ct, err := containerLXCLoad(s, args, cProfiles)
 		if err != nil {
@@ -1139,4 +1504,317 @@ func containerLoadAllInternal(cts []db.ContainerArgs, s *state.State) ([]contain
 	}
 
 	return containers, nil
+}
+
+func containerCompareSnapshots(source container, target container) ([]container, []container, error) {
+	// Get the source snapshots
+	sourceSnapshots, err := source.Snapshots()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Get the target snapshots
+	targetSnapshots, err := target.Snapshots()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Compare source and target
+	sourceSnapshotsTime := map[string]time.Time{}
+	targetSnapshotsTime := map[string]time.Time{}
+
+	toDelete := []container{}
+	toSync := []container{}
+
+	for _, snap := range sourceSnapshots {
+		_, snapName, _ := containerGetParentAndSnapshotName(snap.Name())
+
+		sourceSnapshotsTime[snapName] = snap.CreationDate()
+	}
+
+	for _, snap := range targetSnapshots {
+		_, snapName, _ := containerGetParentAndSnapshotName(snap.Name())
+
+		targetSnapshotsTime[snapName] = snap.CreationDate()
+		existDate, exists := sourceSnapshotsTime[snapName]
+		if !exists {
+			toDelete = append(toDelete, snap)
+		} else if existDate != snap.CreationDate() {
+			toDelete = append(toDelete, snap)
+		}
+	}
+
+	for _, snap := range sourceSnapshots {
+		_, snapName, _ := containerGetParentAndSnapshotName(snap.Name())
+
+		existDate, exists := targetSnapshotsTime[snapName]
+		if !exists || existDate != snap.CreationDate() {
+			toSync = append(toSync, snap)
+		}
+	}
+
+	return toSync, toDelete, nil
+}
+
+func autoCreateContainerSnapshotsTask(d *Daemon) (task.Func, task.Schedule) {
+	f := func(ctx context.Context) {
+		// Load all local containers
+		allContainers, err := containerLoadNodeAll(d.State())
+		if err != nil {
+			logger.Error("Failed to load containers for scheduled snapshots", log.Ctx{"err": err})
+			return
+		}
+
+		// Figure out which need snapshotting (if any)
+		containers := []container{}
+		for _, c := range allContainers {
+			schedule := c.LocalConfig()["snapshots.schedule"]
+
+			if schedule == "" {
+				continue
+			}
+
+			// Extend our schedule to one that is accepted by the used cron parser
+			sched, err := cron.Parse(fmt.Sprintf("* %s", schedule))
+			if err != nil {
+				continue
+			}
+
+			// Check if it's time to snapshot
+			now := time.Now()
+			next := sched.Next(now)
+
+			// Ignore everything that is more precise than minutes.
+			now = now.Truncate(time.Minute)
+			next = next.Truncate(time.Minute)
+
+			if !now.Equal(next) {
+				continue
+			}
+
+			// Check if the container is running
+			if !shared.IsTrue(c.LocalConfig()["snapshots.schedule.stopped"]) && !c.IsRunning() {
+				continue
+			}
+
+			containers = append(containers, c)
+		}
+
+		if len(containers) == 0 {
+			return
+		}
+
+		opRun := func(op *operation) error {
+			return autoCreateContainerSnapshots(ctx, d, containers)
+		}
+
+		op, err := operationCreate(d.cluster, "", operationClassTask, db.OperationSnapshotCreate, nil, nil, opRun, nil, nil)
+		if err != nil {
+			logger.Error("Failed to start create snapshot operation", log.Ctx{"err": err})
+			return
+		}
+
+		logger.Info("Creating scheduled container snapshots")
+
+		_, err = op.Run()
+		if err != nil {
+			logger.Error("Failed to create scheduled container snapshots", log.Ctx{"err": err})
+		}
+
+		logger.Info("Done creating scheduled container snapshots")
+	}
+
+	first := true
+	schedule := func() (time.Duration, error) {
+		interval := time.Minute
+
+		if first {
+			first = false
+			return interval, task.ErrSkip
+		}
+
+		return interval, nil
+	}
+
+	return f, schedule
+}
+
+func autoCreateContainerSnapshots(ctx context.Context, d *Daemon, containers []container) error {
+	// Make the snapshots
+	for _, c := range containers {
+		ch := make(chan error)
+		go func() {
+			snapshotName, err := containerDetermineNextSnapshotName(d, c, "snap%d")
+			if err != nil {
+				logger.Error("Error retrieving next snapshot name", log.Ctx{"err": err, "container": c})
+				ch <- nil
+				return
+			}
+
+			snapshotName = fmt.Sprintf("%s%s%s", c.Name(), shared.SnapshotDelimiter, snapshotName)
+
+			expiry, err := shared.GetSnapshotExpiry(time.Now(), c.LocalConfig()["snapshots.expiry"])
+			if err != nil {
+				logger.Error("Error getting expiry date", log.Ctx{"err": err, "container": c})
+				ch <- nil
+				return
+			}
+
+			args := db.ContainerArgs{
+				Architecture: c.Architecture(),
+				Config:       c.LocalConfig(),
+				Ctype:        db.CTypeSnapshot,
+				Devices:      c.LocalDevices(),
+				Ephemeral:    c.IsEphemeral(),
+				Name:         snapshotName,
+				Profiles:     c.Profiles(),
+				Project:      c.Project(),
+				Stateful:     false,
+				ExpiryDate:   expiry,
+			}
+
+			_, err = containerCreateAsSnapshot(d.State(), args, c)
+			if err != nil {
+				logger.Error("Error creating snapshots", log.Ctx{"err": err, "container": c})
+			}
+
+			ch <- nil
+		}()
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ch:
+		}
+	}
+
+	return nil
+}
+
+func pruneExpiredContainerSnapshotsTask(d *Daemon) (task.Func, task.Schedule) {
+	f := func(ctx context.Context) {
+		// Load all local containers
+		allContainers, err := containerLoadNodeAll(d.State())
+		if err != nil {
+			logger.Error("Failed to load containers for snapshot expiry", log.Ctx{"err": err})
+			return
+		}
+
+		// Figure out which need snapshotting (if any)
+		expiredSnapshots := []container{}
+		for _, c := range allContainers {
+			snapshots, err := c.Snapshots()
+			if err != nil {
+				logger.Error("Failed to list snapshots", log.Ctx{"err": err, "container": c.Name(), "project": c.Project()})
+				continue
+			}
+
+			for _, snapshot := range snapshots {
+				if snapshot.ExpiryDate().IsZero() {
+					// Snapshot doesn't expire
+					continue
+				}
+
+				if time.Now().Unix()-snapshot.ExpiryDate().Unix() >= 0 {
+					expiredSnapshots = append(expiredSnapshots, snapshot)
+				}
+			}
+		}
+
+		if len(expiredSnapshots) == 0 {
+			return
+		}
+
+		opRun := func(op *operation) error {
+			return pruneExpiredContainerSnapshots(ctx, d, expiredSnapshots)
+		}
+
+		op, err := operationCreate(d.cluster, "", operationClassTask, db.OperationSnapshotsExpire, nil, nil, opRun, nil, nil)
+		if err != nil {
+			logger.Error("Failed to start expired snapshots operation", log.Ctx{"err": err})
+			return
+		}
+
+		logger.Info("Pruning expired container snapshots")
+
+		_, err = op.Run()
+		if err != nil {
+			logger.Error("Failed to remove expired container snapshots", log.Ctx{"err": err})
+		}
+
+		logger.Info("Done pruning expired container snapshots")
+	}
+
+	first := true
+	schedule := func() (time.Duration, error) {
+		interval := time.Minute
+
+		if first {
+			first = false
+			return interval, task.ErrSkip
+		}
+
+		return interval, nil
+	}
+
+	return f, schedule
+}
+
+func pruneExpiredContainerSnapshots(ctx context.Context, d *Daemon, snapshots []container) error {
+	// Find snapshots to delete
+	for _, snapshot := range snapshots {
+		err := snapshot.Delete()
+		if err != nil {
+			return errors.Wrapf(err, "Failed to delete expired snapshot '%s' in project '%s'", snapshot.Name(), snapshot.Project())
+		}
+	}
+
+	return nil
+}
+
+func containerDetermineNextSnapshotName(d *Daemon, c container, defaultPattern string) (string, error) {
+	var err error
+
+	pattern := c.LocalConfig()["snapshots.pattern"]
+	if pattern == "" {
+		pattern = defaultPattern
+	}
+
+	pattern, err = shared.RenderTemplate(pattern, pongo2.Context{
+		"creation_date": time.Now(),
+	})
+	if err != nil {
+		return "", err
+	}
+
+	count := strings.Count(pattern, "%d")
+	if count > 1 {
+		return "", fmt.Errorf("Snapshot pattern may contain '%%d' only once")
+	} else if count == 1 {
+		i := d.cluster.ContainerNextSnapshot(c.Project(), c.Name(), pattern)
+		return strings.Replace(pattern, "%d", strconv.Itoa(i), 1), nil
+	}
+
+	snapshotExists := false
+
+	snapshots, err := c.Snapshots()
+	if err != nil {
+		return "", err
+	}
+
+	for _, snap := range snapshots {
+		_, snapOnlyName, _ := containerGetParentAndSnapshotName(snap.Name())
+		if snapOnlyName == pattern {
+			snapshotExists = true
+			break
+		}
+	}
+
+	// Append '-0', '-1', etc. if the actual pattern/snapshot name already exists
+	if snapshotExists {
+		pattern = fmt.Sprintf("%s-%%d", pattern)
+		i := d.cluster.ContainerNextSnapshot(c.Project(), c.Name(), pattern)
+		return strings.Replace(pattern, "%d", strconv.Itoa(i), 1), nil
+	}
+
+	return pattern, nil
 }

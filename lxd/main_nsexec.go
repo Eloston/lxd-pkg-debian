@@ -33,16 +33,18 @@ package main
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "include/memory_utils.h"
+
 // External functions
 extern void checkfeature();
 extern void forkfile();
 extern void forkmount();
 extern void forknet();
 extern void forkproxy();
+extern void forkuevent();
 
 // Command line parsing and tracking
-#define CMDLINE_SIZE (8 * PATH_MAX)
-char cmdline_buf[CMDLINE_SIZE];
+char *cmdline_buf = NULL;
 char *cmdline_cur = NULL;
 ssize_t cmdline_size = -1;
 
@@ -77,7 +79,7 @@ void error(char *msg)
 }
 
 int dosetns(int pid, char *nstype) {
-	int mntns;
+	__do_close_prot_errno int mntns = -EBADF;
 	char buf[PATH_MAX];
 
 	sprintf(buf, "/proc/%d/ns/%s", pid, nstype);
@@ -89,10 +91,8 @@ int dosetns(int pid, char *nstype) {
 
 	if (setns(mntns, 0) < 0) {
 		error("error: setns");
-		close(mntns);
 		return -1;
 	}
-	close(mntns);
 
 	return 0;
 }
@@ -128,7 +128,8 @@ static int preserve_ns(const int pid, const char *ns)
 // in the same namespace returns -EINVAL, -1 if an error occurred.
 static int in_same_namespace(pid_t pid1, pid_t pid2, const char *ns)
 {
-	int ns_fd1 = -1, ns_fd2 = -1, ret = -1;
+	__do_close_prot_errno int ns_fd1 = -1, ns_fd2 = -1;
+	int ret = -1;
 	struct stat ns_st1, ns_st2;
 
 	ns_fd1 = preserve_ns(pid1, ns);
@@ -138,42 +139,32 @@ static int in_same_namespace(pid_t pid1, pid_t pid2, const char *ns)
 		if (errno == ENOENT)
 			return -EINVAL;
 
-		goto out;
+		return -1;
 	}
 
 	ns_fd2 = preserve_ns(pid2, ns);
 	if (ns_fd2 < 0)
-		goto out;
+		return -1;
 
 	ret = fstat(ns_fd1, &ns_st1);
 	if (ret < 0)
-		goto out;
+		return -1;
 
 	ret = fstat(ns_fd2, &ns_st2);
 	if (ret < 0)
-		goto out;
+		return -1;
 
 	// processes are in the same namespace
-	ret = -EINVAL;
 	if ((ns_st1.st_dev == ns_st2.st_dev ) && (ns_st1.st_ino == ns_st2.st_ino))
-		goto out;
+		return -EINVAL;
 
 	// processes are in different namespaces
-	ret = ns_fd2;
-	ns_fd2 = -1;
-
-out:
-
-	if (ns_fd1 >= 0)
-		close(ns_fd1);
-	if (ns_fd2 >= 0)
-		close(ns_fd2);
-
-	return ret;
+	return move_fd(ns_fd2);
 }
 
 void attach_userns(int pid) {
-	int ret, userns_fd;
+	__do_close_prot_errno int userns_fd = -EBADF;
+	int ret;
 
 	userns_fd = in_same_namespace(getpid(), pid, "user");
 	if (userns_fd < 0) {
@@ -184,7 +175,6 @@ void attach_userns(int pid) {
 	}
 
 	ret = setns(userns_fd, CLONE_NEWUSER);
-	close(userns_fd);
 	if (ret < 0) {
 		fprintf(stderr, "Failed setns to container user namespace: %s\n", strerror(errno));
 		_exit(EXIT_FAILURE);
@@ -209,26 +199,61 @@ void attach_userns(int pid) {
 	}
 }
 
+static ssize_t lxc_read_nointr(int fd, void *buf, size_t count)
+{
+	ssize_t ret;
+again:
+	ret = read(fd, buf, count);
+	if (ret < 0 && errno == EINTR)
+		goto again;
+
+	return ret;
+}
+
+static char *file_to_buf(char *path, ssize_t *length)
+{
+	__do_close_prot_errno int fd = -EBADF;
+	__do_free char *copy = NULL;
+	char buf[PATH_MAX];
+
+	if (!length)
+		return NULL;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return NULL;
+
+	*length = 0;
+	for (;;) {
+		int n;
+		char *old = copy;
+
+		n = lxc_read_nointr(fd, buf, sizeof(buf));
+		if (n < 0)
+			return NULL;
+		if (!n)
+			break;
+
+		copy = realloc(old, (*length + n) * sizeof(*old));
+		if (!copy)
+			return NULL;
+
+		memcpy(copy + *length, buf, n);
+		*length += n;
+	}
+
+	return move_ptr(copy);
+}
+
 __attribute__((constructor)) void init(void) {
-	int cmdline;
+	__do_free char *cmdline = NULL;
 
-	// Extract arguments
-	cmdline = open("/proc/self/cmdline", O_RDONLY);
-	if (cmdline < 0) {
-		error("error: open");
+	cmdline_buf = file_to_buf("/proc/self/cmdline", &cmdline_size);
+	if (!cmdline_buf)
 		_exit(232);
-	}
-
-	memset(cmdline_buf, 0, sizeof(cmdline_buf));
-	if ((cmdline_size = read(cmdline, cmdline_buf, sizeof(cmdline_buf)-1)) < 0) {
-		close(cmdline);
-		error("error: read");
-		_exit(232);
-	}
-	close(cmdline);
 
 	// Skip the first argument (but don't fail on missing second argument)
-	cmdline_cur = cmdline_buf;
+	cmdline = cmdline_cur = cmdline_buf;
 	while (*cmdline_cur != 0)
 		cmdline_cur++;
 	cmdline_cur++;
@@ -246,6 +271,8 @@ __attribute__((constructor)) void init(void) {
 		forknet();
 	else if (strcmp(cmdline_cur, "forkproxy") == 0)
 		forkproxy();
+	else if (strcmp(cmdline_cur, "forkuevent") == 0)
+		forkuevent();
 	else if (strncmp(cmdline_cur, "-", 1) == 0 || strcmp(cmdline_cur, "daemon") == 0)
 		checkfeature();
 }

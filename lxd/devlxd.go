@@ -53,10 +53,10 @@ type devLxdHandler struct {
 	 * server side right now either, I went the simple route to avoid
 	 * needless noise.
 	 */
-	f func(c container, w http.ResponseWriter, r *http.Request) *devLxdResponse
+	f func(d *Daemon, c container, w http.ResponseWriter, r *http.Request) *devLxdResponse
 }
 
-var devlxdConfigGet = devLxdHandler{"/1.0/config", func(c container, w http.ResponseWriter, r *http.Request) *devLxdResponse {
+var devlxdConfigGet = devLxdHandler{"/1.0/config", func(d *Daemon, c container, w http.ResponseWriter, r *http.Request) *devLxdResponse {
 	filtered := []string{}
 	for k := range c.ExpandedConfig() {
 		if strings.HasPrefix(k, "user.") {
@@ -66,7 +66,7 @@ var devlxdConfigGet = devLxdHandler{"/1.0/config", func(c container, w http.Resp
 	return okResponse(filtered, "json")
 }}
 
-var devlxdConfigKeyGet = devLxdHandler{"/1.0/config/{key}", func(c container, w http.ResponseWriter, r *http.Request) *devLxdResponse {
+var devlxdConfigKeyGet = devLxdHandler{"/1.0/config/{key}", func(d *Daemon, c container, w http.ResponseWriter, r *http.Request) *devLxdResponse {
 	key := mux.Vars(r)["key"]
 	if !strings.HasPrefix(key, "user.") {
 		return &devLxdResponse{"not authorized", http.StatusForbidden, "raw"}
@@ -80,7 +80,24 @@ var devlxdConfigKeyGet = devLxdHandler{"/1.0/config/{key}", func(c container, w 
 	return okResponse(value, "raw")
 }}
 
-var devlxdMetadataGet = devLxdHandler{"/1.0/meta-data", func(c container, w http.ResponseWriter, r *http.Request) *devLxdResponse {
+var devlxdImageExport = devLxdHandler{"/1.0/images/{fingerprint}/export", func(d *Daemon, c container, w http.ResponseWriter, r *http.Request) *devLxdResponse {
+	if !shared.IsTrue(c.ExpandedConfig()["security.devlxd.images"]) {
+		return &devLxdResponse{"not authorized", http.StatusForbidden, "raw"}
+	}
+
+	// Use by security checks to distinguish devlxd vs lxd APIs
+	r.RemoteAddr = "@devlxd"
+
+	resp := imageExport(d, r)
+	err := resp.Render(w)
+	if err != nil {
+		return &devLxdResponse{"internal server error", http.StatusInternalServerError, "raw"}
+	}
+
+	return &devLxdResponse{"", http.StatusOK, "raw"}
+}}
+
+var devlxdMetadataGet = devLxdHandler{"/1.0/meta-data", func(d *Daemon, c container, w http.ResponseWriter, r *http.Request) *devLxdResponse {
 	value := c.ExpandedConfig()["user.meta-data"]
 	return okResponse(fmt.Sprintf("#cloud-config\ninstance-id: %s\nlocal-hostname: %s\n%s", c.Name(), c.Name(), value), "raw")
 }}
@@ -88,7 +105,7 @@ var devlxdMetadataGet = devLxdHandler{"/1.0/meta-data", func(c container, w http
 var devlxdEventsLock sync.Mutex
 var devlxdEventListeners map[int]map[string]*eventListener = make(map[int]map[string]*eventListener)
 
-var devlxdEventsGet = devLxdHandler{"/1.0/events", func(c container, w http.ResponseWriter, r *http.Request) *devLxdResponse {
+var devlxdEventsGet = devLxdHandler{"/1.0/events", func(d *Daemon, c container, w http.ResponseWriter, r *http.Request) *devLxdResponse {
 	typeStr := r.FormValue("type")
 	if typeStr == "" {
 		typeStr = "config,device"
@@ -100,6 +117,7 @@ var devlxdEventsGet = devLxdHandler{"/1.0/events", func(c container, w http.Resp
 	}
 
 	listener := eventListener{
+		project:      c.Project(),
 		active:       make(chan bool, 1),
 		connection:   conn,
 		id:           uuid.NewRandom().String(),
@@ -182,19 +200,20 @@ func devlxdEventSend(c container, eventType string, eventMessage interface{}) er
 }
 
 var handlers = []devLxdHandler{
-	{"/", func(c container, w http.ResponseWriter, r *http.Request) *devLxdResponse {
+	{"/", func(d *Daemon, c container, w http.ResponseWriter, r *http.Request) *devLxdResponse {
 		return okResponse([]string{"/1.0"}, "json")
 	}},
-	{"/1.0", func(c container, w http.ResponseWriter, r *http.Request) *devLxdResponse {
+	{"/1.0", func(d *Daemon, c container, w http.ResponseWriter, r *http.Request) *devLxdResponse {
 		return okResponse(shared.Jmap{"api_version": version.APIVersion}, "json")
 	}},
 	devlxdConfigGet,
 	devlxdConfigKeyGet,
 	devlxdMetadataGet,
 	devlxdEventsGet,
+	devlxdImageExport,
 }
 
-func hoistReq(f func(container, http.ResponseWriter, *http.Request) *devLxdResponse, d *Daemon) func(http.ResponseWriter, *http.Request) {
+func hoistReq(f func(*Daemon, container, http.ResponseWriter, *http.Request) *devLxdResponse, d *Daemon) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn := extractUnderlyingConn(w)
 		cred, ok := pidMapper.m[conn]
@@ -223,7 +242,7 @@ func hoistReq(f func(container, http.ResponseWriter, *http.Request) *devLxdRespo
 			return
 		}
 
-		resp := f(c, w, r)
+		resp := f(d, c, w, r)
 		if resp.code != http.StatusOK {
 			http.Error(w, fmt.Sprintf("%s", resp.content), resp.code)
 		} else if resp.ctype == "json" {
@@ -420,7 +439,12 @@ func findContainerForPid(pid int32, d *Daemon) (container, error) {
 			parts := strings.Split(string(cmdline), " ")
 			name := strings.TrimSuffix(parts[len(parts)-1], "\x00")
 
-			return containerLoadByName(d.State(), name)
+			project := "default"
+			if strings.Contains(name, "_") {
+				project = strings.Split(name, "_")[0]
+			}
+
+			return containerLoadByProjectAndName(d.State(), project, name)
 		}
 
 		status, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/status", pid))

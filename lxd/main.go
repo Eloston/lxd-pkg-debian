@@ -92,6 +92,10 @@ func main() {
 	forkconsoleCmd := cmdForkconsole{global: &globalCmd}
 	app.AddCommand(forkconsoleCmd.Command())
 
+	// forkdns sub-command
+	forkDNSCmd := cmdForkDNS{global: &globalCmd}
+	app.AddCommand(forkDNSCmd.Command())
+
 	// forkexec sub-command
 	forkexecCmd := cmdForkexec{global: &globalCmd}
 	app.AddCommand(forkexecCmd.Command())
@@ -119,6 +123,10 @@ func main() {
 	// forkstart sub-command
 	forkstartCmd := cmdForkstart{global: &globalCmd}
 	app.AddCommand(forkstartCmd.Command())
+
+	// forkuevent sub-command
+	forkueventCmd := cmdForkuevent{global: &globalCmd}
+	app.AddCommand(forkueventCmd.Command())
 
 	// import sub-command
 	importCmd := cmdImport{global: &globalCmd}

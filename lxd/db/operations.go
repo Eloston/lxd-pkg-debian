@@ -7,12 +7,175 @@ import (
 	"github.com/pkg/errors"
 )
 
+// OperationType is a numeric code indentifying the type of an Operation.
+type OperationType int64
+
+// Possible values for OperationType
+//
+// WARNING: The type codes are stored in the database, so this list of
+//          definitions should be normally append-only. Any other change
+//          requires a database update.
+const (
+	OperationUnknown OperationType = iota
+	OperationClusterBootstrap
+	OperationClusterJoin
+	OperationBackupCreate
+	OperationBackupRename
+	OperationBackupRestore
+	OperationBackupRemove
+	OperationConsoleShow
+	OperationContainerCreate
+	OperationContainerUpdate
+	OperationContainerRename
+	OperationContainerMigrate
+	OperationContainerLiveMigrate
+	OperationContainerFreeze
+	OperationContainerUnfreeze
+	OperationContainerDelete
+	OperationContainerStart
+	OperationContainerStop
+	OperationContainerRestart
+	OperationCommandExec
+	OperationSnapshotCreate
+	OperationSnapshotRename
+	OperationSnapshotRestore
+	OperationSnapshotTransfer
+	OperationSnapshotUpdate
+	OperationSnapshotDelete
+	OperationImageDownload
+	OperationImageDelete
+	OperationImageToken
+	OperationImageRefresh
+	OperationVolumeCopy
+	OperationVolumeCreate
+	OperationVolumeMigrate
+	OperationVolumeMove
+	OperationVolumeSnapshotCreate
+	OperationVolumeSnapshotDelete
+	OperationVolumeSnapshotUpdate
+	OperationProjectRename
+	OperationImagesExpire
+	OperationImagesPruneLeftover
+	OperationImagesUpdate
+	OperationImagesSynchronize
+	OperationLogsExpire
+	OperationInstanceTypesUpdate
+	OperationBackupsExpire
+	OperationSnapshotsExpire
+)
+
+// Description return a human-readable description of the operation type.
+func (t OperationType) Description() string {
+	switch t {
+	case OperationClusterBootstrap:
+		return "Creating bootstrap node"
+	case OperationClusterJoin:
+		return "Joining cluster"
+	case OperationBackupCreate:
+		return "Backing up container"
+	case OperationBackupRename:
+		return "Renaming container backup"
+	case OperationBackupRestore:
+		return "Restoring backup"
+	case OperationBackupRemove:
+		return "Removing container backup"
+	case OperationConsoleShow:
+		return "Showing console"
+	case OperationContainerCreate:
+		return "Creating container"
+	case OperationContainerUpdate:
+		return "Updating container"
+	case OperationContainerRename:
+		return "Renaming container"
+	case OperationContainerMigrate:
+		return "Migrating container"
+	case OperationContainerLiveMigrate:
+		return "Live-migrating container"
+	case OperationContainerFreeze:
+		return "Freezing container"
+	case OperationContainerUnfreeze:
+		return "Unfreezing container"
+	case OperationContainerDelete:
+		return "Deleting container"
+	case OperationContainerStart:
+		return "Starting container"
+	case OperationContainerStop:
+		return "Stopping container"
+	case OperationContainerRestart:
+		return "Restarting container"
+	case OperationCommandExec:
+		return "Executing command"
+	case OperationSnapshotCreate:
+		return "Snapshotting container"
+	case OperationSnapshotRename:
+		return "Renaming snapshot"
+	case OperationSnapshotRestore:
+		return "Restoring snapshot"
+	case OperationSnapshotTransfer:
+		return "Transferring snapshot"
+	case OperationSnapshotUpdate:
+		return "Updating snapshot"
+	case OperationSnapshotDelete:
+		return "Deleting snapshot"
+	case OperationImageDownload:
+		return "Downloading image"
+	case OperationImageDelete:
+		return "Deleting image"
+	case OperationImageToken:
+		return "Image download token"
+	case OperationImageRefresh:
+		return "Refreshing image"
+	case OperationVolumeCopy:
+		return "Copying storage volume"
+	case OperationVolumeCreate:
+		return "Creating storage volume"
+	case OperationVolumeMigrate:
+		return "Migrating storage volume"
+	case OperationVolumeMove:
+		return "Moving storage volume"
+	case OperationVolumeSnapshotCreate:
+		return "Creating storage volume snapshot"
+	case OperationVolumeSnapshotDelete:
+		return "Deleting storage volume snapshot"
+	case OperationVolumeSnapshotUpdate:
+		return "Updating storage volume snapshot"
+	case OperationProjectRename:
+		return "Renaming project"
+	case OperationImagesExpire:
+		return "Cleaning up expired images"
+	case OperationImagesPruneLeftover:
+		return "Pruning leftover image files"
+	case OperationImagesUpdate:
+		return "Updating images"
+	case OperationImagesSynchronize:
+		return "Synchronizing images"
+	case OperationLogsExpire:
+		return "Expiring log files"
+	case OperationInstanceTypesUpdate:
+		return "Updating instance types"
+	case OperationBackupsExpire:
+		return "Cleaning up expired backups"
+	case OperationSnapshotsExpire:
+		return "Cleaning up expired snapshots"
+	default:
+		return "Executing operation"
+
+	}
+
+}
+
 // Operation holds information about a single LXD operation running on a node
 // in the cluster.
 type Operation struct {
-	ID          int64  // Stable database identifier
-	UUID        string // User-visible identifier
-	NodeAddress string // Address of the node the operation is running on
+	ID          int64         // Stable database identifier
+	UUID        string        // User-visible identifier
+	NodeAddress string        // Address of the node the operation is running on
+	Type        OperationType // Type of the operation
+}
+
+// Operations returns all operations associated with this node.
+func (c *ClusterTx) Operations() ([]Operation, error) {
+	return c.operations("node_id=?", c.nodeID)
 }
 
 // OperationsUUIDs returns the UUIDs of all operations associated with this
@@ -23,9 +186,15 @@ func (c *ClusterTx) OperationsUUIDs() ([]string, error) {
 }
 
 // OperationNodes returns a list of nodes that have running operations
-func (c *ClusterTx) OperationNodes() ([]string, error) {
-	stmt := "SELECT DISTINCT nodes.address FROM operations JOIN nodes ON nodes.id = node_id"
-	return query.SelectStrings(c.tx, stmt)
+func (c *ClusterTx) OperationNodes(project string) ([]string, error) {
+	stmt := `
+SELECT DISTINCT nodes.address
+  FROM operations
+  LEFT OUTER JOIN projects ON projects.id = operations.project_id
+  JOIN nodes ON nodes.id = operations.node_id
+ WHERE projects.name = ? OR operations.project_id IS NULL
+`
+	return query.SelectStrings(c.tx, stmt, project)
 }
 
 // OperationByUUID returns the operation with the given UUID.
@@ -46,9 +215,21 @@ func (c *ClusterTx) OperationByUUID(uuid string) (Operation, error) {
 }
 
 // OperationAdd adds a new operations to the table.
-func (c *ClusterTx) OperationAdd(uuid string) (int64, error) {
-	columns := []string{"uuid", "node_id"}
-	values := []interface{}{uuid, c.nodeID}
+func (c *ClusterTx) OperationAdd(project, uuid string, typ OperationType) (int64, error) {
+	var projectID interface{}
+
+	if project != "" {
+		var err error
+		projectID, err = c.ProjectID(project)
+		if err != nil {
+			return -1, errors.Wrap(err, "Fetch project ID")
+		}
+	} else {
+		projectID = nil
+	}
+
+	columns := []string{"uuid", "node_id", "type", "project_id"}
+	values := []interface{}{uuid, c.nodeID, typ, projectID}
 	return query.UpsertObject(c.tx, "operations", columns, values)
 }
 
@@ -77,10 +258,11 @@ func (c *ClusterTx) operations(where string, args ...interface{}) ([]Operation, 
 			&operations[i].ID,
 			&operations[i].UUID,
 			&operations[i].NodeAddress,
+			&operations[i].Type,
 		}
 	}
 	sql := `
-SELECT operations.id, uuid, nodes.address FROM operations JOIN nodes ON nodes.id = node_id `
+SELECT operations.id, uuid, nodes.address, type FROM operations JOIN nodes ON nodes.id = node_id `
 	if where != "" {
 		sql += fmt.Sprintf("WHERE %s ", where)
 	}

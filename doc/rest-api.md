@@ -196,6 +196,9 @@ won't work and PUT needs to be used instead.
          * [`/1.0/containers/<name>/logs/<logfile>`](#10containersnamelogslogfile)
          * [`/1.0/containers/<name>/metadata`](#10containersnamemetadata)
          * [`/1.0/containers/<name>/metadata/templates`](#10containersnamemetadatatemplates)
+         * [`/1.0/containers/<name>/backups`](#10containersnamebackups)
+         * [`/1.0/containers/<name>/backups/<name>`](#10containersnamebackupsname)
+         * [`/1.0/containers/<name>/backups/<name>/export`](#10containersnamebackupsnameexport)
      * [`/1.0/events`](#10events)
      * [`/1.0/images`](#10images)
        * [`/1.0/images/<fingerprint>`](#10imagesfingerprint)
@@ -206,18 +209,23 @@ won't work and PUT needs to be used instead.
          * [`/1.0/images/aliases/<name>`](#10imagesaliasesname)
      * [`/1.0/networks`](#10networks)
        * [`/1.0/networks/<name>`](#10networksname)
+       * [`/1.0/networks/<name>/state`](#10networksnamestate)
      * [`/1.0/operations`](#10operations)
        * [`/1.0/operations/<uuid>`](#10operationsuuid)
          * [`/1.0/operations/<uuid>/wait`](#10operationsuuidwait)
          * [`/1.0/operations/<uuid>/websocket`](#10operationsuuidwebsocket)
      * [`/1.0/profiles`](#10profiles)
        * [`/1.0/profiles/<name>`](#10profilesname)
+     * [`/1.0/projects`](#10projects)
+       * [`/1.0/projects/<name>`](#10projectsname)
      * [`/1.0/storage-pools`](#10storage-pools)
        * [`/1.0/storage-pools/<name>`](#10storage-poolsname)
          * [`/1.0/storage-pools/<name>/resources`](#10storage-poolsnameresources)
          * [`/1.0/storage-pools/<name>/volumes`](#10storage-poolsnamevolumes)
            * [`/1.0/storage-pools/<name>/volumes/<type>`](#10storage-poolsnamevolumestype)
              * [`/1.0/storage-pools/<pool>/volumes/<type>/<name>`](#10storage-poolspoolvolumestypename)
+               * [`/1.0/storage-pools/<pool>/volumes/<type>/<name>/snapshots`](#10storage-poolspoolvolumestypenamesnapshots)
+                 * [`/1.0/storage-pools/<pool>/volumes/<type>/<volume>/snapshots/<name>`](#10storage-poolspoolvolumestypevolumesnapshotsname)
      * [`/1.0/resources`](#10resources)
      * [`/1.0/cluster`](#10cluster)
        * [`/1.0/cluster/members`](#10clustermembers)
@@ -609,6 +617,10 @@ Input (using a remote container, in push mode sent over the migration websocket 
                    "container_only": true}                                              # Whether to migrate only the container without snapshots. Can be "true" or "false".
     }
 
+Input (using a backup):
+
+    Raw compressed tarball as provided by a backup download.
+
 ### `/1.0/containers/<name>`
 #### GET
  * Description: Container information
@@ -770,10 +782,10 @@ HTTP code for this should be 202 (Accepted).
 
 ### `/1.0/containers/<name>/console`
 #### GET
-* Description: returns the contents of the container's console  log
-* Authentication: trusted
-* Operation: N/A
-* Return: the contents of the console log
+ * Description: returns the contents of the container's console  log
+ * Authentication: trusted
+ * Operation: N/A
+ * Return: the contents of the console log
 
 #### POST
  * Description: attach to a container's console devices
@@ -802,10 +814,10 @@ Control (window size change):
     }
 
 #### DELETE
-* Description: empty the container's console log
-* Authentication: trusted
-* Operation: Sync
-* Return: empty response or standard error
+ * Description: empty the container's console log
+ * Authentication: trusted
+ * Operation: Sync
+ * Return: empty response or standard error
 
 ### `/1.0/containers/<name>/exec`
 #### POST
@@ -1075,6 +1087,18 @@ Input (none at present):
     {
     }
 
+#### PUT
+ * Description: update the snapshot
+ * Authentication: trusted
+ * Operation: async
+ * Return: background operation or standard error
+
+Input:
+
+    {
+        "expires_at": "2019-01-16T12:34:56+02:00"
+    }
+
 HTTP code for this should be 202 (Accepted).
 
 ### `/1.0/containers/<name>/state`
@@ -1245,12 +1269,12 @@ Input:
 
 ### `/1.0/containers/<name>/logs`
 #### GET
-* Description: Returns a list of the log files available for this container.
-  Note that this works on containers that have been deleted (or were never
-  created) to enable people to get logs for failed creations.
-* Authentication: trusted
-* Operation: Sync
-* Return: a list of the available log files
+ * Description: Returns a list of the log files available for this container.
+   Note that this works on containers that have been deleted (or were never
+   created) to enable people to get logs for failed creations.
+ * Authentication: trusted
+ * Operation: Sync
+ * Return: a list of the available log files
 
 Return:
 
@@ -1262,24 +1286,24 @@ Return:
 
 ### `/1.0/containers/<name>/logs/<logfile>`
 #### GET
-* Description: returns the contents of a particular log file.
-* Authentication: trusted
-* Operation: N/A
-* Return: the contents of the log file
+ * Description: returns the contents of a particular log file.
+ * Authentication: trusted
+ * Operation: N/A
+ * Return: the contents of the log file
 
 #### DELETE
-* Description: delete a particular log file.
-* Authentication: trusted
-* Operation: Sync
-* Return: empty response or standard error
+ * Description: delete a particular log file.
+ * Authentication: trusted
+ * Operation: Sync
+ * Return: empty response or standard error
 
 ### `/1.0/containers/<name>/metadata`
 #### GET
-* Description: Container metadata
-* Introduced: with API extension `container_edit_metadata`
-* Authentication: trusted
-* Operation: Sync
-* Return: dict representing container metadata
+ * Description: Container metadata
+ * Introduced: with API extension `container_edit_metadata`
+ * Authentication: trusted
+ * Operation: Sync
+ * Return: dict representing container metadata
 
 Return:
 
@@ -1306,11 +1330,11 @@ Return:
     }
 
 #### PUT (ETag supported)
-* Description: Replaces container metadata
-* Introduced: with API extension `container_edit_metadata`
-* Authentication: trusted
-* Operation: sync
-* Return: standard return value or standard error
+ * Description: Replaces container metadata
+ * Introduced: with API extension `container_edit_metadata`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
 
 Input:
 
@@ -1338,11 +1362,11 @@ Input:
 
 ### `/1.0/containers/<name>/metadata/templates`
 #### GET
-* Description: List container templates
-* Introduced: with API extension `container_edit_metadata`
-* Authentication: trusted
-* Operation: Sync
-* Return: a list with container template names
+ * Description: List container templates
+ * Introduced: with API extension `container_edit_metadata`
+ * Authentication: trusted
+ * Operation: Sync
+ * Return: a list with container template names
 
 Return:
 
@@ -1352,40 +1376,123 @@ Return:
     ]
 
 #### GET (`?path=<template>`)
-* Description: Content of a container template
-* Introduced: with API extension `container_edit_metadata`
-* Authentication: trusted
-* Operation: Sync
-* Return: the content of the template
+ * Description: Content of a container template
+ * Introduced: with API extension `container_edit_metadata`
+ * Authentication: trusted
+ * Operation: Sync
+ * Return: the content of the template
 
 #### POST (`?path=<template>`)
-* Description: Add a continer template
-* Introduced: with API extension `container_edit_metadata`
-* Authentication: trusted
-* Operation: Sync
-* Return: standard return value or standard error
+ * Description: Add a continer template
+ * Introduced: with API extension `container_edit_metadata`
+ * Authentication: trusted
+ * Operation: Sync
+ * Return: standard return value or standard error
 
 Input:
 
  * Standard http file upload.
 
 #### PUT (`?path=<template>`)
-* Description: Replace content of a template
-* Introduced: with API extension `container_edit_metadata`
-* Authentication: trusted
-* Operation: Sync
-* Return: standard return value or standard error
+ * Description: Replace content of a template
+ * Introduced: with API extension `container_edit_metadata`
+ * Authentication: trusted
+ * Operation: Sync
+ * Return: standard return value or standard error
 
 Input:
 
  * Standard http file upload.
 
 #### DELETE (`?path=<template>`)
-* Description: Delete a container template
-* Introduced: with API extension `container_edit_metadata`
-* Authentication: trusted
-* Operation: Sync
-* Return: standard return value or standard error
+ * Description: Delete a container template
+ * Introduced: with API extension `container_edit_metadata`
+ * Authentication: trusted
+ * Operation: Sync
+ * Return: standard return value or standard error
+
+### `/1.0/containers/<name>/backups`
+#### GET
+ * Description: List of backups for the container
+ * Introduced: with API extension `container_backup`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: a list of backups for the container
+
+Return value:
+
+    [
+        "/1.0/containers/c1/backups/c1/backup0",
+        "/1.0/containers/c1/backups/c1/backup1",
+    ]
+
+#### POST
+ * Description: Create a new backup
+ * Introduced: with API extension `container_backup`
+ * Authentication: trusted
+ * Operation: async
+ * Returns: background operation or standard error
+
+Input:
+
+    {
+        "name": "backupName",      # unique identifier for the backup
+        "expiry": 3600,            # when to delete the backup automatically
+        "container_only": true,    # if True, snapshots aren't included
+        "optimized_storage": true  # if True, btrfs send or zfs send is used for container and snapshots
+    }
+
+### `/1.0/containers/<name>/backups/<name>`
+#### GET
+ * Description: Backup information
+ * Introduced: with API extension `container_backup`
+ * Authentication: trusted
+ * Operation: sync
+ * Returns: dict of the backup
+
+Output:
+
+    {
+        "name": "backupName",
+        "creation_date": "2018-04-23T12:16:09+02:00",
+        "expiry_date": "2018-04-23T12:16:09+02:00",
+        "container_only": false,
+        "optimized_storage": false
+    }
+
+#### DELETE
+ * Description: remove the backup
+ * Introduced: with API extension `container_backup`
+ * Authentication: trusted
+ * Operation: async
+ * Return: background operation or standard error
+
+#### POST
+ * Description: used to rename the backup
+ * Introduced: with API extension `container_backup`
+ * Authentication: trusted
+ * Operation: async
+ * Return: background operation or standard error
+
+Input:
+
+    {
+        "name": "new-name"
+    }
+
+### `/1.0/containers/<name>/backups/<name>/export`
+#### GET
+ * Description: fetch the backup tarball
+ * Introduced: with API extension `container_backup`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: dict containing the backup tarball
+
+Output:
+
+    {
+        "data": <byte-stream>
+    }
 
 ### `/1.0/events`
 This URL isn't a real REST API endpoint, instead doing a GET query on it
@@ -1885,6 +1992,48 @@ Input (none at present):
 
 HTTP code for this should be 202 (Accepted).
 
+### `/1.0/networks/<name>/state`
+#### GET
+ * Description: network state
+ * Authentication: trusted
+ * Operation: sync
+ * Return: dict representing a network's state
+
+Return:
+
+    {
+        "addresses": [
+            {
+                "family": "inet",
+                "address": "10.87.252.1",
+                "netmask": "24",
+                "scope": "global"
+            },
+            {
+                "family": "inet6",
+                "address": "fd42:6e0e:6542:a212::1",
+                "netmask": "64",
+                "scope": "global"
+            },
+            {
+                "family": "inet6",
+                "address": "fe80::3419:9ff:fe9b:f9aa",
+                "netmask": "64",
+                "scope": "link"
+            }
+        ],
+        "counters": {
+            "bytes_received": 0,
+            "bytes_sent": 17724,
+            "packets_received": 0,
+            "packets_sent": 95
+        },
+        "hwaddr": "36:19:09:9b:f9:aa",
+        "mtu": 1500,
+        "state": "up",
+        "type": "broadcast"
+    }
+
 ### `/1.0/operations`
 #### GET
  * Description: list of operations
@@ -2105,6 +2254,132 @@ Input (none at present):
 HTTP code for this should be 202 (Accepted).
 
 Attempting to delete the `default` profile will return the 403 (Forbidden) HTTP code.
+
+### `/1.0/projects`
+#### GET
+ * Description: List of projects
+ * Introduced: with API extension `projects`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: list of URLs to defined projects
+
+Return:
+
+    [
+        "/1.0/projects/default"
+    ]
+
+#### POST
+ * Description: define a new project
+ * Introduced: with API extension `projects`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+Input:
+
+    {
+        "name": "test",
+        "config": {
+            "features.images": "true",
+            "features.profiles": "true",
+        },
+        "description": "Some description string"
+    }
+
+### `/1.0/projects/<name>`
+#### GET
+ * Description: project configuration
+ * Introduced: with API extension `projects`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: dict representing the project content
+
+Output:
+
+    {
+        "name": "test",
+        "config": {
+            "features.images": "true",
+            "features.profiles": "true",
+        },
+        "description": "Some description string",
+        "used_by": [
+            "/1.0/containers/blah"
+        ]
+    }
+
+#### PUT (ETag supported)
+ * Description: replace the project information
+ * Introduced: with API extension `projects`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+Input:
+
+    {
+        "config": {
+            "features.images": "true",
+            "features.profiles": "true",
+        },
+        "description": "Some description string"
+    }
+
+Same dict as used for initial creation and coming from GET. The name
+property can't be changed (see POST for that).
+
+#### PATCH (ETag supported)
+ * Description: update the project information
+ * Introduced: with API extension `projects`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+Input:
+
+    {
+        "config": {
+            "features.images": "true",
+        },
+        "description": "Some description string"
+    }
+
+#### POST
+ * Description: rename a project
+ * Introduced: with API extension `projects`
+ * Authentication: trusted
+ * Operation: async
+ * Return: background operation or standard error
+
+Input (rename a project):
+
+    {
+        "name": "new-name"
+    }
+
+HTTP return value must be 204 (No content) and Location must point to
+the renamed resource.
+
+Renaming to an existing name must return the 409 (Conflict) HTTP code.
+
+Attempting to rename the `default` project will return the 403 (Forbidden) HTTP code.
+
+#### DELETE
+ * Description: remove a project
+ * Introduced: with API extension `projects`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+Input (none at present):
+
+    {
+    }
+
+HTTP code for this should be 202 (Accepted).
+
+Attempting to delete the `default` project will return the 403 (Forbidden) HTTP code.
 
 ### `/1.0/storage-pools`
 #### GET
@@ -2451,8 +2726,8 @@ Return:
 
 
 #### PUT (ETag supported)
- * Description: replace the storage volume information
- * Introduced: with API extension `storage`
+ * Description: replace the storage volume information or restore from snapshot
+ * Introduced: with API extension `storage`, `storage_api_volume_snapshots`
  * Authentication: trusted
  * Operation: sync
  * Return: standard return value or standard error
@@ -2470,6 +2745,10 @@ Return:
             "lvm.vg_name": "pool1",
             "volume.size": "10737418240"
         }
+    }
+
+    {
+        "restore": "snapshot-name"
     }
 
 #### PATCH (ETag supported)
@@ -2498,6 +2777,79 @@ Input (none at present):
 
     {
     }
+
+
+### `/1.0/storage-pools/<pool>/volumes/<type>/<name>/snapshots`
+#### GET
+ * Description: List of volume snapshots
+ * Authentication: trusted
+ * Operation: sync
+ * Return: list of URLs for snapshots for this volume
+
+Return value:
+
+    [
+        "/1.0/storage-pools/default/volumes/custom/foo/snapshots/snap0"
+    ]
+
+#### POST
+ * Description: create a new volume snapshot
+ * Authentication: trusted
+ * Operation: async
+ * Return: background operation or standard error
+
+Input:
+
+    {
+        "name": "my-snapshot",          # Name of the snapshot
+    }
+
+### `/1.0/storage-pools/<pool>/volumes/<type>/<volume>/snapshots/name`
+#### GET
+ * Description: Snapshot information
+ * Authentication: trusted
+ * Operation: sync
+ * Return: dict representing the snapshot
+
+Return:
+
+    {
+        "config": {},
+        "description": "",
+        "name": "snap0"
+    }
+
+#### PUT
+ * Description: Volume snapshot information
+ * Authentication: trusted
+ * Operation: sync
+ * Return: dict representing the volume snapshot
+
+Input:
+
+    {
+        "description": "new-description"
+    }
+
+#### POST
+ * Description: used to rename the volume snapshot
+ * Authentication: trusted
+ * Operation: async
+ * Return: background operation or standard error
+
+Input:
+
+    {
+        "name": "new-name"
+    }
+
+#### DELETE
+ * Description: remove the volume snapshot
+ * Authentication: trusted
+ * Operation: async
+ * Return: background operation or standard error
+
+HTTP code for this should be 202 (Accepted).
 
 ### `/1.0/resources`
 #### GET
@@ -2550,6 +2902,20 @@ Return:
     {
         "server_name": "node1",
         "enabled": true,
+        "member_config": [
+            {
+                "entity": "storage-pool",
+                "name": "local",
+                "key": "source",
+                "description": "\"source\" property for storage pool \"local\"",
+            },
+            {
+                "entity": "network",
+                "name": "lxdbr0",
+                "key": "bridge.external_interfaces",
+                "description": "\"bridge.external_interfaces\" property for network \"lxdbr0\"",
+            },
+        ],
     }
 
 #### PUT
@@ -2572,9 +2938,24 @@ Input (request to join an existing cluster):
 
     {
         "server_name": "node2",
+        "server_address": "10.1.1.102:8443",
         "enabled": true,
         "cluster_address": "10.1.1.101:8443",
         "cluster_certificate": "-----BEGIN CERTIFICATE-----MIFf\n-----END CERTIFICATE-----",
+        "cluster_password": "sekret",
+        "member_config": [
+            {
+                "entity": "storage-pool",
+                "name": "local",
+                "key": "source",
+                "value": "/dev/sdb",
+            },
+            {
+                "entity": "network",
+                "name": "lxdbr0",
+                "key": "bridge.external_interfaces",
+                "value": "vlan0",
+            },
     }
 
 Input (disable clustering on the node):
@@ -2609,10 +2990,11 @@ Return:
 Return:
 
     {
-        "name": "lxd1",
+        "server_name": "lxd1",
         "url": "https://10.1.1.101:8443",
         "database": true,
-        "state": "Online"
+        "status": "Online",
+        "message":"fully operational"
     }
 
 #### POST

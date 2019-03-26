@@ -3,6 +3,11 @@ safe_pot_hash() {
 }
 
 test_static_analysis() {
+  if [ -n "${LXD_SKIP_STATIC:-}" ]; then
+    echo "==> SKIP: Asked to skip static analysis"
+    return
+  fi
+
   (
     set -e
 
@@ -72,7 +77,6 @@ test_static_analysis() {
       golint -set_exit_status lxd/db/node
       golint -set_exit_status lxd/db/query
       golint -set_exit_status lxd/db/schema
-      golint -set_exit_status lxd/debug
       golint -set_exit_status lxd/endpoints
       golint -set_exit_status lxd/maas
       #golint -set_exit_status lxd/migration

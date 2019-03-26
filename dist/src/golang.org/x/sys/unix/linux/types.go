@@ -36,6 +36,7 @@ package unix
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/signal.h>
+#include <sys/signalfd.h>
 #include <sys/statfs.h>
 #include <sys/statvfs.h>
 #include <sys/sysinfo.h>
@@ -46,6 +47,8 @@ package unix
 #include <sys/user.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <linux/errqueue.h>
+#include <linux/fanotify.h>
 #include <linux/filter.h>
 #include <linux/icmpv6.h>
 #include <linux/if_pppox.h>
@@ -57,7 +60,28 @@ package unix
 #include <linux/perf_event.h>
 #include <linux/rtnetlink.h>
 #include <linux/stat.h>
+#if defined(__sparc__)
+// On sparc{,64}, the kernel defines struct termios2 itself which clashes with the
+// definition in glibc. Duplicate the kernel version here.
+#if defined(__arch64__)
+typedef unsigned int tcflag_t;
+#else
+typedef unsigned long tcflag_t;
+#endif
+
+struct termios2 {
+	tcflag_t c_iflag;
+	tcflag_t c_oflag;
+	tcflag_t c_cflag;
+	tcflag_t c_lflag;
+	unsigned char c_line;
+	unsigned char c_cc[19];
+	unsigned int c_ispeed;
+	unsigned int c_ospeed;
+};
+#else
 #include <asm/termbits.h>
+#endif
 #include <asm/ptrace.h>
 #include <time.h>
 #include <unistd.h>
@@ -208,8 +232,8 @@ struct sockaddr_rc {
 // copied from /usr/include/linux/un.h
 struct my_sockaddr_un {
 	sa_family_t sun_family;
-#if defined(__ARM_EABI__) || defined(__powerpc64__)
-	// on ARM char is by default unsigned
+#if defined(__ARM_EABI__) || defined(__powerpc64__) || defined(__riscv)
+	// on some platforms char is unsigned by default
 	signed char sun_path[108];
 #else
 	char sun_path[108];
@@ -470,6 +494,8 @@ type Ucred C.struct_ucred
 
 type TCPInfo C.struct_tcp_info
 
+type CanFilter C.struct_can_filter
+
 const (
 	SizeofSockaddrInet4     = C.sizeof_struct_sockaddr_in
 	SizeofSockaddrInet6     = C.sizeof_struct_sockaddr_in6
@@ -499,6 +525,7 @@ const (
 	SizeofICMPv6Filter      = C.sizeof_struct_icmp6_filter
 	SizeofUcred             = C.sizeof_struct_ucred
 	SizeofTCPInfo           = C.sizeof_struct_tcp_info
+	SizeofCanFilter         = C.sizeof_struct_can_filter
 )
 
 // Netlink routing and interface messages
@@ -636,6 +663,7 @@ const (
 	SizeofIfAddrmsg      = C.sizeof_struct_ifaddrmsg
 	SizeofRtMsg          = C.sizeof_struct_rtmsg
 	SizeofRtNexthop      = C.sizeof_struct_rtnexthop
+	SizeofNdUseroptmsg   = C.sizeof_struct_nduseroptmsg
 )
 
 type NlMsghdr C.struct_nlmsghdr
@@ -655,6 +683,8 @@ type IfAddrmsg C.struct_ifaddrmsg
 type RtMsg C.struct_rtmsg
 
 type RtNexthop C.struct_rtnexthop
+
+type NdUseroptmsg C.struct_nduseroptmsg
 
 // Linux socket filter
 
@@ -727,7 +757,7 @@ const (
 
 type Sigset_t C.sigset_t
 
-const RNDGETENTCNT = C.RNDGETENTCNT
+type SignalfdSiginfo C.struct_signalfd_siginfo
 
 const PERF_IOC_FLAG_GROUP = C.PERF_IOC_FLAG_GROUP
 
@@ -1619,7 +1649,9 @@ const (
 	NCSI_CHANNEL_ATTR_VLAN_ID       = C.NCSI_CHANNEL_ATTR_VLAN_ID
 )
 
-// SO_TIMESTAMPING flags
+// Timestamping
+
+type ScmTimestamping C.struct_scm_timestamping
 
 const (
 	SOF_TIMESTAMPING_TX_HARDWARE  = C.SOF_TIMESTAMPING_TX_HARDWARE
@@ -1640,4 +1672,18 @@ const (
 
 	SOF_TIMESTAMPING_LAST = C.SOF_TIMESTAMPING_LAST
 	SOF_TIMESTAMPING_MASK = C.SOF_TIMESTAMPING_MASK
+
+	SCM_TSTAMP_SND   = C.SCM_TSTAMP_SND
+	SCM_TSTAMP_SCHED = C.SCM_TSTAMP_SCHED
+	SCM_TSTAMP_ACK   = C.SCM_TSTAMP_ACK
 )
+
+// Socket error queue
+
+type SockExtendedErr C.struct_sock_extended_err
+
+// Fanotify
+
+type FanotifyEventMetadata C.struct_fanotify_event_metadata
+
+type FanotifyResponse C.struct_fanotify_response

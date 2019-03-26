@@ -1,15 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 
 	"github.com/dustinkirkland/golang-petname"
 	"github.com/gorilla/websocket"
+	"github.com/pkg/errors"
 
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
@@ -17,13 +23,14 @@ import (
 	"github.com/lxc/lxd/lxd/types"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/ioprogress"
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/osarch"
 
 	log "github.com/lxc/lxd/shared/log15"
 )
 
-func createFromImage(d *Daemon, req *api.ContainersPost) Response {
+func createFromImage(d *Daemon, project string, req *api.ContainersPost) Response {
 	var hash string
 	var err error
 
@@ -33,7 +40,7 @@ func createFromImage(d *Daemon, req *api.ContainersPost) Response {
 		if req.Source.Server != "" {
 			hash = req.Source.Alias
 		} else {
-			_, alias, err := d.cluster.ImageAliasGet(req.Source.Alias, true)
+			_, alias, err := d.cluster.ImageAliasGet(project, req.Source.Alias, true)
 			if err != nil {
 				return SmartError(err)
 			}
@@ -45,7 +52,7 @@ func createFromImage(d *Daemon, req *api.ContainersPost) Response {
 			return BadRequest(fmt.Errorf("Property match is only supported for local images"))
 		}
 
-		hashes, err := d.cluster.ImagesGet(false)
+		hashes, err := d.cluster.ImagesGet(project, false)
 		if err != nil {
 			return SmartError(err)
 		}
@@ -53,7 +60,7 @@ func createFromImage(d *Daemon, req *api.ContainersPost) Response {
 		var image *api.Image
 
 		for _, imageHash := range hashes {
-			_, img, err := d.cluster.ImageGet(imageHash, false, true)
+			_, img, err := d.cluster.ImageGet(project, imageHash, false, true)
 			if err != nil {
 				continue
 			}
@@ -88,6 +95,7 @@ func createFromImage(d *Daemon, req *api.ContainersPost) Response {
 
 	run := func(op *operation) error {
 		args := db.ContainerArgs{
+			Project:     project,
 			Config:      req.Config,
 			Ctype:       db.CTypeRegular,
 			Description: req.Description,
@@ -105,12 +113,12 @@ func createFromImage(d *Daemon, req *api.ContainersPost) Response {
 			}
 			info, err = d.ImageDownload(
 				op, req.Source.Server, req.Source.Protocol, req.Source.Certificate,
-				req.Source.Secret, hash, true, autoUpdate, "", true)
+				req.Source.Secret, hash, true, autoUpdate, "", true, project)
 			if err != nil {
 				return err
 			}
 		} else {
-			_, info, err = d.cluster.ImageGet(hash, false, false)
+			_, info, err = d.cluster.ImageGet(project, hash, false, false)
 			if err != nil {
 				return err
 			}
@@ -121,14 +129,19 @@ func createFromImage(d *Daemon, req *api.ContainersPost) Response {
 			return err
 		}
 
-		_, err = containerCreateFromImage(d, args, info.Fingerprint)
+		metadata := make(map[string]interface{})
+		_, err = containerCreateFromImage(d, args, info.Fingerprint, &ioprogress.ProgressTracker{
+			Handler: func(percent, speed int64) {
+				shared.SetProgressMetadata(metadata, "create_container_from_image_unpack", "Unpack", percent, 0, speed)
+				op.UpdateMetadata(metadata)
+			}})
 		return err
 	}
 
 	resources := map[string][]string{}
 	resources["containers"] = []string{req.Name}
 
-	op, err := operationCreate(d.cluster, operationClassTask, "Creating container", resources, nil, run, nil, nil)
+	op, err := operationCreate(d.cluster, project, operationClassTask, db.OperationContainerCreate, resources, nil, run, nil, nil)
 	if err != nil {
 		return InternalError(err)
 	}
@@ -136,8 +149,9 @@ func createFromImage(d *Daemon, req *api.ContainersPost) Response {
 	return OperationResponse(op)
 }
 
-func createFromNone(d *Daemon, req *api.ContainersPost) Response {
+func createFromNone(d *Daemon, project string, req *api.ContainersPost) Response {
 	args := db.ContainerArgs{
+		Project:     project,
 		Config:      req.Config,
 		Ctype:       db.CTypeRegular,
 		Description: req.Description,
@@ -163,7 +177,7 @@ func createFromNone(d *Daemon, req *api.ContainersPost) Response {
 	resources := map[string][]string{}
 	resources["containers"] = []string{req.Name}
 
-	op, err := operationCreate(d.cluster, operationClassTask, "Creating container", resources, nil, run, nil, nil)
+	op, err := operationCreate(d.cluster, project, operationClassTask, db.OperationContainerCreate, resources, nil, run, nil, nil)
 	if err != nil {
 		return InternalError(err)
 	}
@@ -171,7 +185,7 @@ func createFromNone(d *Daemon, req *api.ContainersPost) Response {
 	return OperationResponse(op)
 }
 
-func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
+func createFromMigration(d *Daemon, project string, req *api.ContainersPost) Response {
 	// Validate migration mode
 	if req.Source.Mode != "pull" && req.Source.Mode != "push" {
 		return NotImplemented(fmt.Errorf("Mode '%s' not implemented", req.Source.Mode))
@@ -187,6 +201,7 @@ func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 
 	// Prepare the container creation request
 	args := db.ContainerArgs{
+		Project:      project,
 		Architecture: architecture,
 		BaseImage:    req.Source.BaseImage,
 		Config:       req.Config,
@@ -200,7 +215,7 @@ func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 	}
 
 	// Early profile validation
-	profiles, err := d.cluster.Profiles()
+	profiles, err := d.cluster.Profiles(project)
 	if err != nil {
 		return InternalError(err)
 	}
@@ -234,7 +249,7 @@ func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 	// If we don't have a valid pool yet, look through profiles
 	if storagePool == "" {
 		for _, pName := range req.Profiles {
-			_, p, err := d.cluster.ProfileGet(pName)
+			_, p, err := d.cluster.ProfileGet(project, pName)
 			if err != nil {
 				return SmartError(err)
 			}
@@ -295,57 +310,71 @@ func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 		args.Devices[localRootDiskDeviceKey]["pool"] = storagePool
 	}
 
-	/* Only create a container from an image if we're going to
-	 * rsync over the top of it. In the case of a better file
-	 * transfer mechanism, let's just use that.
-	 *
-	 * TODO: we could invent some negotiation here, where if the
-	 * source and sink both have the same image, we can clone from
-	 * it, but we have to know before sending the snapshot that
-	 * we're sending the whole thing or just a delta from the
-	 * image, so one extra negotiation round trip is needed. An
-	 * alternative is to move actual container object to a later
-	 * point and just negotiate it over the migration control
-	 * socket. Anyway, it'll happen later :)
-	 */
-	_, _, err = d.cluster.ImageGet(req.Source.BaseImage, false, true)
-	if err != nil {
-		c, err = containerCreateAsEmpty(d, args)
+	if req.Source.Refresh {
+		// Check if the container exists
+		c, err = containerLoadByProjectAndName(d.State(), project, req.Name)
 		if err != nil {
-			return InternalError(err)
+			req.Source.Refresh = false
 		}
-	} else {
-		// Retrieve the future storage pool
-		cM, err := containerLXCLoad(d.State(), args, nil)
+
+		if c.IsRunning() {
+			return BadRequest(fmt.Errorf("Cannot refresh a running container"))
+		}
+	}
+
+	if !req.Source.Refresh {
+		/* Only create a container from an image if we're going to
+		 * rsync over the top of it. In the case of a better file
+		 * transfer mechanism, let's just use that.
+		 *
+		 * TODO: we could invent some negotiation here, where if the
+		 * source and sink both have the same image, we can clone from
+		 * it, but we have to know before sending the snapshot that
+		 * we're sending the whole thing or just a delta from the
+		 * image, so one extra negotiation round trip is needed. An
+		 * alternative is to move actual container object to a later
+		 * point and just negotiate it over the migration control
+		 * socket. Anyway, it'll happen later :)
+		 */
+		_, _, err = d.cluster.ImageGet(args.Project, req.Source.BaseImage, false, true)
 		if err != nil {
-			return InternalError(err)
-		}
-
-		_, rootDiskDevice, err := shared.GetRootDiskDevice(cM.ExpandedDevices())
-		if err != nil {
-			return InternalError(err)
-		}
-
-		if rootDiskDevice["pool"] == "" {
-			return BadRequest(fmt.Errorf("The container's root device is missing the pool property"))
-		}
-
-		storagePool = rootDiskDevice["pool"]
-
-		ps, err := storagePoolInit(d.State(), storagePool)
-		if err != nil {
-			return InternalError(err)
-		}
-
-		if ps.MigrationType() == migration.MigrationFSType_RSYNC {
-			c, err = containerCreateFromImage(d, args, req.Source.BaseImage)
+			c, err = containerCreateAsEmpty(d, args)
 			if err != nil {
 				return InternalError(err)
 			}
 		} else {
-			c, err = containerCreateAsEmpty(d, args)
+			// Retrieve the future storage pool
+			cM, err := containerLXCLoad(d.State(), args, nil)
 			if err != nil {
 				return InternalError(err)
+			}
+
+			_, rootDiskDevice, err := shared.GetRootDiskDevice(cM.ExpandedDevices())
+			if err != nil {
+				return InternalError(err)
+			}
+
+			if rootDiskDevice["pool"] == "" {
+				return BadRequest(fmt.Errorf("The container's root device is missing the pool property"))
+			}
+
+			storagePool = rootDiskDevice["pool"]
+
+			ps, err := storagePoolInit(d.State(), storagePool)
+			if err != nil {
+				return InternalError(err)
+			}
+
+			if ps.MigrationType() == migration.MigrationFSType_RSYNC {
+				c, err = containerCreateFromImage(d, args, req.Source.BaseImage, nil)
+				if err != nil {
+					return InternalError(err)
+				}
+			} else {
+				c, err = containerCreateAsEmpty(d, args)
+				if err != nil {
+					return InternalError(err)
+				}
 			}
 		}
 	}
@@ -354,20 +383,26 @@ func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 	if req.Source.Certificate != "" {
 		certBlock, _ := pem.Decode([]byte(req.Source.Certificate))
 		if certBlock == nil {
-			c.Delete()
+			if !req.Source.Refresh {
+				c.Delete()
+			}
 			return InternalError(fmt.Errorf("Invalid certificate"))
 		}
 
 		cert, err = x509.ParseCertificate(certBlock.Bytes)
 		if err != nil {
-			c.Delete()
+			if !req.Source.Refresh {
+				c.Delete()
+			}
 			return InternalError(err)
 		}
 	}
 
 	config, err := shared.GetTLSConfig("", "", "", cert)
 	if err != nil {
-		c.Delete()
+		if !req.Source.Refresh {
+			c.Delete()
+		}
 		return InternalError(err)
 	}
 
@@ -386,6 +421,7 @@ func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 		Push:          push,
 		Live:          req.Source.Live,
 		ContainerOnly: req.Source.ContainerOnly,
+		Refresh:       req.Source.Refresh,
 	}
 
 	sink, err := NewMigrationSink(&migrationArgs)
@@ -399,13 +435,17 @@ func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 		err = sink.Do(op)
 		if err != nil {
 			logger.Error("Error during migration sink", log.Ctx{"err": err})
-			c.Delete()
+			if !req.Source.Refresh {
+				c.Delete()
+			}
 			return fmt.Errorf("Error transferring container data: %s", err)
 		}
 
 		err = c.TemplateApply("copy")
 		if err != nil {
-			c.Delete()
+			if !req.Source.Refresh {
+				c.Delete()
+			}
 			return err
 		}
 
@@ -423,12 +463,12 @@ func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 
 	var op *operation
 	if push {
-		op, err = operationCreate(d.cluster, operationClassWebsocket, "Creating container", resources, sink.Metadata(), run, nil, sink.Connect)
+		op, err = operationCreate(d.cluster, project, operationClassWebsocket, db.OperationContainerCreate, resources, sink.Metadata(), run, nil, sink.Connect)
 		if err != nil {
 			return InternalError(err)
 		}
 	} else {
-		op, err = operationCreate(d.cluster, operationClassTask, "Creating container", resources, nil, run, nil, nil)
+		op, err = operationCreate(d.cluster, project, operationClassTask, db.OperationContainerCreate, resources, nil, run, nil, nil)
 		if err != nil {
 			return InternalError(err)
 		}
@@ -437,12 +477,18 @@ func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 	return OperationResponse(op)
 }
 
-func createFromCopy(d *Daemon, req *api.ContainersPost) Response {
+func createFromCopy(d *Daemon, project string, req *api.ContainersPost) Response {
 	if req.Source.Source == "" {
 		return BadRequest(fmt.Errorf("must specify a source container"))
 	}
 
-	source, err := containerLoadByName(d.State(), req.Source.Source)
+	sourceProject := req.Source.Project
+	if sourceProject == "" {
+		sourceProject = project
+	}
+	targetProject := project
+
+	source, err := containerLoadByProjectAndName(d.State(), sourceProject, req.Source.Source)
 	if err != nil {
 		return SmartError(err)
 	}
@@ -501,6 +547,7 @@ func createFromCopy(d *Daemon, req *api.ContainersPost) Response {
 	}
 
 	args := db.ContainerArgs{
+		Project:      targetProject,
 		Architecture: source.Architecture(),
 		BaseImage:    req.Source.BaseImage,
 		Config:       req.Config,
@@ -514,7 +561,7 @@ func createFromCopy(d *Daemon, req *api.ContainersPost) Response {
 	}
 
 	run := func(op *operation) error {
-		_, err := containerCreateAsCopy(d.State(), args, source, req.Source.ContainerOnly)
+		_, err := containerCreateAsCopy(d.State(), args, source, req.Source.ContainerOnly, req.Source.Refresh)
 		if err != nil {
 			return err
 		}
@@ -524,7 +571,90 @@ func createFromCopy(d *Daemon, req *api.ContainersPost) Response {
 	resources := map[string][]string{}
 	resources["containers"] = []string{req.Name, req.Source.Source}
 
-	op, err := operationCreate(d.cluster, operationClassTask, "Creating container", resources, nil, run, nil, nil)
+	op, err := operationCreate(d.cluster, targetProject, operationClassTask, db.OperationContainerCreate, resources, nil, run, nil, nil)
+	if err != nil {
+		return InternalError(err)
+	}
+
+	return OperationResponse(op)
+}
+
+func createFromBackup(d *Daemon, project string, data io.Reader, pool string) Response {
+	// Write the data to a temp file
+	f, err := ioutil.TempFile("", "lxd_backup_")
+	if err != nil {
+		return InternalError(err)
+	}
+	defer os.Remove(f.Name())
+
+	_, err = io.Copy(f, data)
+	if err != nil {
+		f.Close()
+		return InternalError(err)
+	}
+
+	// Parse the backup information
+	f.Seek(0, 0)
+	bInfo, err := backupGetInfo(f)
+	if err != nil {
+		f.Close()
+		return BadRequest(err)
+	}
+	bInfo.Project = project
+
+	// Override pool
+	if pool != "" {
+		bInfo.Pool = pool
+	}
+
+	run := func(op *operation) error {
+		defer f.Close()
+
+		// Dump tarball to storage
+		f.Seek(0, 0)
+		err = containerCreateFromBackup(d.State(), *bInfo, f, pool != "")
+		if err != nil {
+			return errors.Wrap(err, "Create container from backup")
+		}
+
+		body, err := json.Marshal(&internalImportPost{
+			Name:  bInfo.Name,
+			Force: true,
+		})
+		if err != nil {
+			return errors.Wrap(err, "Marshal internal import request")
+		}
+
+		req := &http.Request{
+			Body: ioutil.NopCloser(bytes.NewReader(body)),
+		}
+		req.URL = &url.URL{
+			RawQuery: fmt.Sprintf("project=%s", project),
+		}
+		resp := internalImport(d, req)
+
+		if resp.String() != "success" {
+			return fmt.Errorf("Internal import request: %v", resp.String())
+		}
+
+		c, err := containerLoadByProjectAndName(d.State(), project, bInfo.Name)
+		if err != nil {
+			return errors.Wrap(err, "Load container")
+		}
+
+		_, err = c.StorageStop()
+		if err != nil {
+			return errors.Wrap(err, "Stop storage pool")
+		}
+
+		return nil
+	}
+
+	resources := map[string][]string{}
+	resources["containers"] = []string{bInfo.Name}
+
+	op, err := operationCreate(d.cluster, project, operationClassTask, db.OperationBackupRestore,
+		resources, nil, run, nil, nil)
 	if err != nil {
 		return InternalError(err)
 	}
@@ -533,8 +663,15 @@ func createFromCopy(d *Daemon, req *api.ContainersPost) Response {
 }
 
 func containersPost(d *Daemon, r *http.Request) Response {
+	project := projectParam(r)
 	logger.Debugf("Responding to container create")
 
+	// If we're getting binary content, process separately
+	if r.Header.Get("Content-Type") == "application/octet-stream" {
+		return createFromBackup(d, project, r.Body, r.Header.Get("X-LXD-pool"))
+	}
+
+	// Parse the request
 	req := api.ContainersPost{}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return BadRequest(err)
@@ -556,6 +693,7 @@ func containersPost(d *Daemon, r *http.Request) Response {
 			return SmartError(err)
 		}
 	}
+
 	if targetNode != "" {
 		address, err := cluster.ResolveTarget(d.cluster, targetNode)
 		if err != nil {
@@ -568,14 +706,17 @@ func containersPost(d *Daemon, r *http.Request) Response {
 				return SmartError(err)
 			}
 
+			client = client.UseProject(project)
+			client = client.UseTarget(targetNode)
+
 			logger.Debugf("Forward container post request to %s", address)
-			op, err := client.UseTarget(targetNode).CreateContainer(req)
+			op, err := client.CreateContainer(req)
 			if err != nil {
 				return SmartError(err)
 			}
 
 			opAPI := op.Get()
-			return ForwardedOperationResponse(&opAPI)
+			return ForwardedOperationResponse(project, &opAPI)
 		}
 	}
 
@@ -586,7 +727,12 @@ func containersPost(d *Daemon, r *http.Request) Response {
 	}
 
 	if req.Name == "" {
-		cs, err := d.cluster.ContainersList(db.CTypeRegular)
+		var names []string
+		err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
+			var err error
+			names, err = tx.ContainerNames(project)
+			return err
+		})
 		if err != nil {
 			return SmartError(err)
 		}
@@ -595,7 +741,7 @@ func containersPost(d *Daemon, r *http.Request) Response {
 		for {
 			i++
 			req.Name = strings.ToLower(petname.Generate(2, "-"))
-			if !shared.StringInSlice(req.Name, cs) {
+			if !shared.StringInSlice(req.Name, names) {
 				break
 			}
 
@@ -633,13 +779,13 @@ func containersPost(d *Daemon, r *http.Request) Response {
 
 	switch req.Source.Type {
 	case "image":
-		return createFromImage(d, &req)
+		return createFromImage(d, project, &req)
 	case "none":
-		return createFromNone(d, &req)
+		return createFromNone(d, project, &req)
 	case "migration":
-		return createFromMigration(d, &req)
+		return createFromMigration(d, project, &req)
 	case "copy":
-		return createFromCopy(d, &req)
+		return createFromCopy(d, project, &req)
 	default:
 		return BadRequest(fmt.Errorf("unknown source type %s", req.Source.Type))
 	}

@@ -213,6 +213,15 @@ func OpenCluster(name string, store dqlite.ServerStore, address, dir string, tim
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
+	if !nodesVersionsMatch {
+		cluster := &Cluster{
+			db:    db,
+			stmts: map[int]*sql.Stmt{},
+		}
+
+		return cluster, ErrSomeNodesAreBehind
+	}
+
 	stmts, err := cluster.PrepareStmts(db)
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed to prepare statements")
@@ -246,10 +255,6 @@ func OpenCluster(name string, store dqlite.ServerStore, address, dir string, tim
 		return nil, err
 	}
 
-	if !nodesVersionsMatch {
-		err = ErrSomeNodesAreBehind
-	}
-
 	return cluster, err
 }
 
@@ -262,6 +267,21 @@ var ErrSomeNodesAreBehind = fmt.Errorf("some nodes are behind this node's versio
 // with the legacy patches that need to interact with the database.
 func ForLocalInspection(db *sql.DB) *Cluster {
 	return &Cluster{db: db}
+}
+
+// ForLocalInspectionWithPreparedStmts is the same as ForLocalInspection but it
+// also prepares the statements used in auto-generated database code.
+func ForLocalInspectionWithPreparedStmts(db *sql.DB) (*Cluster, error) {
+	c := ForLocalInspection(db)
+
+	stmts, err := cluster.PrepareStmts(c.db)
+	if err != nil {
+		return nil, errors.Wrap(err, "Prepare database statements")
+	}
+
+	c.stmts = stmts
+
+	return c, nil
 }
 
 // SetDefaultTimeout sets the default go-dqlite driver timeout.
@@ -354,21 +374,6 @@ func (c *Cluster) DB() *sql.DB {
 // FIXME: legacy method.
 func (c *Cluster) Begin() (*sql.Tx, error) {
 	return begin(c.db)
-}
-
-// UpdateSchemasDotGo updates the schema.go files in the local/ and cluster/
-// sub-packages.
-func UpdateSchemasDotGo() error {
-	err := node.SchemaDotGo()
-	if err != nil {
-		return fmt.Errorf("failed to update node schema.go: %v", err)
-	}
-	err = cluster.SchemaDotGo()
-	if err != nil {
-		return fmt.Errorf("failed to update cluster schema.go: %v", err)
-	}
-
-	return nil
 }
 
 func isNoMatchError(err error) bool {

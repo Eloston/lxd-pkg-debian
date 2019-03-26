@@ -15,6 +15,7 @@ import (
 	"github.com/gorilla/websocket"
 	"gopkg.in/lxc/go-lxc.v2"
 
+	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/migration"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
@@ -219,6 +220,7 @@ type preDumpLoopArgs struct {
 	preDumpDir    string
 	dumpDir       string
 	final         bool
+	rsyncFeatures []string
 }
 
 // The function preDumpLoop is the main logic behind the pre-copy migration.
@@ -249,7 +251,7 @@ func (s *migrationSourceWs) preDumpLoop(args *preDumpLoopArgs) (bool, error) {
 	// Send the pre-dump.
 	ctName, _, _ := containerGetParentAndSnapshotName(s.container.Name())
 	state := s.container.DaemonState()
-	err = RsyncSend(ctName, shared.AddSlash(args.checkpointDir), s.criuConn, nil, args.bwlimit, state.OS.ExecPath)
+	err = RsyncSend(ctName, shared.AddSlash(args.checkpointDir), s.criuConn, nil, args.rsyncFeatures, args.bwlimit, state.OS.ExecPath)
 	if err != nil {
 		return final, err
 	}
@@ -354,14 +356,12 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 		}
 	}
 
-	driver, fsErr := s.container.Storage().MigrationSource(s.container, s.containerOnly)
-
 	snapshots := []*migration.Snapshot{}
 	snapshotNames := []string{}
 	// Only send snapshots when requested.
 	if !s.containerOnly {
-		if fsErr == nil {
-			fullSnaps := driver.Snapshots()
+		fullSnaps, err := s.container.Snapshots()
+		if err == nil {
 			for _, snap := range fullSnaps {
 				snapshots = append(snapshots, snapshotToProtobuf(snap))
 				snapshotNames = append(snapshotNames, shared.ExtractSnapshotName(snap.Name()))
@@ -378,7 +378,7 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 	// The protocol says we have to send a header no matter what, so let's
 	// do that, but then immediately send an error.
 	myType := s.container.Storage().MigrationType()
-	rsyncHasFeature := true
+	hasFeature := true
 	header := migration.MigrationHeader{
 		Fs:            &myType,
 		Criu:          criuType,
@@ -387,10 +387,17 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 		Snapshots:     snapshots,
 		Predump:       proto.Bool(use_pre_dumps),
 		RsyncFeatures: &migration.RsyncFeatures{
-			Xattrs:   &rsyncHasFeature,
-			Delete:   &rsyncHasFeature,
-			Compress: &rsyncHasFeature,
+			Xattrs:        &hasFeature,
+			Delete:        &hasFeature,
+			Compress:      &hasFeature,
+			Bidirectional: &hasFeature,
 		},
+	}
+
+	if len(zfsVersion) >= 3 && zfsVersion[0:3] != "0.6" {
+		header.ZfsFeatures = &migration.ZfsFeatures{
+			Compress: &hasFeature,
+		}
 	}
 
 	err = s.send(&header)
@@ -399,23 +406,48 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 		return err
 	}
 
-	if fsErr != nil {
-		s.sendControl(fsErr)
-		return fsErr
-	}
-
 	err = s.recv(&header)
 	if err != nil {
 		s.sendControl(err)
 		return err
 	}
 
+	// Handle rsync options
+	rsyncFeatures := header.GetRsyncFeaturesSlice()
+	if !shared.StringInSlice("bidirectional", rsyncFeatures) {
+		// If no bi-directional support, assume LXD 3.7 level
+		// NOTE: Do NOT extend this list of arguments
+		rsyncFeatures = []string{"xattrs", "delete", "compress"}
+	}
+
+	// Handle zfs options
+	zfsFeatures := header.GetZfsFeaturesSlice()
+
+	// Set source args
+	sourceArgs := MigrationSourceArgs{
+		Container:     s.container,
+		ContainerOnly: s.containerOnly,
+		RsyncFeatures: rsyncFeatures,
+		ZfsFeatures:   zfsFeatures,
+	}
+
+	// Initialize storage driver
+	driver, fsErr := s.container.Storage().MigrationSource(sourceArgs)
+	if fsErr != nil {
+		s.sendControl(fsErr)
+		return fsErr
+	}
+
 	bwlimit := ""
-	if *header.Fs != myType {
+	if header.GetRefresh() || *header.Fs != myType {
 		myType = migration.MigrationFSType_RSYNC
 		header.Fs = &myType
 
-		driver, _ = rsyncMigrationSource(s.container, s.containerOnly)
+		if header.GetRefresh() {
+			driver, _ = rsyncRefreshSource(header.GetSnapshotNames(), sourceArgs)
+		} else {
+			driver, _ = rsyncMigrationSource(sourceArgs)
+		}
 
 		// Check if this storage pool has a rate limit set for rsync.
 		poolwritable := s.container.Storage().GetStoragePoolWritable()
@@ -442,7 +474,7 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 	// without introducing the fragility of closing on err.
 	abort := func(err error) error {
 		driver.Cleanup()
-		s.sendControl(err)
+		go s.sendControl(err)
 		return err
 	}
 
@@ -493,8 +525,9 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 			state := s.container.DaemonState()
 			actionScriptOp, err := operationCreate(
 				state.Cluster,
+				s.container.Project(),
 				operationClassWebsocket,
-				"Live-migrating container",
+				db.OperationContainerLiveMigrate,
 				nil,
 				nil,
 				func(op *operation) error {
@@ -555,6 +588,7 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 						preDumpDir:    preDumpDir,
 						dumpDir:       dumpDir,
 						final:         final,
+						rsyncFeatures: rsyncFeatures,
 					}
 					final, err = s.preDumpLoop(&loop_args)
 					if err != nil {
@@ -625,7 +659,7 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 		 */
 		ctName, _, _ := containerGetParentAndSnapshotName(s.container.Name())
 		state := s.container.DaemonState()
-		err = RsyncSend(ctName, shared.AddSlash(checkpointDir), s.criuConn, nil, bwlimit, state.OS.ExecPath)
+		err = RsyncSend(ctName, shared.AddSlash(checkpointDir), s.criuConn, nil, rsyncFeatures, bwlimit, state.OS.ExecPath)
 		if err != nil {
 			return abort(err)
 		}
@@ -664,11 +698,12 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 
 func NewMigrationSink(args *MigrationSinkArgs) (*migrationSink, error) {
 	sink := migrationSink{
-		src:    migrationFields{container: args.Container, containerOnly: args.ContainerOnly},
-		dest:   migrationFields{containerOnly: args.ContainerOnly},
-		url:    args.Url,
-		dialer: args.Dialer,
-		push:   args.Push,
+		src:     migrationFields{container: args.Container, containerOnly: args.ContainerOnly},
+		dest:    migrationFields{containerOnly: args.ContainerOnly},
+		url:     args.Url,
+		dialer:  args.Dialer,
+		push:    args.Push,
+		refresh: args.Refresh,
 	}
 
 	if sink.push {
@@ -778,18 +813,7 @@ func (c *migrationSink) Do(migrateOp *operation) error {
 	}
 
 	// Handle rsync options
-	c.rsyncArgs = []string{}
-	rsyncFeatures := header.GetRsyncFeatures()
-	if rsyncFeatures.GetXattrs() {
-		c.rsyncArgs = append(c.rsyncArgs, "--xattrs")
-	}
-	if rsyncFeatures.GetDelete() {
-		c.rsyncArgs = append(c.rsyncArgs, "--delete")
-	}
-	if rsyncFeatures.GetCompress() {
-		c.rsyncArgs = append(c.rsyncArgs, "--compress")
-		c.rsyncArgs = append(c.rsyncArgs, "--compress-level=2")
-	}
+	rsyncFeatures := header.GetRsyncFeaturesSlice()
 
 	live := c.src.live
 	if c.push {
@@ -806,15 +830,69 @@ func (c *migrationSink) Do(migrateOp *operation) error {
 	}
 
 	mySink := c.src.container.Storage().MigrationSink
+	if c.refresh {
+		mySink = rsyncMigrationSink
+	}
+
 	myType := c.src.container.Storage().MigrationType()
+	hasFeature := true
 	resp := migration.MigrationHeader{
-		Fs:   &myType,
-		Criu: criuType,
+		Fs:            &myType,
+		Criu:          criuType,
+		Snapshots:     header.Snapshots,
+		SnapshotNames: header.SnapshotNames,
+		Refresh:       &c.refresh,
+		RsyncFeatures: &migration.RsyncFeatures{
+			Xattrs:        &hasFeature,
+			Delete:        &hasFeature,
+			Compress:      &hasFeature,
+			Bidirectional: &hasFeature,
+		},
+	}
+
+	if len(zfsVersion) >= 3 && zfsVersion[0:3] != "0.6" {
+		resp.ZfsFeatures = &migration.ZfsFeatures{
+			Compress: &hasFeature,
+		}
+	}
+
+	if c.refresh {
+		// Get our existing snapshots
+		targetSnapshots, err := c.src.container.Snapshots()
+		if err != nil {
+			controller(err)
+			return err
+		}
+
+		// Get the remote snapshots
+		sourceSnapshots := header.GetSnapshots()
+
+		// Compare the two sets
+		syncSnapshots, deleteSnapshots := migrationCompareSnapshots(sourceSnapshots, targetSnapshots)
+
+		// Delete the extra local ones
+		for _, snap := range deleteSnapshots {
+			err := snap.Delete()
+			if err != nil {
+				controller(err)
+				return err
+			}
+		}
+
+		snapshotNames := []string{}
+		for _, snap := range syncSnapshots {
+			snapshotNames = append(snapshotNames, snap.GetName())
+		}
+
+		resp.Snapshots = syncSnapshots
+		resp.SnapshotNames = snapshotNames
+		header.Snapshots = syncSnapshots
+		header.SnapshotNames = snapshotNames
 	}
 
 	// If the storage type the source has doesn't match what we have, then
 	// we have to use rsync.
-	if *header.Fs != *resp.Fs {
+	if c.refresh || *header.Fs != *resp.Fs {
 		mySink = rsyncMigrationSink
 		myType = migration.MigrationFSType_RSYNC
 		resp.Fs = &myType
@@ -890,12 +968,16 @@ func (c *migrationSink) Do(migrateOp *operation) error {
 			}
 
 			args := MigrationSinkArgs{
-				RsyncArgs: c.rsyncArgs,
+				Container:     c.src.container,
+				ContainerOnly: c.src.containerOnly,
+				Idmap:         srcIdmap,
+				Live:          sendFinalFsDelta,
+				Refresh:       c.refresh,
+				RsyncFeatures: rsyncFeatures,
+				Snapshots:     snapshots,
 			}
 
-			err = mySink(sendFinalFsDelta, c.src.container,
-				snapshots, fsConn, srcIdmap, migrateOp,
-				c.src.containerOnly, args)
+			err = mySink(fsConn, migrateOp, args)
 			if err != nil {
 				fsTransfer <- err
 				return
@@ -935,7 +1017,7 @@ func (c *migrationSink) Do(migrateOp *operation) error {
 				for !sync.GetFinalPreDump() {
 					logger.Debugf("About to receive rsync")
 					// Transfer a CRIU pre-dump
-					err = RsyncRecv(shared.AddSlash(imagesDir), criuConn, nil, c.rsyncArgs)
+					err = RsyncRecv(shared.AddSlash(imagesDir), criuConn, nil, rsyncFeatures)
 					if err != nil {
 						restore <- err
 						return
@@ -963,7 +1045,7 @@ func (c *migrationSink) Do(migrateOp *operation) error {
 			}
 
 			// Final CRIU dump
-			err = RsyncRecv(shared.AddSlash(imagesDir), criuConn, nil, c.rsyncArgs)
+			err = RsyncRecv(shared.AddSlash(imagesDir), criuConn, nil, rsyncFeatures)
 			if err != nil {
 				restore <- err
 				return
@@ -1037,4 +1119,42 @@ func (c *migrationSink) Do(migrateOp *operation) error {
 
 func (s *migrationSourceWs) ConnectContainerTarget(target api.ContainerPostTarget) error {
 	return s.ConnectTarget(target.Certificate, target.Operation, target.Websockets)
+}
+
+func migrationCompareSnapshots(sourceSnapshots []*migration.Snapshot, targetSnapshots []container) ([]*migration.Snapshot, []container) {
+	// Compare source and target
+	sourceSnapshotsTime := map[string]int64{}
+	targetSnapshotsTime := map[string]int64{}
+
+	toDelete := []container{}
+	toSync := []*migration.Snapshot{}
+
+	for _, snap := range sourceSnapshots {
+		snapName := snap.GetName()
+
+		sourceSnapshotsTime[snapName] = snap.GetCreationDate()
+	}
+
+	for _, snap := range targetSnapshots {
+		_, snapName, _ := containerGetParentAndSnapshotName(snap.Name())
+
+		targetSnapshotsTime[snapName] = snap.CreationDate().Unix()
+		existDate, exists := sourceSnapshotsTime[snapName]
+		if !exists {
+			toDelete = append(toDelete, snap)
+		} else if existDate != snap.CreationDate().Unix() {
+			toDelete = append(toDelete, snap)
+		}
+	}
+
+	for _, snap := range sourceSnapshots {
+		snapName := snap.GetName()
+
+		existDate, exists := targetSnapshotsTime[snapName]
+		if !exists || existDate != snap.GetCreationDate() {
+			toSync = append(toSync, snap)
+		}
+	}
+
+	return toSync, toDelete
 }

@@ -293,7 +293,9 @@ func containerLXCCreate(s *state.State, args db.ContainerArgs) (container, error
 	c := &containerLXC{
 		state:        s,
 		id:           args.ID,
+		project:      args.Project,
 		name:         args.Name,
+		node:         args.Node,
 		description:  args.Description,
 		ephemeral:    args.Ephemeral,
 		architecture: args.Architecture,
@@ -304,10 +306,27 @@ func containerLXCCreate(s *state.State, args db.ContainerArgs) (container, error
 		profiles:     args.Profiles,
 		localConfig:  args.Config,
 		localDevices: args.Devices,
+		expiryDate:   args.ExpiryDate,
 	}
 
-	ctxMap := log.Ctx{"name": c.name,
-		"ephemeral": c.ephemeral}
+	// Cleanup the zero values
+	if c.expiryDate.IsZero() {
+		c.expiryDate = time.Time{}
+	}
+
+	if c.creationDate.IsZero() {
+		c.creationDate = time.Time{}
+	}
+
+	if c.lastUsedDate.IsZero() {
+		c.lastUsedDate = time.Time{}
+	}
+
+	ctxMap := log.Ctx{
+		"project":   args.Project,
+		"name":      c.name,
+		"ephemeral": c.ephemeral,
+	}
 
 	logger.Info("Creating container", ctxMap)
 
@@ -359,21 +378,22 @@ func containerLXCCreate(s *state.State, args db.ContainerArgs) (container, error
 	volumeConfig := map[string]string{}
 	err = storageVolumeFillDefault(storagePool, volumeConfig, pool)
 	if err != nil {
+		c.Delete()
 		return nil, err
 	}
 
 	// Create a new database entry for the container's storage volume
-	_, err = s.Cluster.StoragePoolVolumeCreate(args.Name, "", storagePoolVolumeTypeContainer, poolID, volumeConfig)
+	_, err = s.Cluster.StoragePoolVolumeCreate(args.Project, args.Name, "", storagePoolVolumeTypeContainer, false, poolID, volumeConfig)
 	if err != nil {
 		c.Delete()
 		return nil, err
 	}
 
 	// Initialize the container storage
-	cStorage, err := storagePoolVolumeContainerCreateInit(s, storagePool, args.Name)
+	cStorage, err := storagePoolVolumeContainerCreateInit(s, args.Project, storagePool, args.Name)
 	if err != nil {
 		c.Delete()
-		s.Cluster.StoragePoolVolumeDelete(args.Name, storagePoolVolumeTypeContainer, poolID)
+		s.Cluster.StoragePoolVolumeDelete(args.Project, args.Name, storagePoolVolumeTypeContainer, poolID)
 		logger.Error("Failed to initialize container storage", ctxMap)
 		return nil, err
 	}
@@ -461,7 +481,7 @@ func containerLXCCreate(s *state.State, args db.ContainerArgs) (container, error
 	networkUpdateStatic(s, "")
 
 	logger.Info("Created container", ctxMap)
-	eventSendLifecycle("container-created",
+	eventSendLifecycle(c.project, "container-created",
 		fmt.Sprintf("/1.0/containers/%s", c.name), nil)
 
 	return c, nil
@@ -492,7 +512,7 @@ func containerLXCLoad(s *state.State, args db.ContainerArgs, profiles []api.Prof
 func containerLXCUnload(c *containerLXC) {
 	runtime.SetFinalizer(c, nil)
 	if c.c != nil {
-		lxc.Release(c.c)
+		c.c.Release()
 		c.c = nil
 	}
 }
@@ -502,6 +522,7 @@ func containerLXCInstantiate(s *state.State, args db.ContainerArgs) *containerLX
 	return &containerLXC{
 		state:        s,
 		id:           args.ID,
+		project:      args.Project,
 		name:         args.Name,
 		description:  args.Description,
 		ephemeral:    args.Ephemeral,
@@ -514,6 +535,7 @@ func containerLXCInstantiate(s *state.State, args db.ContainerArgs) *containerLX
 		localDevices: args.Devices,
 		stateful:     args.Stateful,
 		node:         args.Node,
+		expiryDate:   args.ExpiryDate,
 	}
 }
 
@@ -526,6 +548,7 @@ type containerLXC struct {
 	lastUsedDate time.Time
 	ephemeral    bool
 	id           int
+	project      string
 	name         string
 	description  string
 	stateful     bool
@@ -553,6 +576,8 @@ type containerLXC struct {
 
 	// Progress tracking
 	op *operation
+
+	expiryDate time.Time
 }
 
 func (c *containerLXC) createOperation(action string, reusable bool, reuse bool) (*lxcContainerOperation, error) {
@@ -905,10 +930,18 @@ func (c *containerLXC) initLXC(config bool) error {
 	}
 
 	// Load the go-lxc struct
-	cc, err := lxc.NewContainer(c.Name(), c.state.OS.LxcPath)
+	cname := projectPrefix(c.Project(), c.Name())
+	cc, err := lxc.NewContainer(cname, c.state.OS.LxcPath)
 	if err != nil {
 		return err
 	}
+
+	freeContainer := true
+	defer func() {
+		if freeContainer {
+			cc.Release()
+		}
+	}()
 
 	// Setup logging
 	logfile := c.LogFilePath()
@@ -953,7 +986,12 @@ func (c *containerLXC) initLXC(config bool) error {
 	// Allow for lightweight init
 	c.cConfig = config
 	if !config {
+		if c.c != nil {
+			c.c.Release()
+		}
+
 		c.c = cc
+		freeContainer = false
 		return nil
 	}
 
@@ -1010,7 +1048,7 @@ func (c *containerLXC) initLXC(config bool) error {
 		"/sys/kernel/security"}
 
 	if c.IsPrivileged() && !c.state.OS.RunningInUserNS {
-		err = lxcSetConfigItem(cc, "lxc.mount.entry", "mqueue dev/mqueue mqueue rw,relatime,create=dir,optional")
+		err = lxcSetConfigItem(cc, "lxc.mount.entry", "mqueue dev/mqueue mqueue rw,relatime,create=dir,optional 0 0")
 		if err != nil {
 			return err
 		}
@@ -1024,12 +1062,12 @@ func (c *containerLXC) initLXC(config bool) error {
 		}
 
 		if shared.IsDir(mnt) {
-			err = lxcSetConfigItem(cc, "lxc.mount.entry", fmt.Sprintf("%s %s none rbind,create=dir,optional", mnt, strings.TrimPrefix(mnt, "/")))
+			err = lxcSetConfigItem(cc, "lxc.mount.entry", fmt.Sprintf("%s %s none rbind,create=dir,optional 0 0", mnt, strings.TrimPrefix(mnt, "/")))
 			if err != nil {
 				return err
 			}
 		} else {
-			err = lxcSetConfigItem(cc, "lxc.mount.entry", fmt.Sprintf("%s %s none bind,create=file,optional", mnt, strings.TrimPrefix(mnt, "/")))
+			err = lxcSetConfigItem(cc, "lxc.mount.entry", fmt.Sprintf("%s %s none bind,create=file,optional 0 0", mnt, strings.TrimPrefix(mnt, "/")))
 			if err != nil {
 				return err
 			}
@@ -1085,12 +1123,12 @@ func (c *containerLXC) initLXC(config bool) error {
 		 * mount extra /proc and /sys to work around kernel
 		 * restrictions on remounting them when covered
 		 */
-		err = lxcSetConfigItem(cc, "lxc.mount.entry", "proc dev/.lxc/proc proc create=dir,optional")
+		err = lxcSetConfigItem(cc, "lxc.mount.entry", "proc dev/.lxc/proc proc create=dir,optional 0 0")
 		if err != nil {
 			return err
 		}
 
-		err = lxcSetConfigItem(cc, "lxc.mount.entry", "sys dev/.lxc/sys sysfs create=dir,optional")
+		err = lxcSetConfigItem(cc, "lxc.mount.entry", "sys dev/.lxc/sys sysfs create=dir,optional 0 0")
 		if err != nil {
 			return err
 		}
@@ -1229,9 +1267,33 @@ func (c *containerLXC) initLXC(config bool) error {
 			return err
 		}
 
-		err = lxcSetConfigItem(cc, "lxc.environment", "NVIDIA_DRIVER_CAPABILITIES=compute,utility")
-		if err != nil {
-			return err
+		nvidiaDriver := c.expandedConfig["nvidia.driver.capabilities"]
+		if nvidiaDriver == "" {
+			err = lxcSetConfigItem(cc, "lxc.environment", "NVIDIA_DRIVER_CAPABILITIES=compute,utility")
+			if err != nil {
+				return err
+			}
+		} else {
+			err = lxcSetConfigItem(cc, "lxc.environment", fmt.Sprintf("NVIDIA_DRIVER_CAPABILITIES=%s", nvidiaDriver))
+			if err != nil {
+				return err
+			}
+		}
+
+		nvidiaRequireCuda := c.expandedConfig["nvidia.require.cuda"]
+		if nvidiaRequireCuda == "" {
+			err = lxcSetConfigItem(cc, "lxc.environment", fmt.Sprintf("NVIDIA_REQUIRE_CUDA=%s", nvidiaRequireCuda))
+			if err != nil {
+				return err
+			}
+		}
+
+		nvidiaRequireDriver := c.expandedConfig["nvidia.require.driver"]
+		if nvidiaRequireDriver == "" {
+			err = lxcSetConfigItem(cc, "lxc.environment", fmt.Sprintf("NVIDIA_REQUIRE_DRIVER=%s", nvidiaRequireDriver))
+			if err != nil {
+				return err
+			}
 		}
 
 		err = lxcSetConfigItem(cc, "lxc.hook.mount", hookPath)
@@ -1387,6 +1449,11 @@ func (c *containerLXC) initLXC(config bool) error {
 			}
 		}
 
+		// Detect initial creation where the rootfs doesn't exist yet (can't mount it)
+		if !shared.PathExists(c.RootfsPath()) {
+			hasRootLimit = false
+		}
+
 		if hasDiskLimits {
 			ourStart := false
 
@@ -1498,7 +1565,7 @@ func (c *containerLXC) initLXC(config bool) error {
 				fmt.Sprintf("%s %s %s",
 					shared.EscapePathFstab(sourceDevPath),
 					shared.EscapePathFstab(relativeDestPath),
-					"none bind,create=file"))
+					"none bind,create=file 0 0"))
 			if err != nil {
 				return err
 			}
@@ -1673,6 +1740,10 @@ func (c *containerLXC) initLXC(config bool) error {
 					rbind = "r"
 				}
 
+				if m["propagation"] != "" {
+					options = append(options, m["propagation"])
+				}
+
 				if isFile {
 					options = append(options, "create=file")
 				} else {
@@ -1680,9 +1751,10 @@ func (c *containerLXC) initLXC(config bool) error {
 				}
 
 				err = lxcSetConfigItem(cc, "lxc.mount.entry",
-					fmt.Sprintf("%s %s none %sbind,%s",
+					fmt.Sprintf("%s %s none %sbind,%s 0 0",
 						shared.EscapePathFstab(sourceDevPath),
-						shared.EscapePathFstab(relativeDestPath), rbind,
+						shared.EscapePathFstab(relativeDestPath),
+						rbind,
 						strings.Join(options, ",")))
 				if err != nil {
 					return err
@@ -1692,7 +1764,11 @@ func (c *containerLXC) initLXC(config bool) error {
 	}
 
 	// Setup shmounts
-	err = lxcSetConfigItem(cc, "lxc.mount.entry", fmt.Sprintf("%s dev/.lxd-mounts none bind,create=dir 0 0", shared.VarPath("shmounts", c.Name())))
+	if lxc.HasApiExtension("mount_injection_file") {
+		err = lxcSetConfigItem(cc, "lxc.mount.auto", fmt.Sprintf("shmounts:%s:/dev/.lxd-mounts", c.ShmountsPath()))
+	} else {
+		err = lxcSetConfigItem(cc, "lxc.mount.entry", fmt.Sprintf("%s dev/.lxd-mounts none bind,create=dir 0 0", c.ShmountsPath()))
+	}
 	if err != nil {
 		return err
 	}
@@ -1716,7 +1792,11 @@ func (c *containerLXC) initLXC(config bool) error {
 		}
 	}
 
+	if c.c != nil {
+		c.c.Release()
+	}
 	c.c = cc
+	freeContainer = false
 
 	return nil
 }
@@ -1727,7 +1807,7 @@ func (c *containerLXC) initStorage() error {
 		return nil
 	}
 
-	s, err := storagePoolVolumeContainerLoadInit(c.state, c.Name())
+	s, err := storagePoolVolumeContainerLoadInit(c.state, c.Project(), c.Name())
 	if err != nil {
 		return err
 	}
@@ -1739,89 +1819,31 @@ func (c *containerLXC) initStorage() error {
 
 // Config handling
 func (c *containerLXC) expandConfig(profiles []api.Profile) error {
-	// Fetch profile configs
-	profileConfigs := make([]map[string]string, len(c.profiles))
-
-	// Apply all the profiles
-	if profiles != nil {
-		for i, profile := range profiles {
-			profileConfigs[i] = profile.Config
-		}
-	} else {
-		for i, name := range c.profiles {
-			profileConfig, err := c.state.Cluster.ProfileConfig(name)
-			if err != nil {
-				return err
-			}
-			profileConfigs[i] = profileConfig
+	if profiles == nil && len(c.profiles) > 0 {
+		var err error
+		profiles, err = c.state.Cluster.ProfilesGet(c.project, c.profiles)
+		if err != nil {
+			return err
 		}
 	}
 
-	c.expandConfigFromProfiles(profileConfigs)
+	c.expandedConfig = db.ProfilesExpandConfig(c.localConfig, profiles)
 
 	return nil
-}
-
-// Expand the container config using the given profile configs.
-func (c *containerLXC) expandConfigFromProfiles(profileConfigs []map[string]string) {
-	config := map[string]string{}
-
-	// Apply all the profiles
-	for i := range profileConfigs {
-		for k, v := range profileConfigs[i] {
-			config[k] = v
-		}
-	}
-
-	// Stick the local config on top
-	for k, v := range c.localConfig {
-		config[k] = v
-	}
-
-	c.expandedConfig = config
 }
 
 func (c *containerLXC) expandDevices(profiles []api.Profile) error {
-	// Fetch profile devices
-	profileDevices := make([]types.Devices, len(c.profiles))
-
-	// Apply all the profiles
-	if profiles != nil {
-		for i, profile := range profiles {
-			profileDevices[i] = profile.Devices
-		}
-	} else {
-		for _, p := range c.profiles {
-			devices, err := c.state.Cluster.Devices(p, true)
-			if err != nil {
-				return err
-			}
-			profileDevices = append(profileDevices, devices)
+	if profiles == nil && len(c.profiles) > 0 {
+		var err error
+		profiles, err = c.state.Cluster.ProfilesGet(c.project, c.profiles)
+		if err != nil {
+			return err
 		}
 	}
 
-	c.expandDevicesFromProfiles(profileDevices)
+	c.expandedDevices = db.ProfilesExpandDevices(c.localDevices, profiles)
 
 	return nil
-}
-
-// Expand the container config using the given profile devices.
-func (c *containerLXC) expandDevicesFromProfiles(profileDevices []types.Devices) {
-	devices := types.Devices{}
-
-	// Apply all the profiles
-	for i := range profileDevices {
-		for k, v := range profileDevices[i] {
-			devices[k] = v
-		}
-	}
-
-	// Stick local devices on top
-	for k, v := range c.localDevices {
-		devices[k] = v
-	}
-
-	c.expandedDevices = devices
 }
 
 // setupUnixDevice() creates the unix device and sets up the necessary low-level
@@ -1856,7 +1878,7 @@ func (c *containerLXC) setupUnixDevice(prefix string, dev types.Device, major in
 
 	devPath := shared.EscapePathFstab(paths[0])
 	tgtPath := shared.EscapePathFstab(paths[1])
-	val := fmt.Sprintf("%s %s none bind,create=file", devPath, tgtPath)
+	val := fmt.Sprintf("%s %s none bind,create=file 0 0", devPath, tgtPath)
 
 	return lxcSetConfigItem(c.c, "lxc.mount.entry", val)
 }
@@ -1971,6 +1993,10 @@ func (c *containerLXC) startCommon() (string, error) {
 	}
 
 	if !reflect.DeepEqual(idmap, lastIdmap) {
+		if shared.IsTrue(c.expandedConfig["security.protection.shift"]) {
+			return "", fmt.Errorf("Container is protected against filesystem shifting")
+		}
+
 		logger.Debugf("Container idmap changed, remapping")
 		c.updateProgress("Remapping container filesystem")
 
@@ -2326,7 +2352,7 @@ func (c *containerLXC) startCommon() (string, error) {
 					}
 
 					// Attempt to disable IPv6 on the host side interface
-					networkSysctl(fmt.Sprintf("ipv6/conf/%s/disable_ipv6", device), "1")
+					networkSysctlSet(fmt.Sprintf("ipv6/conf/%s/disable_ipv6", device), "1")
 				}
 			}
 		}
@@ -2346,12 +2372,12 @@ func (c *containerLXC) startCommon() (string, error) {
 		return "", err
 	}
 
-	err = os.MkdirAll(shared.VarPath("devices", c.Name()), 0711)
+	err = os.MkdirAll(c.DevicesPath(), 0711)
 	if err != nil {
 		return "", err
 	}
 
-	err = os.MkdirAll(shared.VarPath("shmounts", c.Name()), 0711)
+	err = os.MkdirAll(c.ShmountsPath(), 0711)
 	if err != nil {
 		return "", err
 	}
@@ -2434,7 +2460,9 @@ func (c *containerLXC) Start(stateful bool) error {
 		return errors.Wrap(err, "Storage start")
 	}
 
-	ctxMap = log.Ctx{"name": c.name,
+	ctxMap = log.Ctx{
+		"project":   c.project,
+		"name":      c.name,
 		"action":    op.action,
 		"created":   c.creationDate,
 		"ephemeral": c.ephemeral,
@@ -2473,9 +2501,16 @@ func (c *containerLXC) Start(stateful bool) error {
 			return errors.Wrap(err, "Start container")
 		}
 
-		logger.Info("Started container", ctxMap)
+		// Start proxy devices
+		err = c.restartProxyDevices()
+		if err != nil {
+			// Attempt to stop the container
+			c.Stop(false)
+			return err
+		}
 
-		return err
+		logger.Info("Started container", ctxMap)
+		return nil
 	} else if c.stateful {
 		/* stateless start required when we have state, let's delete it */
 		err := os.RemoveAll(c.StatePath())
@@ -2490,11 +2525,13 @@ func (c *containerLXC) Start(stateful bool) error {
 		}
 	}
 
+	name := projectPrefix(c.Project(), c.name)
+
 	// Start the LXC container
 	out, err := shared.RunCommand(
 		c.state.OS.ExecPath,
 		"forkstart",
-		c.name,
+		name,
 		c.state.OS.LxcPath,
 		configPath)
 
@@ -2548,7 +2585,7 @@ func (c *containerLXC) Start(stateful bool) error {
 	}
 
 	logger.Info("Started container", ctxMap)
-	eventSendLifecycle("container-started",
+	eventSendLifecycle(c.project, "container-started",
 		fmt.Sprintf("/1.0/containers/%s", c.name), nil)
 
 	return nil
@@ -2664,7 +2701,9 @@ func (c *containerLXC) Stop(stateful bool) error {
 		return err
 	}
 
-	ctxMap = log.Ctx{"name": c.name,
+	ctxMap = log.Ctx{
+		"project":   c.project,
+		"name":      c.name,
 		"action":    op.action,
 		"created":   c.creationDate,
 		"ephemeral": c.ephemeral,
@@ -2704,6 +2743,12 @@ func (c *containerLXC) Stop(stateful bool) error {
 			return err
 		}
 
+		err = op.Wait()
+		if err != nil && c.IsRunning() {
+			logger.Error("Failed stopping container", ctxMap)
+			return err
+		}
+
 		c.stateful = true
 		err = c.state.Cluster.ContainerSetStateful(c.id, true)
 		if err != nil {
@@ -2714,7 +2759,7 @@ func (c *containerLXC) Stop(stateful bool) error {
 
 		op.Done(nil)
 		logger.Info("Stopped container", ctxMap)
-		eventSendLifecycle("container-stopped",
+		eventSendLifecycle(c.project, "container-stopped",
 			fmt.Sprintf("/1.0/containers/%s", c.name), nil)
 		return nil
 	} else if shared.PathExists(c.StatePath()) {
@@ -2761,7 +2806,7 @@ func (c *containerLXC) Stop(stateful bool) error {
 	}
 
 	logger.Info("Stopped container", ctxMap)
-	eventSendLifecycle("container-stopped",
+	eventSendLifecycle(c.project, "container-stopped",
 		fmt.Sprintf("/1.0/containers/%s", c.name), nil)
 
 	return nil
@@ -2781,7 +2826,9 @@ func (c *containerLXC) Shutdown(timeout time.Duration) error {
 		return err
 	}
 
-	ctxMap = log.Ctx{"name": c.name,
+	ctxMap = log.Ctx{
+		"project":   c.project,
+		"name":      c.name,
 		"action":    "shutdown",
 		"created":   c.creationDate,
 		"ephemeral": c.ephemeral,
@@ -2811,7 +2858,7 @@ func (c *containerLXC) Shutdown(timeout time.Duration) error {
 	}
 
 	logger.Info("Shut down container", ctxMap)
-	eventSendLifecycle("container-shutdown",
+	eventSendLifecycle(c.project, "container-shutdown",
 		fmt.Sprintf("/1.0/containers/%s", c.name), nil)
 
 	return nil
@@ -2845,7 +2892,9 @@ func (c *containerLXC) OnStop(target string) error {
 
 	// Log user actions
 	if op == nil {
-		ctxMap := log.Ctx{"name": c.name,
+		ctxMap := log.Ctx{
+			"project":   c.project,
+			"name":      c.name,
 			"action":    target,
 			"created":   c.creationDate,
 			"ephemeral": c.ephemeral,
@@ -2853,6 +2902,12 @@ func (c *containerLXC) OnStop(target string) error {
 			"stateful":  false}
 
 		logger.Info(fmt.Sprintf("Container initiated %s", target), ctxMap)
+	}
+
+	// Record power state
+	err = c.state.Cluster.ContainerSetState(c.id, "STOPPED")
+	if err != nil {
+		logger.Error("Failed to set container state", log.Ctx{"container": c.Name(), "err": err})
 	}
 
 	go func(c *containerLXC, target string, op *lxcContainerOperation) {
@@ -2907,12 +2962,6 @@ func (c *containerLXC) OnStop(target string) error {
 		// Trigger a rebalance
 		deviceTaskSchedulerTrigger("container", c.name, "stopped")
 
-		// Record current state
-		err = c.state.Cluster.ContainerSetState(c.id, "STOPPED")
-		if err != nil {
-			logger.Error("Failed to set container state", log.Ctx{"container": c.Name(), "err": err})
-		}
-
 		// Destroy ephemeral containers
 		if c.ephemeral {
 			err = c.Delete()
@@ -2924,7 +2973,9 @@ func (c *containerLXC) OnStop(target string) error {
 
 // Freezer functions
 func (c *containerLXC) Freeze() error {
-	ctxMap := log.Ctx{"name": c.name,
+	ctxMap := log.Ctx{
+		"project":   c.project,
+		"name":      c.name,
 		"created":   c.creationDate,
 		"ephemeral": c.ephemeral,
 		"used":      c.lastUsedDate}
@@ -2963,14 +3014,16 @@ func (c *containerLXC) Freeze() error {
 	}
 
 	logger.Info("Froze container", ctxMap)
-	eventSendLifecycle("container-paused",
+	eventSendLifecycle(c.project, "container-paused",
 		fmt.Sprintf("/1.0/containers/%s", c.name), nil)
 
 	return err
 }
 
 func (c *containerLXC) Unfreeze() error {
-	ctxMap := log.Ctx{"name": c.name,
+	ctxMap := log.Ctx{
+		"project":   c.project,
+		"name":      c.name,
 		"created":   c.creationDate,
 		"ephemeral": c.ephemeral,
 		"used":      c.lastUsedDate}
@@ -3006,7 +3059,7 @@ func (c *containerLXC) Unfreeze() error {
 	}
 
 	logger.Info("Unfroze container", ctxMap)
-	eventSendLifecycle("container-resumed",
+	eventSendLifecycle(c.project, "container-resumed",
 		fmt.Sprintf("/1.0/containers/%s", c.name), nil)
 
 	return err
@@ -3045,52 +3098,116 @@ func (c *containerLXC) Render() (interface{}, interface{}, error) {
 	// Ignore err as the arch string on error is correct (unknown)
 	architectureName, _ := osarch.ArchitectureName(c.architecture)
 
-	// Prepare the ETag
-	etag := []interface{}{c.architecture, c.localConfig, c.localDevices, c.ephemeral, c.profiles}
-
 	if c.IsSnapshot() {
-		return &api.ContainerSnapshot{
-			Architecture:    architectureName,
-			Config:          c.localConfig,
-			CreationDate:    c.creationDate,
-			Devices:         c.localDevices,
-			Ephemeral:       c.ephemeral,
+		// Prepare the ETag
+		etag := []interface{}{c.expiryDate}
+
+		ct := api.ContainerSnapshot{
+			CreatedAt:       c.creationDate,
 			ExpandedConfig:  c.expandedConfig,
 			ExpandedDevices: c.expandedDevices,
-			LastUsedDate:    c.lastUsedDate,
+			LastUsedAt:      c.lastUsedDate,
 			Name:            strings.SplitN(c.name, "/", 2)[1],
-			Profiles:        c.profiles,
 			Stateful:        c.stateful,
-		}, etag, nil
-	} else {
-		// FIXME: Render shouldn't directly access the go-lxc struct
-		cState, err := c.getLxcState()
-		if err != nil {
-			return nil, nil, err
 		}
-		statusCode := lxcStatusCode(cState)
-
-		ct := api.Container{
-			ExpandedConfig:  c.expandedConfig,
-			ExpandedDevices: c.expandedDevices,
-			Name:            c.name,
-			Status:          statusCode.String(),
-			StatusCode:      statusCode,
-			Location:        c.node,
-		}
-
-		ct.Description = c.description
 		ct.Architecture = architectureName
 		ct.Config = c.localConfig
-		ct.CreatedAt = c.creationDate
 		ct.Devices = c.localDevices
 		ct.Ephemeral = c.ephemeral
-		ct.LastUsedAt = c.lastUsedDate
 		ct.Profiles = c.profiles
-		ct.Stateful = c.stateful
+		ct.ExpiresAt = c.expiryDate
 
 		return &ct, etag, nil
 	}
+
+	// Prepare the ETag
+	etag := []interface{}{c.architecture, c.localConfig, c.localDevices, c.ephemeral, c.profiles}
+
+	// FIXME: Render shouldn't directly access the go-lxc struct
+	cState, err := c.getLxcState()
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "Get container stated")
+	}
+	statusCode := lxcStatusCode(cState)
+
+	ct := api.Container{
+		ExpandedConfig:  c.expandedConfig,
+		ExpandedDevices: c.expandedDevices,
+		Name:            c.name,
+		Status:          statusCode.String(),
+		StatusCode:      statusCode,
+		Location:        c.node,
+	}
+
+	ct.Description = c.description
+	ct.Architecture = architectureName
+	ct.Config = c.localConfig
+	ct.CreatedAt = c.creationDate
+	ct.Devices = c.localDevices
+	ct.Ephemeral = c.ephemeral
+	ct.LastUsedAt = c.lastUsedDate
+	ct.Profiles = c.profiles
+	ct.Stateful = c.stateful
+
+	return &ct, etag, nil
+}
+
+func (c *containerLXC) RenderFull() (*api.ContainerFull, interface{}, error) {
+	if c.IsSnapshot() {
+		return nil, nil, fmt.Errorf("RenderFull only works with containers")
+	}
+
+	// Get the Container struct
+	base, etag, err := c.Render()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Convert to ContainerFull
+	ct := api.ContainerFull{Container: *base.(*api.Container)}
+
+	// Add the ContainerState
+	ct.State, err = c.RenderState()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Add the ContainerSnapshots
+	snaps, err := c.Snapshots()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	for _, snap := range snaps {
+		render, _, err := snap.Render()
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if ct.Snapshots == nil {
+			ct.Snapshots = []api.ContainerSnapshot{}
+		}
+
+		ct.Snapshots = append(ct.Snapshots, *render.(*api.ContainerSnapshot))
+	}
+
+	// Add the ContainerBackups
+	backups, err := c.Backups()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	for _, backup := range backups {
+		render := backup.Render()
+
+		if ct.Backups == nil {
+			ct.Backups = []api.ContainerBackup{}
+		}
+
+		ct.Backups = append(ct.Backups, *render)
+	}
+
+	return &ct, etag, nil
 }
 
 func (c *containerLXC) RenderState() (*api.ContainerState, error) {
@@ -3119,7 +3236,7 @@ func (c *containerLXC) RenderState() (*api.ContainerState, error) {
 
 func (c *containerLXC) Snapshots() ([]container, error) {
 	// Get all the snapshots
-	snaps, err := c.state.Cluster.ContainerGetSnapshots(c.name)
+	snaps, err := c.state.Cluster.ContainerGetSnapshots(c.Project(), c.name)
 	if err != nil {
 		return nil, err
 	}
@@ -3127,7 +3244,7 @@ func (c *containerLXC) Snapshots() ([]container, error) {
 	// Build the snapshot list
 	containers := []container{}
 	for _, snapName := range snaps {
-		snap, err := containerLoadByName(c.state, snapName)
+		snap, err := containerLoadByProjectAndName(c.state, c.project, snapName)
 		if err != nil {
 			return nil, err
 		}
@@ -3136,6 +3253,27 @@ func (c *containerLXC) Snapshots() ([]container, error) {
 	}
 
 	return containers, nil
+}
+
+func (c *containerLXC) Backups() ([]backup, error) {
+	// Get all the backups
+	backupNames, err := c.state.Cluster.ContainerGetBackups(c.project, c.name)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build the backup list
+	backups := []backup{}
+	for _, backupName := range backupNames {
+		backup, err := backupLoadByName(c.state, c.project, backupName)
+		if err != nil {
+			return nil, err
+		}
+
+		backups = append(backups, *backup)
+	}
+
+	return backups, nil
 }
 
 func (c *containerLXC) Restore(sourceContainer container, stateful bool) error {
@@ -3192,7 +3330,9 @@ func (c *containerLXC) Restore(sourceContainer container, stateful bool) error {
 		}
 	}
 
-	ctxMap = log.Ctx{"name": c.name,
+	ctxMap = log.Ctx{
+		"project":   c.project,
+		"name":      c.name,
 		"created":   c.creationDate,
 		"ephemeral": c.ephemeral,
 		"used":      c.lastUsedDate,
@@ -3215,6 +3355,7 @@ func (c *containerLXC) Restore(sourceContainer container, stateful bool) error {
 		Devices:      sourceContainer.LocalDevices(),
 		Ephemeral:    sourceContainer.IsEphemeral(),
 		Profiles:     sourceContainer.Profiles(),
+		Project:      sourceContainer.Project(),
 	}
 
 	err = c.Update(args, false)
@@ -3274,7 +3415,7 @@ func (c *containerLXC) Restore(sourceContainer container, stateful bool) error {
 		return nil
 	}
 
-	eventSendLifecycle("container-snapshot-restored",
+	eventSendLifecycle(c.project, "container-snapshot-restored",
 		fmt.Sprintf("/1.0/containers/%s", c.name), map[string]interface{}{
 			"snapshot_name": c.name,
 		})
@@ -3305,16 +3446,24 @@ func (c *containerLXC) cleanup() {
 	os.Remove(c.DevicesPath())
 
 	// Remove the shmounts path
-	os.RemoveAll(shared.VarPath("shmounts", c.Name()))
+	os.RemoveAll(c.ShmountsPath())
 }
 
 func (c *containerLXC) Delete() error {
-	ctxMap := log.Ctx{"name": c.name,
+	ctxMap := log.Ctx{
+		"project":   c.project,
+		"name":      c.name,
 		"created":   c.creationDate,
 		"ephemeral": c.ephemeral,
 		"used":      c.lastUsedDate}
 
 	logger.Info("Deleting container", ctxMap)
+
+	if shared.IsTrue(c.expandedConfig["security.protection.delete"]) && !c.IsSnapshot() {
+		err := fmt.Errorf("Container is protected")
+		logger.Warn("Failed to delete container", log.Ctx{"name": c.Name(), "err": err})
+		return err
+	}
 
 	// Check if we're dealing with "lxd import"
 	isImport := false
@@ -3334,7 +3483,10 @@ func (c *containerLXC) Delete() error {
 	}
 
 	// Attempt to initialize storage interface for the container.
-	c.initStorage()
+	err := c.initStorage()
+	if err != nil {
+		logger.Warnf("Failed to init storage: %v", err)
+	}
 
 	if c.IsSnapshot() {
 		// Remove the snapshot
@@ -3346,11 +3498,24 @@ func (c *containerLXC) Delete() error {
 			}
 		}
 	} else {
-		// Remove all snapshot
-		err := containerDeleteSnapshots(c.state, c.Name())
+		// Remove all snapshots
+		err := containerDeleteSnapshots(c.state, c.Project(), c.Name())
 		if err != nil {
 			logger.Warn("Failed to delete snapshots", log.Ctx{"name": c.Name(), "err": err})
 			return err
+		}
+
+		// Remove all backups
+		backups, err := c.Backups()
+		if err != nil {
+			return err
+		}
+
+		for _, backup := range backups {
+			err = backup.Delete()
+			if err != nil {
+				return err
+			}
 		}
 
 		// Clean things up
@@ -3359,7 +3524,7 @@ func (c *containerLXC) Delete() error {
 		// Delete the container from disk
 		if c.storage != nil && !isImport {
 			_, poolName, _ := c.storage.GetContainerPoolInfo()
-			containerMountPoint := getContainerMountPoint(poolName, c.Name())
+			containerMountPoint := getContainerMountPoint(c.Project(), poolName, c.Name())
 			if shared.PathExists(c.Path()) ||
 				shared.PathExists(containerMountPoint) {
 				err := c.storage.ContainerDelete(c)
@@ -3393,7 +3558,7 @@ func (c *containerLXC) Delete() error {
 	}
 
 	// Remove the database record
-	if err := c.state.Cluster.ContainerRemove(c.Name()); err != nil {
+	if err := c.state.Cluster.ContainerRemove(c.project, c.Name()); err != nil {
 		logger.Error("Failed deleting container entry", log.Ctx{"name": c.Name(), "err": err})
 		return err
 	}
@@ -3406,7 +3571,7 @@ func (c *containerLXC) Delete() error {
 		poolID, _, _ := c.storage.GetContainerPoolInfo()
 
 		// Remove volume from storage pool.
-		err := c.state.Cluster.StoragePoolVolumeDelete(c.Name(), storagePoolVolumeTypeContainer, poolID)
+		err := c.state.Cluster.StoragePoolVolumeDelete(c.Project(), c.Name(), storagePoolVolumeTypeContainer, poolID)
 		if err != nil {
 			return err
 		}
@@ -3420,12 +3585,12 @@ func (c *containerLXC) Delete() error {
 	logger.Info("Deleted container", ctxMap)
 
 	if c.IsSnapshot() {
-		eventSendLifecycle("container-snapshot-deleted",
+		eventSendLifecycle(c.project, "container-snapshot-deleted",
 			fmt.Sprintf("/1.0/containers/%s", c.name), map[string]interface{}{
 				"snapshot_name": c.name,
 			})
 	} else {
-		eventSendLifecycle("container-deleted",
+		eventSendLifecycle(c.project, "container-deleted",
 			fmt.Sprintf("/1.0/containers/%s", c.name), nil)
 	}
 
@@ -3434,7 +3599,9 @@ func (c *containerLXC) Delete() error {
 
 func (c *containerLXC) Rename(newName string) error {
 	oldName := c.Name()
-	ctxMap := log.Ctx{"name": c.name,
+	ctxMap := log.Ctx{
+		"project":   c.project,
+		"name":      c.name,
 		"created":   c.creationDate,
 		"ephemeral": c.ephemeral,
 		"used":      c.lastUsedDate,
@@ -3493,8 +3660,26 @@ func (c *containerLXC) Rename(newName string) error {
 		}
 	}
 
+	// Rename the backups
+	backups, err := c.Backups()
+	if err != nil {
+		return err
+	}
+
+	for _, backup := range backups {
+		backupName := strings.Split(backup.name, "/")[1]
+		newName := fmt.Sprintf("%s/%s", newName, backupName)
+
+		err = backup.Rename(newName)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Rename the database entry
-	err = c.state.Cluster.ContainerRename(oldName, newName)
+	err = c.state.Cluster.Transaction(func(tx *db.ClusterTx) error {
+		return tx.ContainerRename(c.project, oldName, newName)
+	})
 	if err != nil {
 		logger.Error("Failed renaming container", ctxMap)
 		return err
@@ -3502,7 +3687,7 @@ func (c *containerLXC) Rename(newName string) error {
 
 	// Rename storage volume for the container.
 	poolID, _, _ := c.storage.GetContainerPoolInfo()
-	err = c.state.Cluster.StoragePoolVolumeRename(oldName, newName, storagePoolVolumeTypeContainer, poolID)
+	err = c.state.Cluster.StoragePoolVolumeRename(c.project, oldName, newName, storagePoolVolumeTypeContainer, poolID)
 	if err != nil {
 		logger.Error("Failed renaming storage volume", ctxMap)
 		return err
@@ -3510,7 +3695,7 @@ func (c *containerLXC) Rename(newName string) error {
 
 	if !c.IsSnapshot() {
 		// Rename all the snapshots
-		results, err := c.state.Cluster.ContainerGetSnapshots(oldName)
+		results, err := c.state.Cluster.ContainerGetSnapshots(c.project, oldName)
 		if err != nil {
 			logger.Error("Failed renaming container", ctxMap)
 			return err
@@ -3520,14 +3705,16 @@ func (c *containerLXC) Rename(newName string) error {
 			// Rename the snapshot
 			baseSnapName := filepath.Base(sname)
 			newSnapshotName := newName + shared.SnapshotDelimiter + baseSnapName
-			err := c.state.Cluster.ContainerRename(sname, newSnapshotName)
+			err := c.state.Cluster.Transaction(func(tx *db.ClusterTx) error {
+				return tx.ContainerRename(c.project, sname, newSnapshotName)
+			})
 			if err != nil {
 				logger.Error("Failed renaming container", ctxMap)
 				return err
 			}
 
 			// Rename storage volume for the snapshot.
-			err = c.state.Cluster.StoragePoolVolumeRename(sname, newSnapshotName, storagePoolVolumeTypeContainer, poolID)
+			err = c.state.Cluster.StoragePoolVolumeRename(c.project, sname, newSnapshotName, storagePoolVolumeTypeContainer, poolID)
 			if err != nil {
 				logger.Error("Failed renaming storage volume", ctxMap)
 				return err
@@ -3543,7 +3730,11 @@ func (c *containerLXC) Rename(newName string) error {
 	c.storage.SetStoragePoolVolumeWritable(&sNew)
 
 	// Invalidate the go-lxc cache
-	c.c = nil
+	if c.c != nil {
+		c.c.Release()
+		c.c = nil
+	}
+
 	c.cConfig = false
 
 	// Update lease files
@@ -3552,13 +3743,13 @@ func (c *containerLXC) Rename(newName string) error {
 	logger.Info("Renamed container", ctxMap)
 
 	if c.IsSnapshot() {
-		eventSendLifecycle("container-snapshot-renamed",
+		eventSendLifecycle(c.project, "container-snapshot-renamed",
 			fmt.Sprintf("/1.0/containers/%s", oldName), map[string]interface{}{
 				"new_name":      newName,
 				"snapshot_name": oldName,
 			})
 	} else {
-		eventSendLifecycle("container-renamed",
+		eventSendLifecycle(c.project, "container-renamed",
 			fmt.Sprintf("/1.0/containers/%s", oldName), map[string]interface{}{
 				"new_name": newName,
 			})
@@ -3613,9 +3804,16 @@ func (c *containerLXC) ConfigKeySet(key string, value string) error {
 		Devices:      c.localDevices,
 		Ephemeral:    c.ephemeral,
 		Profiles:     c.profiles,
+		Project:      c.project,
+		ExpiryDate:   c.expiryDate,
 	}
 
-	return c.Update(args, false)
+	err := c.Update(args, false)
+	if err != nil {
+		errors.Wrap(err, "Failed to update container")
+	}
+
+	return err
 }
 
 type backupFile struct {
@@ -3637,8 +3835,9 @@ func writeBackupFile(c container) error {
 	}
 
 	/* deal with the container occasionally not being monuted */
-	if !shared.PathExists(c.RootfsPath()) {
-		logger.Warn("Unable to update backup.yaml at this time", log.Ctx{"name": c.Name()})
+	rootfs := c.RootfsPath()
+	if !shared.PathExists(rootfs) {
+		logger.Warn("Unable to update backup.yaml at this time", log.Ctx{"name": c.Name(), "rootfs": rootfs})
 		return nil
 	}
 
@@ -3674,7 +3873,7 @@ func writeBackupFile(c container) error {
 		return err
 	}
 
-	_, volume, err := s.Cluster.StoragePoolNodeVolumeGetType(c.Name(), storagePoolVolumeTypeContainer, poolID)
+	_, volume, err := s.Cluster.StoragePoolNodeVolumeGetTypeByProject(c.Project(), c.Name(), storagePoolVolumeTypeContainer, poolID)
 	if err != nil {
 		return err
 	}
@@ -3689,7 +3888,7 @@ func writeBackupFile(c container) error {
 		return err
 	}
 
-	f, err := os.Create(shared.VarPath("containers", c.Name(), "backup.yaml"))
+	f, err := os.Create(filepath.Join(c.Path(), "backup.yaml"))
 	if err != nil {
 		return err
 	}
@@ -3710,6 +3909,10 @@ func writeBackupFile(c container) error {
 
 func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 	// Set sane defaults for unset keys
+	if args.Project == "" {
+		args.Project = "default"
+	}
+
 	if args.Architecture == 0 {
 		args.Architecture = c.architecture
 	}
@@ -3739,7 +3942,7 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 	}
 
 	// Validate the new profiles
-	profiles, err := c.state.Cluster.Profiles()
+	profiles, err := c.state.Cluster.Profiles(args.Project)
 	if err != nil {
 		return errors.Wrap(err, "Failed to get project profiles")
 	}
@@ -3832,6 +4035,8 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 		return err
 	}
 
+	oldExpiryDate := c.expiryDate
+
 	// Define a function which reverts everything.  Defer this function
 	// so that it doesn't need to be explicitly called in every failing
 	// return path.  Track whether or not we want to undo the changes
@@ -3847,7 +4052,11 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 			c.localConfig = oldLocalConfig
 			c.localDevices = oldLocalDevices
 			c.profiles = oldProfiles
-			c.c = nil
+			c.expiryDate = oldExpiryDate
+			if c.c != nil {
+				c.c.Release()
+				c.c = nil
+			}
 			c.cConfig = false
 			c.initLXC(true)
 			deviceTaskSchedulerTrigger("container", c.name, "changed")
@@ -3861,6 +4070,7 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 	c.localConfig = args.Config
 	c.localDevices = args.Devices
 	c.profiles = args.Profiles
+	c.expiryDate = args.ExpiryDate
 
 	// Expand the config and refresh the LXC config
 	err = c.expandConfig(nil)
@@ -3907,7 +4117,10 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 	}
 
 	// Run through initLXC to catch anything we missed
-	c.c = nil
+	if c.c != nil {
+		c.c.Release()
+		c.c = nil
+	}
 	c.cConfig = false
 	err = c.initLXC(true)
 	if err != nil {
@@ -4697,7 +4910,7 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 			return errors.Wrap(err, "Config insert")
 		}
 
-		err = db.ContainerProfilesInsert(tx, c.id, c.profiles)
+		err = db.ContainerProfilesInsert(tx, c.id, c.project, c.profiles)
 		if err != nil {
 			tx.Rollback()
 			return errors.Wrap(err, "Profiles insert")
@@ -4709,7 +4922,8 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 			return errors.Wrap(err, "Device add")
 		}
 
-		err = db.ContainerUpdate(tx, c.id, c.description, c.architecture, c.ephemeral)
+		err = db.ContainerUpdate(tx, c.id, c.description, c.architecture, c.ephemeral,
+			c.expiryDate)
 		if err != nil {
 			tx.Rollback()
 			return errors.Wrap(err, "Container update")
@@ -4812,14 +5026,24 @@ func (c *containerLXC) Update(args db.ContainerArgs, userRequested bool) error {
 	// Success, update the closure to mark that the changes should be kept.
 	undoChanges = false
 
-	eventSendLifecycle("container-updated",
-		fmt.Sprintf("/1.0/containers/%s", c.name), nil)
+	var endpoint string
+
+	if c.IsSnapshot() {
+		cName, sName, _ := containerGetParentAndSnapshotName(c.name)
+		endpoint = fmt.Sprintf("/1.0/containers/%s/snapshots/%s", cName, sName)
+	} else {
+		endpoint = fmt.Sprintf("/1.0/containers/%s", c.name)
+	}
+
+	eventSendLifecycle(c.project, "container-updated", endpoint, nil)
 
 	return nil
 }
 
 func (c *containerLXC) Export(w io.Writer, properties map[string]string) error {
-	ctxMap := log.Ctx{"name": c.name,
+	ctxMap := log.Ctx{
+		"project":   c.project,
+		"name":      c.name,
 		"created":   c.creationDate,
 		"ephemeral": c.ephemeral,
 		"used":      c.lastUsedDate}
@@ -4848,6 +5072,10 @@ func (c *containerLXC) Export(w io.Writer, properties map[string]string) error {
 	}
 
 	if idmap != nil {
+		if !c.IsSnapshot() && shared.IsTrue(c.expandedConfig["security.protection.shift"]) {
+			return fmt.Errorf("Container is protected against filesystem shifting")
+		}
+
 		var err error
 
 		if c.Storage().GetStorageType() == storageTypeZfs {
@@ -4906,7 +5134,7 @@ func (c *containerLXC) Export(w io.Writer, properties map[string]string) error {
 		var arch string
 		if c.IsSnapshot() {
 			parentName, _, _ := containerGetParentAndSnapshotName(c.name)
-			parent, err := containerLoadByName(c.state, parentName)
+			parent, err := containerLoadByProjectAndName(c.state, c.project, parentName)
 			if err != nil {
 				tw.Close()
 				logger.Error("Failed exporting container", ctxMap)
@@ -5096,7 +5324,9 @@ type CriuMigrationArgs struct {
 }
 
 func (c *containerLXC) Migrate(args *CriuMigrationArgs) error {
-	ctxMap := log.Ctx{"name": c.name,
+	ctxMap := log.Ctx{
+		"project":      c.project,
+		"name":         c.name,
 		"created":      c.creationDate,
 		"ephemeral":    c.ephemeral,
 		"used":         c.lastUsedDate,
@@ -5209,6 +5439,16 @@ func (c *containerLXC) Migrate(args *CriuMigrationArgs) error {
 		if out != "" {
 			for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
 				logger.Debugf("forkmigrate: %s", line)
+			}
+		}
+
+		if migrateErr == nil {
+			// Start proxy devices
+			err = c.restartProxyDevices()
+			if err != nil {
+				// Attempt to stop the container
+				c.Stop(false)
+				return err
 			}
 		}
 	} else if args.cmd == lxc.MIGRATE_FEATURE_CHECK {
@@ -5769,7 +6009,7 @@ func (c *containerLXC) Console(terminal *os.File) *exec.Cmd {
 	args := []string{
 		c.state.OS.ExecPath,
 		"forkconsole",
-		c.name,
+		projectPrefix(c.Project(), c.Name()),
 		c.state.OS.LxcPath,
 		filepath.Join(c.LogPath(), "lxc.conf"),
 		"tty=0",
@@ -5809,7 +6049,8 @@ func (c *containerLXC) Exec(command []string, env map[string]string, stdin *os.F
 	}
 
 	// Prepare the subcommand
-	args := []string{c.state.OS.ExecPath, "forkexec", c.name, c.state.OS.LxcPath, filepath.Join(c.LogPath(), "lxc.conf")}
+	cname := projectPrefix(c.Project(), c.Name())
+	args := []string{c.state.OS.ExecPath, "forkexec", cname, c.state.OS.LxcPath, filepath.Join(c.LogPath(), "lxc.conf")}
 
 	args = append(args, "--")
 	args = append(args, "env")
@@ -5826,6 +6067,23 @@ func (c *containerLXC) Exec(command []string, env map[string]string, stdin *os.F
 	cmd.Stdin = nil
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+
+	// Mitigation for CVE-2019-5736
+	useRexec := false
+	if c.expandedConfig["raw.idmap"] != "" {
+		err := allowedUnprivilegedOnlyMap(c.expandedConfig["raw.idmap"])
+		if err != nil {
+			useRexec = true
+		}
+	}
+
+	if shared.IsTrue(c.expandedConfig["security.privileged"]) {
+		useRexec = true
+	}
+
+	if useRexec {
+		cmd.Env = append(os.Environ(), "LXC_MEMFD_REXEC=1")
+	}
 
 	// Setup communication PIPE
 	rStatus, wStatus, err := shared.Pipe()
@@ -6238,45 +6496,61 @@ func (c *containerLXC) insertMount(source, target, fstype string, flags int) err
 		return fmt.Errorf("Can't insert mount into stopped container")
 	}
 
-	// Create the temporary mount target
-	var tmpMount string
-	if shared.IsDir(source) {
-		tmpMount, err = ioutil.TempDir(shared.VarPath("shmounts", c.name), "lxdmount_")
+	if lxc.HasApiExtension("mount_injection_file") {
+		cname := projectPrefix(c.Project(), c.Name())
+		configPath := filepath.Join(c.LogPath(), "lxc.conf")
+		if fstype == "" {
+			fstype = "none"
+		}
+
+		if !strings.HasPrefix(target, "/") {
+			target = "/" + target
+		}
+
+		_, err := shared.RunCommand(c.state.OS.ExecPath, "forkmount", "lxc-mount", cname, c.state.OS.LxcPath, configPath, source, target, fstype, fmt.Sprintf("%d", flags))
 		if err != nil {
-			return fmt.Errorf("Failed to create shmounts path: %s", err)
+			return err
 		}
 	} else {
-		f, err := ioutil.TempFile(shared.VarPath("shmounts", c.name), "lxdmount_")
+		// Create the temporary mount target
+		var tmpMount string
+		if shared.IsDir(source) {
+			tmpMount, err = ioutil.TempDir(c.ShmountsPath(), "lxdmount_")
+			if err != nil {
+				return fmt.Errorf("Failed to create shmounts path: %s", err)
+			}
+		} else {
+			f, err := ioutil.TempFile(c.ShmountsPath(), "lxdmount_")
+			if err != nil {
+				return fmt.Errorf("Failed to create shmounts path: %s", err)
+			}
+
+			tmpMount = f.Name()
+			f.Close()
+		}
+		defer os.Remove(tmpMount)
+
+		// Mount the filesystem
+		err = syscall.Mount(source, tmpMount, fstype, uintptr(flags), "")
 		if err != nil {
-			return fmt.Errorf("Failed to create shmounts path: %s", err)
+			return fmt.Errorf("Failed to setup temporary mount: %s", err)
 		}
+		defer syscall.Unmount(tmpMount, syscall.MNT_DETACH)
 
-		tmpMount = f.Name()
-		f.Close()
-	}
-	defer os.Remove(tmpMount)
+		// Move the mount inside the container
+		mntsrc := filepath.Join("/dev/.lxd-mounts", filepath.Base(tmpMount))
+		pidStr := fmt.Sprintf("%d", pid)
 
-	// Mount the filesystem
-	err = syscall.Mount(source, tmpMount, fstype, uintptr(flags), "")
-	if err != nil {
-		return fmt.Errorf("Failed to setup temporary mount: %s", err)
-	}
-	defer syscall.Unmount(tmpMount, syscall.MNT_DETACH)
+		out, err := shared.RunCommand(c.state.OS.ExecPath, "forkmount", "lxd-mount", pidStr, mntsrc, target)
 
-	// Move the mount inside the container
-	mntsrc := filepath.Join("/dev/.lxd-mounts", filepath.Base(tmpMount))
-	pidStr := fmt.Sprintf("%d", pid)
-
-	out, err := shared.RunCommand(c.state.OS.ExecPath, "forkmount", "mount", pidStr, mntsrc, target)
-
-	if out != "" {
-		for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
-			logger.Debugf("forkmount: %s", line)
+		if out != "" {
+			for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+				logger.Debugf("forkmount: %s", line)
+			}
 		}
-	}
-
-	if err != nil {
-		return err
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -6290,18 +6564,32 @@ func (c *containerLXC) removeMount(mount string) error {
 		return fmt.Errorf("Can't remove mount from stopped container")
 	}
 
-	// Remove the mount from the container
-	pidStr := fmt.Sprintf("%d", pid)
-	out, err := shared.RunCommand(c.state.OS.ExecPath, "forkmount", "umount", pidStr, mount)
+	if lxc.HasApiExtension("mount_injection_file") {
+		configPath := filepath.Join(c.LogPath(), "lxc.conf")
+		cname := projectPrefix(c.Project(), c.Name())
 
-	if out != "" {
-		for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
-			logger.Debugf("forkumount: %s", line)
+		if !strings.HasPrefix(mount, "/") {
+			mount = "/" + mount
 		}
-	}
 
-	if err != nil {
-		return err
+		_, err := shared.RunCommand(c.state.OS.ExecPath, "forkmount", "lxc-umount", cname, c.state.OS.LxcPath, configPath, mount)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Remove the mount from the container
+		pidStr := fmt.Sprintf("%d", pid)
+		out, err := shared.RunCommand(c.state.OS.ExecPath, "forkmount", "lxd-umount", pidStr, mount)
+
+		if out != "" {
+			for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+				logger.Debugf("forkumount: %s", line)
+			}
+		}
+
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -6450,7 +6738,7 @@ func (c *containerLXC) createUnixDevice(prefix string, m types.Device, defaultMo
 		}
 		f.Close()
 
-		err = deviceMountDisk(srcPath, devPath, false, false)
+		err = deviceMountDisk(srcPath, devPath, false, false, "")
 		if err != nil {
 			return nil, err
 		}
@@ -6698,7 +6986,7 @@ func (c *containerLXC) addInfinibandDevicesPerPort(deviceName string, ifDev *IBF
 
 		// inform liblxc about the mount
 		err = lxcSetConfigItem(c.c, "lxc.mount.entry",
-			fmt.Sprintf("%s %s none bind,create=file",
+			fmt.Sprintf("%s %s none bind,create=file 0 0",
 				shared.EscapePathFstab(devPath),
 				shared.EscapePathFstab(relDestPath)))
 		if err != nil {
@@ -6743,7 +7031,7 @@ func (c *containerLXC) addInfinibandDevicesPerFun(deviceName string, ifDev *IBF,
 		}
 
 		// inform liblxc about the mount
-		err := lxcSetConfigItem(c.c, "lxc.mount.entry", fmt.Sprintf("%s %s none bind,create=file", hostDevPath, relativeDestPath))
+		err := lxcSetConfigItem(c.c, "lxc.mount.entry", fmt.Sprintf("%s %s none bind,create=file 0 0", hostDevPath, relativeDestPath))
 		if err != nil {
 			return err
 		}
@@ -6903,6 +7191,10 @@ func (c *containerLXC) insertProxyDevice(devName string, m types.Device) error {
 		return fmt.Errorf("Can't add proxy device to stopped container")
 	}
 
+	if shared.IsTrue(m["nat"]) {
+		return c.doNat(devName, m)
+	}
+
 	proxyValues, err := setupProxyProcInfo(c, m)
 	if err != nil {
 		return err
@@ -6921,11 +7213,134 @@ func (c *containerLXC) insertProxyDevice(devName string, m types.Device) error {
 		proxyValues.connectPid,
 		proxyValues.connectAddr,
 		logPath,
-		pidPath)
+		pidPath,
+		proxyValues.listenAddrGid,
+		proxyValues.listenAddrUid,
+		proxyValues.listenAddrMode,
+		proxyValues.securityGid,
+		proxyValues.securityUid,
+		proxyValues.proxyProtocol,
+	)
 	if err != nil {
 		return fmt.Errorf("Error occurred when starting proxy device: %s", err)
 	}
 
+	return nil
+}
+
+func (c *containerLXC) doNat(proxy string, device types.Device) error {
+	listenAddr, err := parseAddr(device["listen"])
+	if err != nil {
+		return err
+	}
+
+	connectAddr, err := parseAddr(device["connect"])
+	if err != nil {
+		return err
+	}
+
+	address, _, err := net.SplitHostPort(connectAddr.addr[0])
+	if err != nil {
+		return err
+	}
+
+	var IPv4Addr string
+	var IPv6Addr string
+
+	for _, name := range c.expandedDevices.DeviceNames() {
+		m := c.expandedDevices[name]
+		if m["type"] != "nic" || (m["type"] == "nic" && m["nictype"] != "bridged") {
+			continue
+		}
+
+		// Check whether the NIC has a static IP
+		ip := m["ipv4.address"]
+		// Ensure that the provided IP address matches the container's IP
+		// address otherwise we could mess with other containers.
+		if ip != "" && IPv4Addr == "" && (address == ip || address == "0.0.0.0") {
+			IPv4Addr = ip
+		}
+
+		ip = m["ipv6.address"]
+		if ip != "" && IPv6Addr == "" && (address == ip || address == "::") {
+			IPv6Addr = ip
+		}
+	}
+
+	if IPv4Addr == "" && IPv6Addr == "" {
+		return fmt.Errorf("NIC IP doesn't match proxy target IP")
+	}
+
+	iptablesComment := fmt.Sprintf("%s (%s)", c.Name(), proxy)
+
+	revert := true
+	defer func() {
+		if revert {
+			if IPv4Addr != "" {
+				containerIptablesClear("ipv4", iptablesComment, "nat")
+			}
+
+			if IPv6Addr != "" {
+				containerIptablesClear("ipv6", iptablesComment, "nat")
+			}
+		}
+	}()
+
+	for i, lAddr := range listenAddr.addr {
+		address, port, err := net.SplitHostPort(lAddr)
+		if err != nil {
+			return err
+		}
+		var cPort string
+		if len(connectAddr.addr) == 1 {
+			_, cPort, _ = net.SplitHostPort(connectAddr.addr[0])
+		} else {
+			_, cPort, _ = net.SplitHostPort(connectAddr.addr[i])
+		}
+
+		if IPv4Addr != "" {
+			// outbound <-> container
+			err := containerIptablesPrepend("ipv4", iptablesComment, "nat",
+				"PREROUTING", "-p", listenAddr.connType, "--destination",
+				address, "--dport", port, "-j", "DNAT",
+				"--to-destination", fmt.Sprintf("%s:%s", IPv4Addr, cPort))
+			if err != nil {
+				return err
+			}
+
+			// host <-> container
+			err = containerIptablesPrepend("ipv4", iptablesComment, "nat",
+				"OUTPUT", "-p", listenAddr.connType, "--destination",
+				address, "--dport", port, "-j", "DNAT",
+				"--to-destination", fmt.Sprintf("%s:%s", IPv4Addr, cPort))
+			if err != nil {
+				return err
+			}
+		}
+
+		if IPv6Addr != "" {
+			// outbound <-> container
+			err := containerIptablesPrepend("ipv6", iptablesComment, "nat",
+				"PREROUTING", "-p", listenAddr.connType, "--destination",
+				address, "--dport", port, "-j", "DNAT",
+				"--to-destination", fmt.Sprintf("[%s]:%s", IPv6Addr, cPort))
+			if err != nil {
+				return err
+			}
+
+			// host <-> container
+			err = containerIptablesPrepend("ipv6", iptablesComment, "nat",
+				"OUTPUT", "-p", listenAddr.connType, "--destination",
+				address, "--dport", port, "-j", "DNAT",
+				"--to-destination", fmt.Sprintf("[%s]:%s", IPv6Addr, cPort))
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	revert = false
+	logger.Info(fmt.Sprintf("Using NAT for proxy device '%s'", proxy))
 	return nil
 }
 
@@ -6934,8 +7349,18 @@ func (c *containerLXC) removeProxyDevice(devName string) error {
 		return fmt.Errorf("Can't remove proxy device from stopped container")
 	}
 
+	// Remove possible iptables entries
+	containerIptablesClear("ipv4", fmt.Sprintf("%s (%s)", c.Name(), devName), "nat")
+	containerIptablesClear("ipv6", fmt.Sprintf("%s (%s)", c.Name(), devName), "nat")
+
 	devFileName := fmt.Sprintf("proxy.%s", devName)
 	devPath := filepath.Join(c.DevicesPath(), devFileName)
+
+	if !shared.PathExists(devPath) {
+		// There's no proxy process if NAT is enabled
+		return nil
+	}
+
 	err := killProxyProc(devPath)
 	if err != nil {
 		return err
@@ -6945,6 +7370,10 @@ func (c *containerLXC) removeProxyDevice(devName string) error {
 }
 
 func (c *containerLXC) removeProxyDevices() error {
+	// Remove possible iptables entries
+	containerIptablesClear("ipv4", fmt.Sprintf("%s", c.Name()), "nat")
+	containerIptablesClear("ipv6", fmt.Sprintf("%s", c.Name()), "nat")
+
 	// Check that we actually have devices to remove
 	if !shared.PathExists(c.DevicesPath()) {
 		return nil
@@ -7041,7 +7470,7 @@ func (c *containerLXC) createNetworkDevice(name string, m types.Device) (string,
 			}
 
 			// Attempt to disable IPv6 on the host side interface
-			networkSysctl(fmt.Sprintf("ipv6/conf/%s/disable_ipv6", n1), "1")
+			networkSysctlSet(fmt.Sprintf("ipv6/conf/%s/disable_ipv6", n1), "1")
 		}
 
 		dev = n2
@@ -7060,7 +7489,7 @@ func (c *containerLXC) createNetworkDevice(name string, m types.Device) (string,
 				}
 
 				// Attempt to disable IPv6 on the host side interface
-				networkSysctl(fmt.Sprintf("ipv6/conf/%s/disable_ipv6", device), "1")
+				networkSysctlSet(fmt.Sprintf("ipv6/conf/%s/disable_ipv6", device), "1")
 			}
 		}
 
@@ -7282,9 +7711,10 @@ func (c *containerLXC) fillNetworkDevice(name string, m types.Device) (types.Dev
 		}
 
 		// Attempt to include all existing interfaces
-		cc, err := lxc.NewContainer(c.Name(), c.state.OS.LxcPath)
+		cname := projectPrefix(c.Project(), c.Name())
+		cc, err := lxc.NewContainer(cname, c.state.OS.LxcPath)
 		if err == nil {
-			defer lxc.Release(cc)
+			defer cc.Release()
 
 			interfaces, err := cc.Interfaces()
 			if err == nil {
@@ -7348,19 +7778,26 @@ func (c *containerLXC) fillNetworkDevice(name string, m types.Device) (types.Dev
 			}
 
 			// Update the database
-			err = query.Retry(func() error { return updateKey(configKey, volatileHwaddr) })
-			if err != nil {
-				// Check if something else filled it in behind our back
-				value, err1 := c.state.Cluster.ContainerConfigGet(c.id, configKey)
-				if err1 != nil || value == "" {
-					return nil, err
+			err = query.Retry(func() error {
+				err := updateKey(configKey, volatileHwaddr)
+				if err != nil {
+					// Check if something else filled it in behind our back
+					value, err1 := c.state.Cluster.ContainerConfigGet(c.id, configKey)
+					if err1 != nil || value == "" {
+						return err
+					}
+
+					c.localConfig[configKey] = value
+					c.expandedConfig[configKey] = value
+					return nil
 				}
 
-				c.localConfig[configKey] = value
-				c.expandedConfig[configKey] = value
-			} else {
 				c.localConfig[configKey] = volatileHwaddr
 				c.expandedConfig[configKey] = volatileHwaddr
+				return nil
+			})
+			if err != nil {
+				return nil, err
 			}
 		}
 		newDevice["hwaddr"] = volatileHwaddr
@@ -7539,16 +7976,25 @@ func (c *containerLXC) removeNetworkDevice(name string, m types.Device) error {
 	}
 
 	// For some reason, having network config confuses detach, so get our own go-lxc struct
-	cc, err := lxc.NewContainer(c.Name(), c.state.OS.LxcPath)
+	cname := projectPrefix(c.Project(), c.Name())
+	cc, err := lxc.NewContainer(cname, c.state.OS.LxcPath)
 	if err != nil {
 		return err
 	}
-	defer lxc.Release(cc)
+	defer cc.Release()
 
-	// Remove the interface from the container
-	err = cc.DetachInterfaceRename(m["name"], hostName)
+	// Check if interface exists inside container namespace
+	ifaces, err := cc.Interfaces()
 	if err != nil {
-		return fmt.Errorf("Failed to detach interface: %s: %s", m["name"], err)
+		return fmt.Errorf("Failed to list network interfaces: %v", err)
+	}
+
+	// Remove the interface from the container if it exists
+	if shared.StringInSlice(m["name"], ifaces) {
+		err = cc.DetachInterfaceRename(m["name"], hostName)
+		if err != nil {
+			return fmt.Errorf("Failed to detach interface: %s: %v", m["name"], err)
+		}
 	}
 
 	// If a veth, destroy it
@@ -7687,7 +8133,7 @@ func (c *containerLXC) createDiskDevice(name string, m types.Device) (string, er
 	}
 
 	// Mount the fs
-	err := deviceMountDisk(srcPath, devPath, isReadOnly, isRecursive)
+	err := deviceMountDisk(srcPath, devPath, isReadOnly, isRecursive, m["propagation"])
 	if err != nil {
 		return "", err
 	}
@@ -7796,6 +8242,19 @@ func (c *containerLXC) removeDiskDevice(name string, m types.Device) error {
 	err = syscall.Unmount(devPath, syscall.MNT_DETACH)
 	if err != nil {
 		return err
+	}
+
+	// Check if pool-specific action should be taken
+	if m["pool"] != "" {
+		s, err := storagePoolVolumeInit(c.state, "default", m["pool"], m["source"], storagePoolVolumeTypeCustom)
+		if err != nil {
+			return err
+		}
+
+		_, err = s.StoragePoolVolumeUmount()
+		if err != nil {
+			return err
+		}
 	}
 
 	// Remove the host side
@@ -8287,6 +8746,10 @@ func (c *containerLXC) DaemonState() *state.State {
 	return c.state
 }
 
+func (c *containerLXC) Project() string {
+	return c.project
+}
+
 func (c *containerLXC) Name() string {
 	return c.name
 }
@@ -8309,15 +8772,23 @@ func (c *containerLXC) State() string {
 
 // Various container paths
 func (c *containerLXC) Path() string {
-	return containerPath(c.Name(), c.IsSnapshot())
+	name := projectPrefix(c.Project(), c.Name())
+	return containerPath(name, c.IsSnapshot())
 }
 
 func (c *containerLXC) DevicesPath() string {
-	return shared.VarPath("devices", c.Name())
+	name := projectPrefix(c.Project(), c.Name())
+	return shared.VarPath("devices", name)
+}
+
+func (c *containerLXC) ShmountsPath() string {
+	name := projectPrefix(c.Project(), c.Name())
+	return shared.VarPath("shmounts", name)
 }
 
 func (c *containerLXC) LogPath() string {
-	return shared.LogPath(c.Name())
+	name := projectPrefix(c.Project(), c.Name())
+	return shared.LogPath(name)
 }
 
 func (c *containerLXC) LogFilePath() string {
@@ -8349,7 +8820,7 @@ func (c *containerLXC) StatePath() string {
 }
 
 func (c *containerLXC) StoragePool() (string, error) {
-	poolName, err := c.state.Cluster.ContainerPool(c.Name())
+	poolName, err := c.state.Cluster.ContainerPool(c.Project(), c.Name())
 	if err != nil {
 		return "", err
 	}
@@ -8360,6 +8831,15 @@ func (c *containerLXC) StoragePool() (string, error) {
 // Progress tracking
 func (c *containerLXC) SetOperation(op *operation) {
 	c.op = op
+}
+
+func (c *containerLXC) ExpiryDate() time.Time {
+	if c.IsSnapshot() {
+		return c.expiryDate
+	}
+
+	// Return zero time if the container is not a snapshot
+	return time.Time{}
 }
 
 func (c *containerLXC) updateProgress(progress string) {

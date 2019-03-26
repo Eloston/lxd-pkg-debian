@@ -333,6 +333,26 @@ func (s *S) TestFloat(c *gc.C) {
 	c.Assert(err, gc.IsNil)
 	c.Assert(out, gc.Equals, float64(1.0))
 
+	out, err = sch.Coerce(int8(1), aPath)
+	c.Assert(err, gc.IsNil)
+	c.Assert(out, gc.Equals, float64(1))
+
+	out, err = sch.Coerce(int64( math.MaxInt64 ), aPath)
+	c.Assert(err, gc.IsNil)
+	c.Assert(out, gc.Equals, float64( math.MaxInt64 ))
+
+	out, err = sch.Coerce(int64( math.MinInt64 ), aPath)
+	c.Assert(err, gc.IsNil)
+	c.Assert(out, gc.Equals, float64( math.MinInt64 ))
+
+	out, err = sch.Coerce(uint64( 0 ), aPath)
+	c.Assert(err, gc.IsNil)
+	c.Assert(out, gc.Equals, float64( 0 ))
+
+	out, err = sch.Coerce(uint64( math.MaxUint64 ), aPath)
+	c.Assert(err, gc.IsNil)
+	c.Assert(out, gc.Equals, float64( math.MaxUint64 ))
+
 	out, err = sch.Coerce(true, aPath)
 	c.Assert(out, gc.IsNil)
 	c.Assert(err, gc.ErrorMatches, `<path>: expected float, got bool\(true\)`)

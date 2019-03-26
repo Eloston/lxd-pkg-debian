@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
-	"gopkg.in/macaroon-bakery.v2/httpbakery"
-	"gopkg.in/macaroon-bakery.v2/httpbakery/form"
 
 	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxc/config"
@@ -19,26 +17,31 @@ import (
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/logging"
 	"github.com/lxc/lxd/shared/version"
-
-	schemaform "gopkg.in/juju/environschema.v1/form"
 )
 
 type cmdGlobal struct {
 	conf     *config.Config
 	confPath string
 	cmd      *cobra.Command
+	ret      int
 
 	flagForceLocal bool
 	flagHelp       bool
 	flagHelpAll    bool
 	flagLogDebug   bool
 	flagLogVerbose bool
+	flagProject    string
+	flagQuiet      bool
 	flagVersion    bool
 }
 
 func main() {
 	// Process aliases
-	execIfAliases()
+	err := execIfAliases()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Setup the parser
 	app := &cobra.Command{}
@@ -56,8 +59,10 @@ For help with any of those, simply call them with --help.`))
 	app.PersistentFlags().BoolVar(&globalCmd.flagVersion, "version", false, i18n.G("Print version number"))
 	app.PersistentFlags().BoolVarP(&globalCmd.flagHelp, "help", "h", false, i18n.G("Print help"))
 	app.PersistentFlags().BoolVar(&globalCmd.flagForceLocal, "force-local", false, i18n.G("Force using the local unix socket"))
+	app.PersistentFlags().StringVar(&globalCmd.flagProject, "project", "", i18n.G("Override the source project"))
 	app.PersistentFlags().BoolVar(&globalCmd.flagLogDebug, "debug", false, i18n.G("Show all debug messages"))
 	app.PersistentFlags().BoolVarP(&globalCmd.flagLogVerbose, "verbose", "v", false, i18n.G("Show all information messages"))
+	app.PersistentFlags().BoolVarP(&globalCmd.flagQuiet, "quiet", "q", false, i18n.G("Don't show progress information"))
 
 	// Wrappers
 	app.PersistentPreRunE = globalCmd.PreRun
@@ -95,9 +100,17 @@ For help with any of those, simply call them with --help.`))
 	execCmd := cmdExec{global: &globalCmd}
 	app.AddCommand(execCmd.Command())
 
+	// export sub-command
+	exportCmd := cmdExport{global: &globalCmd}
+	app.AddCommand(exportCmd.Command())
+
 	// file sub-command
 	fileCmd := cmdFile{global: &globalCmd}
 	app.AddCommand(fileCmd.Command())
+
+	// import sub-command
+	importCmd := cmdImport{global: &globalCmd}
+	app.AddCommand(importCmd.Command())
 
 	// info sub-command
 	infoCmd := cmdInfo{global: &globalCmd}
@@ -150,6 +163,10 @@ For help with any of those, simply call them with --help.`))
 	// profile sub-command
 	profileCmd := cmdProfile{global: &globalCmd}
 	app.AddCommand(profileCmd.Command())
+
+	// profile sub-command
+	projectCmd := cmdProject{global: &globalCmd}
+	app.AddCommand(projectCmd.Command())
 
 	// query sub-command
 	queryCmd := cmdQuery{global: &globalCmd}
@@ -206,7 +223,7 @@ For help with any of those, simply call them with --help.`))
 	help.Flags().BoolVar(&globalCmd.flagHelpAll, "all", false, i18n.G("Show less common commands"))
 
 	// Deal with --all flag
-	err := app.ParseFlags(os.Args[1:])
+	err = app.ParseFlags(os.Args[1:])
 	if err == nil {
 		if globalCmd.flagHelpAll {
 			// Show all commands
@@ -220,6 +237,10 @@ For help with any of those, simply call them with --help.`))
 	err = app.Execute()
 	if err != nil {
 		os.Exit(1)
+	}
+
+	if globalCmd.ret != 0 {
+		os.Exit(globalCmd.ret)
 	}
 }
 
@@ -260,6 +281,11 @@ func (c *cmdGlobal) PreRun(cmd *cobra.Command, args []string) error {
 		c.conf = config.NewConfig(filepath.Dir(c.confPath), true)
 	}
 
+	// Override the project
+	if c.flagProject != "" {
+		c.conf.ProjectOverride = c.flagProject
+	}
+
 	// Setup password helper
 	c.conf.PromptPassword = func(filename string) (string, error) {
 		return cli.AskPasswordOnce(fmt.Sprintf(i18n.G("Password for %s: "), filename)), nil
@@ -297,15 +323,6 @@ func (c *cmdGlobal) PreRun(cmd *cobra.Command, args []string) error {
 		}
 
 		fmt.Fprintf(os.Stderr, i18n.G("To start your first container, try: lxc launch ubuntu:18.04")+"\n\n")
-	}
-
-	// Only setup macaroons if a config path exists (so the jar can be saved)
-	if shared.PathExists(c.confPath) {
-		// Add interactor for external authentication
-		c.conf.SetAuthInteractor([]httpbakery.Interactor{
-			form.Interactor{Filler: schemaform.IOFiller{}},
-			httpbakery.WebBrowserInteractor{},
-		})
 	}
 
 	// Set the user agent

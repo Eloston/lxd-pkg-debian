@@ -46,6 +46,15 @@ type Config struct {
 	//
 	// It can be updated after the endpoints are up using UpdateNetworkAddress().
 	NetworkAddress string
+
+	// Optional dedicated network address for clustering traffic. If not
+	// set, NetworkAddress will be used.
+	ClusterAddress string
+
+	// DebugSetAddress sets the address for the pprof endpoint.
+	//
+	// It can be updated after the endpoints are up using UpdateDebugAddress().
+	DebugAddress string
 }
 
 // Up brings up all applicable LXD endpoints and starts accepting HTTP
@@ -86,21 +95,27 @@ type Config struct {
 //
 // The network endpoint socket will use TLS encryption, using the certificate
 // keypair and CA passed via config.Cert.
+//
+// cluster endpoint (TCP socket with TLS)
+// -------------------------------------
+//
+// If a network address was set via config.ClusterAddress, then attach
+// config.RestServer to it.
 func Up(config *Config) (*Endpoints, error) {
 	if config.Dir == "" {
-		return nil, fmt.Errorf("no directory configured")
+		return nil, fmt.Errorf("No directory configured")
 	}
 	if config.UnixSocket == "" {
-		return nil, fmt.Errorf("no unix socket configured")
+		return nil, fmt.Errorf("No unix socket configured")
 	}
 	if config.RestServer == nil {
-		return nil, fmt.Errorf("no REST server configured")
+		return nil, fmt.Errorf("No REST server configured")
 	}
 	if config.DevLxdServer == nil {
-		return nil, fmt.Errorf("no devlxd server configured")
+		return nil, fmt.Errorf("No devlxd server configured")
 	}
 	if config.Cert == nil {
-		return nil, fmt.Errorf("no TLS certificate configured")
+		return nil, fmt.Errorf("No TLS certificate configured")
 	}
 
 	endpoints := &Endpoints{
@@ -141,6 +156,8 @@ func (e *Endpoints) up(config *Config) error {
 		devlxd:  config.DevLxdServer,
 		local:   config.RestServer,
 		network: config.RestServer,
+		cluster: config.RestServer,
+		pprof:   pprofCreateServer(),
 	}
 	e.cert = config.Cert
 	e.inherited = map[kind]bool{}
@@ -179,6 +196,28 @@ func (e *Endpoints) up(config *Config) error {
 
 		// Errors here are not fatal and are just logged.
 		e.listeners[network] = networkCreateListener(config.NetworkAddress, e.cert)
+
+		isCovered := util.IsAddressCovered(config.ClusterAddress, config.NetworkAddress)
+		if config.ClusterAddress != "" && !isCovered {
+			e.listeners[cluster], err = clusterCreateListener(config.ClusterAddress, e.cert)
+			if err != nil {
+				return err
+			}
+
+			logger.Infof("Starting cluster handler:")
+			e.serveHTTP(cluster)
+		}
+
+	}
+
+	if config.DebugAddress != "" {
+		e.listeners[pprof], err = pprofCreateListener(config.DebugAddress)
+		if err != nil {
+			return err
+		}
+
+		logger.Infof("Starting pprof handler:")
+		e.serveHTTP(pprof)
 	}
 
 	logger.Infof("Starting /dev/lxd handler:")
@@ -196,20 +235,41 @@ func (e *Endpoints) Down() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	logger.Infof("Stopping REST API handler:")
-	err := e.closeListener(network)
-	if err != nil {
-		return err
-	}
-	err = e.closeListener(local)
-	if err != nil {
-		return err
+	if e.listeners[network] != nil || e.listeners[local] != nil {
+		logger.Infof("Stopping REST API handler:")
+		err := e.closeListener(network)
+		if err != nil {
+			return err
+		}
+
+		err = e.closeListener(local)
+		if err != nil {
+			return err
+		}
 	}
 
-	logger.Infof("Stopping /dev/lxd handler")
-	err = e.closeListener(devlxd)
-	if err != nil {
-		return err
+	if e.listeners[cluster] != nil {
+		logger.Infof("Stopping cluster handler:")
+		err := e.closeListener(cluster)
+		if err != nil {
+			return err
+		}
+	}
+
+	if e.listeners[devlxd] != nil {
+		logger.Infof("Stopping /dev/lxd handler:")
+		err := e.closeListener(devlxd)
+		if err != nil {
+			return err
+		}
+	}
+
+	if e.listeners[pprof] != nil {
+		logger.Infof("Stopping pprof handler:")
+		err := e.closeListener(pprof)
+		if err != nil {
+			return err
+		}
 	}
 
 	if e.tomb != nil {
@@ -292,6 +352,8 @@ const (
 	local kind = iota
 	devlxd
 	network
+	pprof
+	cluster
 )
 
 // Human-readable descriptions of the various kinds of endpoints.
@@ -299,4 +361,6 @@ var descriptions = map[kind]string{
 	local:   "Unix socket",
 	devlxd:  "devlxd socket",
 	network: "TCP socket",
+	pprof:   "pprof socket",
+	cluster: "cluster socket",
 }

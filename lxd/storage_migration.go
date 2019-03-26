@@ -10,7 +10,6 @@ import (
 	"github.com/lxc/lxd/lxd/migration"
 	"github.com/lxc/lxd/lxd/types"
 	"github.com/lxc/lxd/shared"
-	"github.com/lxc/lxd/shared/idmap"
 	"github.com/lxc/lxd/shared/logger"
 )
 
@@ -41,8 +40,9 @@ type MigrationStorageSourceDriver interface {
 }
 
 type rsyncStorageSourceDriver struct {
-	container container
-	snapshots []container
+	container     container
+	snapshots     []container
+	rsyncFeatures []string
 }
 
 func (s rsyncStorageSourceDriver) Snapshots() []container {
@@ -66,7 +66,7 @@ func (s rsyncStorageSourceDriver) SendStorageVolume(conn *websocket.Conn, op *op
 	path := getStoragePoolVolumeMountPoint(pool.Name, volume.Name)
 	path = shared.AddSlash(path)
 	logger.Debugf("Starting to send storage volume %s on storage pool %s from %s", volume.Name, pool.Name, path)
-	return RsyncSend(volume.Name, path, conn, wrapper, bwlimit, state.OS.ExecPath)
+	return RsyncSend(volume.Name, path, conn, wrapper, s.rsyncFeatures, bwlimit, state.OS.ExecPath)
 }
 
 func (s rsyncStorageSourceDriver) SendWhileRunning(conn *websocket.Conn, op *operation, bwlimit string, containerOnly bool) error {
@@ -85,7 +85,7 @@ func (s rsyncStorageSourceDriver) SendWhileRunning(conn *websocket.Conn, op *ope
 			path := send.Path()
 			wrapper := StorageProgressReader(op, "fs_progress", send.Name())
 			state := s.container.DaemonState()
-			err = RsyncSend(ctName, shared.AddSlash(path), conn, wrapper, bwlimit, state.OS.ExecPath)
+			err = RsyncSend(projectPrefix(s.container.Project(), ctName), shared.AddSlash(path), conn, wrapper, s.rsyncFeatures, bwlimit, state.OS.ExecPath)
 			if err != nil {
 				return err
 			}
@@ -94,38 +94,70 @@ func (s rsyncStorageSourceDriver) SendWhileRunning(conn *websocket.Conn, op *ope
 
 	wrapper := StorageProgressReader(op, "fs_progress", s.container.Name())
 	state := s.container.DaemonState()
-	return RsyncSend(ctName, shared.AddSlash(s.container.Path()), conn, wrapper, bwlimit, state.OS.ExecPath)
+
+	// Attempt to freeze the container to avoid changing files during transfer
+	if s.container.IsRunning() {
+		err := s.container.Freeze()
+		if err != nil {
+			logger.Errorf("Unable to freeze container during live-migration")
+		} else {
+			defer s.container.Unfreeze()
+		}
+	}
+
+	return RsyncSend(projectPrefix(s.container.Project(), ctName), shared.AddSlash(s.container.Path()), conn, wrapper, s.rsyncFeatures, bwlimit, state.OS.ExecPath)
 }
 
 func (s rsyncStorageSourceDriver) SendAfterCheckpoint(conn *websocket.Conn, bwlimit string) error {
 	ctName, _, _ := containerGetParentAndSnapshotName(s.container.Name())
 	// resync anything that changed between our first send and the checkpoint
 	state := s.container.DaemonState()
-	return RsyncSend(ctName, shared.AddSlash(s.container.Path()), conn, nil, bwlimit, state.OS.ExecPath)
+	return RsyncSend(projectPrefix(s.container.Project(), ctName), shared.AddSlash(s.container.Path()), conn, nil, s.rsyncFeatures, bwlimit, state.OS.ExecPath)
 }
 
 func (s rsyncStorageSourceDriver) Cleanup() {
 	// noop
 }
 
-func rsyncStorageMigrationSource() (MigrationStorageSourceDriver, error) {
-	return rsyncStorageSourceDriver{nil, nil}, nil
+func rsyncStorageMigrationSource(args MigrationSourceArgs) (MigrationStorageSourceDriver, error) {
+	return rsyncStorageSourceDriver{nil, nil, args.RsyncFeatures}, nil
 }
 
-func rsyncMigrationSource(c container, containerOnly bool) (MigrationStorageSourceDriver, error) {
+func rsyncRefreshSource(refreshSnapshots []string, args MigrationSourceArgs) (MigrationStorageSourceDriver, error) {
+	var snapshots = []container{}
+	if !args.ContainerOnly {
+		allSnapshots, err := args.Container.Snapshots()
+		if err != nil {
+			return nil, err
+		}
+
+		for _, snap := range allSnapshots {
+			_, snapName, _ := containerGetParentAndSnapshotName(snap.Name())
+			if !shared.StringInSlice(snapName, refreshSnapshots) {
+				continue
+			}
+
+			snapshots = append(snapshots, snap)
+		}
+	}
+
+	return rsyncStorageSourceDriver{args.Container, snapshots, args.RsyncFeatures}, nil
+}
+
+func rsyncMigrationSource(args MigrationSourceArgs) (MigrationStorageSourceDriver, error) {
 	var err error
 	var snapshots = []container{}
-	if !containerOnly {
-		snapshots, err = c.Snapshots()
+	if !args.ContainerOnly {
+		snapshots, err = args.Container.Snapshots()
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return rsyncStorageSourceDriver{c, snapshots}, nil
+	return rsyncStorageSourceDriver{args.Container, snapshots, args.RsyncFeatures}, nil
 }
 
-func snapshotProtobufToContainerArgs(containerName string, snap *migration.Snapshot) db.ContainerArgs {
+func snapshotProtobufToContainerArgs(project string, containerName string, snap *migration.Snapshot) db.ContainerArgs {
 	config := map[string]string{}
 
 	for _, ent := range snap.LocalConfig {
@@ -152,6 +184,7 @@ func snapshotProtobufToContainerArgs(containerName string, snap *migration.Snaps
 		Name:         name,
 		Profiles:     snap.Profiles,
 		Stateful:     snap.GetStateful(),
+		Project:      project,
 	}
 
 	if snap.GetCreationDate() != 0 {
@@ -165,43 +198,43 @@ func snapshotProtobufToContainerArgs(containerName string, snap *migration.Snaps
 	return args
 }
 
-func rsyncStorageMigrationSink(conn *websocket.Conn, op *operation, storage storage, args MigrationSinkArgs) error {
-	err := storage.StoragePoolVolumeCreate()
+func rsyncStorageMigrationSink(conn *websocket.Conn, op *operation, args MigrationSinkArgs) error {
+	err := args.Storage.StoragePoolVolumeCreate()
 	if err != nil {
 		return err
 	}
 
-	ourMount, err := storage.StoragePoolVolumeMount()
+	ourMount, err := args.Storage.StoragePoolVolumeMount()
 	if err != nil {
 		return err
 	}
 	if ourMount {
-		defer storage.StoragePoolVolumeUmount()
+		defer args.Storage.StoragePoolVolumeUmount()
 	}
 
-	pool := storage.GetStoragePool()
-	volume := storage.GetStoragePoolVolume()
+	pool := args.Storage.GetStoragePool()
+	volume := args.Storage.GetStoragePoolVolume()
 
 	wrapper := StorageProgressWriter(op, "fs_progress", volume.Name)
 	path := getStoragePoolVolumeMountPoint(pool.Name, volume.Name)
 	path = shared.AddSlash(path)
 	logger.Debugf("Starting to receive storage volume %s on storage pool %s into %s", volume.Name, pool.Name, path)
-	return RsyncRecv(path, conn, wrapper, args.RsyncArgs)
+	return RsyncRecv(path, conn, wrapper, args.RsyncFeatures)
 }
 
-func rsyncMigrationSink(live bool, container container, snapshots []*migration.Snapshot, conn *websocket.Conn, srcIdmap *idmap.IdmapSet, op *operation, containerOnly bool, args MigrationSinkArgs) error {
-	ourStart, err := container.StorageStart()
+func rsyncMigrationSink(conn *websocket.Conn, op *operation, args MigrationSinkArgs) error {
+	ourStart, err := args.Container.StorageStart()
 	if err != nil {
 		return err
 	}
 	if ourStart {
-		defer container.StorageStop()
+		defer args.Container.StorageStop()
 	}
 
 	// At this point we have already figured out the parent container's root
 	// disk device so we can simply retrieve it from the expanded devices.
 	parentStoragePool := ""
-	parentExpandedDevices := container.ExpandedDevices()
+	parentExpandedDevices := args.Container.ExpandedDevices()
 	parentLocalRootDiskDeviceKey, parentLocalRootDiskDevice, _ := shared.GetRootDiskDevice(parentExpandedDevices)
 	if parentLocalRootDiskDeviceKey != "" {
 		parentStoragePool = parentLocalRootDiskDevice["pool"]
@@ -212,11 +245,32 @@ func rsyncMigrationSink(live bool, container container, snapshots []*migration.S
 		return fmt.Errorf("the container's root device is missing the pool property")
 	}
 
-	isDirBackend := container.Storage().GetStorageType() == storageTypeDir
+	localSnapshots, err := args.Container.Snapshots()
+	if err != nil {
+		return err
+	}
+
+	isDirBackend := args.Container.Storage().GetStorageType() == storageTypeDir
 	if isDirBackend {
-		if !containerOnly {
-			for _, snap := range snapshots {
-				snapArgs := snapshotProtobufToContainerArgs(container.Name(), snap)
+		if !args.ContainerOnly {
+			for _, snap := range args.Snapshots {
+				isSnapshotOutdated := true
+
+				for _, localSnap := range localSnapshots {
+					if localSnap.Name() == snap.GetName() {
+						if localSnap.CreationDate().Unix() > snap.GetCreationDate() {
+							isSnapshotOutdated = false
+							break
+						}
+					}
+				}
+
+				// Only copy snapshot if it's outdated
+				if !isSnapshotOutdated {
+					continue
+				}
+
+				snapArgs := snapshotProtobufToContainerArgs(args.Container.Project(), args.Container.Name(), snap)
 
 				// Ensure that snapshot and parent container have the
 				// same storage pool in their local root disk device.
@@ -230,32 +284,54 @@ func rsyncMigrationSink(live bool, container container, snapshots []*migration.S
 					}
 				}
 
-				s, err := containerCreateEmptySnapshot(container.DaemonState(), snapArgs)
+				// Try and a load container
+				s, err := containerLoadByProjectAndName(args.Container.DaemonState(),
+					args.Container.Project(), snapArgs.Name)
 				if err != nil {
-					return err
+					// Create the snapshot since it doesn't seem to exist
+					s, err = containerCreateEmptySnapshot(args.Container.DaemonState(), snapArgs)
+					if err != nil {
+						return err
+					}
 				}
 
 				wrapper := StorageProgressWriter(op, "fs_progress", s.Name())
-				if err := RsyncRecv(shared.AddSlash(s.Path()), conn, wrapper, args.RsyncArgs); err != nil {
+				if err := RsyncRecv(shared.AddSlash(s.Path()), conn, wrapper, args.RsyncFeatures); err != nil {
 					return err
 				}
 
-				err = ShiftIfNecessary(container, srcIdmap)
+				err = ShiftIfNecessary(args.Container, args.Idmap)
 				if err != nil {
 					return err
 				}
 			}
 		}
 
-		wrapper := StorageProgressWriter(op, "fs_progress", container.Name())
-		err = RsyncRecv(shared.AddSlash(container.Path()), conn, wrapper, args.RsyncArgs)
+		wrapper := StorageProgressWriter(op, "fs_progress", args.Container.Name())
+		err = RsyncRecv(shared.AddSlash(args.Container.Path()), conn, wrapper, args.RsyncFeatures)
 		if err != nil {
 			return err
 		}
 	} else {
-		if !containerOnly {
-			for _, snap := range snapshots {
-				snapArgs := snapshotProtobufToContainerArgs(container.Name(), snap)
+		if !args.ContainerOnly {
+			for _, snap := range args.Snapshots {
+				isSnapshotOutdated := true
+
+				for _, localSnap := range localSnapshots {
+					if localSnap.Name() == snap.GetName() {
+						if localSnap.CreationDate().Unix() > snap.GetCreationDate() {
+							isSnapshotOutdated = false
+							break
+						}
+					}
+				}
+
+				// Only copy snapshot if it's outdated
+				if !isSnapshotOutdated {
+					continue
+				}
+
+				snapArgs := snapshotProtobufToContainerArgs(args.Container.Project(), args.Container.Name(), snap)
 
 				// Ensure that snapshot and parent container have the
 				// same storage pool in their local root disk device.
@@ -270,40 +346,44 @@ func rsyncMigrationSink(live bool, container container, snapshots []*migration.S
 				}
 
 				wrapper := StorageProgressWriter(op, "fs_progress", snap.GetName())
-				err := RsyncRecv(shared.AddSlash(container.Path()), conn, wrapper, args.RsyncArgs)
+				err := RsyncRecv(shared.AddSlash(args.Container.Path()), conn, wrapper, args.RsyncFeatures)
 				if err != nil {
 					return err
 				}
 
-				err = ShiftIfNecessary(container, srcIdmap)
+				err = ShiftIfNecessary(args.Container, args.Idmap)
 				if err != nil {
 					return err
 				}
 
-				_, err = containerCreateAsSnapshot(container.DaemonState(), snapArgs, container)
+				_, err = containerLoadByProjectAndName(args.Container.DaemonState(),
+					args.Container.Project(), snapArgs.Name)
 				if err != nil {
-					return err
+					_, err = containerCreateAsSnapshot(args.Container.DaemonState(), snapArgs, args.Container)
+					if err != nil {
+						return err
+					}
 				}
 			}
 		}
 
-		wrapper := StorageProgressWriter(op, "fs_progress", container.Name())
-		err = RsyncRecv(shared.AddSlash(container.Path()), conn, wrapper, args.RsyncArgs)
+		wrapper := StorageProgressWriter(op, "fs_progress", args.Container.Name())
+		err = RsyncRecv(shared.AddSlash(args.Container.Path()), conn, wrapper, args.RsyncFeatures)
 		if err != nil {
 			return err
 		}
 	}
 
-	if live {
+	if args.Live {
 		/* now receive the final sync */
-		wrapper := StorageProgressWriter(op, "fs_progress", container.Name())
-		err := RsyncRecv(shared.AddSlash(container.Path()), conn, wrapper, args.RsyncArgs)
+		wrapper := StorageProgressWriter(op, "fs_progress", args.Container.Name())
+		err := RsyncRecv(shared.AddSlash(args.Container.Path()), conn, wrapper, args.RsyncFeatures)
 		if err != nil {
 			return err
 		}
 	}
 
-	err = ShiftIfNecessary(container, srcIdmap)
+	err = ShiftIfNecessary(args.Container, args.Idmap)
 	if err != nil {
 		return err
 	}

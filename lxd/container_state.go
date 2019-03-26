@@ -14,10 +14,11 @@ import (
 )
 
 func containerState(d *Daemon, r *http.Request) Response {
+	project := projectParam(r)
 	name := mux.Vars(r)["name"]
 
 	// Handle requests targeted to a container on a different node
-	response, err := ForwardedResponseIfContainerIsRemote(d, r, name)
+	response, err := ForwardedResponseIfContainerIsRemote(d, r, project, name)
 	if err != nil {
 		return SmartError(err)
 	}
@@ -25,7 +26,7 @@ func containerState(d *Daemon, r *http.Request) Response {
 		return response
 	}
 
-	c, err := containerLoadByName(d.State(), name)
+	c, err := containerLoadByProjectAndName(d.State(), project, name)
 	if err != nil {
 		return SmartError(err)
 	}
@@ -38,10 +39,11 @@ func containerState(d *Daemon, r *http.Request) Response {
 }
 
 func containerStatePut(d *Daemon, r *http.Request) Response {
+	project := projectParam(r)
 	name := mux.Vars(r)["name"]
 
 	// Handle requests targeted to a container on a different node
-	response, err := ForwardedResponseIfContainerIsRemote(d, r, name)
+	response, err := ForwardedResponseIfContainerIsRemote(d, r, project, name)
 	if err != nil {
 		return SmartError(err)
 	}
@@ -62,16 +64,16 @@ func containerStatePut(d *Daemon, r *http.Request) Response {
 	// Don't mess with containers while in setup mode
 	<-d.readyChan
 
-	c, err := containerLoadByName(d.State(), name)
+	c, err := containerLoadByProjectAndName(d.State(), project, name)
 	if err != nil {
 		return SmartError(err)
 	}
 
-	var opDescription string
+	var opType db.OperationType
 	var do func(*operation) error
 	switch shared.ContainerAction(raw.Action) {
 	case shared.Start:
-		opDescription = "Starting container"
+		opType = db.OperationContainerStart
 		do = func(op *operation) error {
 			c.SetOperation(op)
 			if err = c.Start(raw.Stateful); err != nil {
@@ -80,7 +82,7 @@ func containerStatePut(d *Daemon, r *http.Request) Response {
 			return nil
 		}
 	case shared.Stop:
-		opDescription = "Stopping container"
+		opType = db.OperationContainerStop
 		if raw.Stateful {
 			do = func(op *operation) error {
 				c.SetOperation(op)
@@ -120,7 +122,7 @@ func containerStatePut(d *Daemon, r *http.Request) Response {
 			}
 		}
 	case shared.Restart:
-		opDescription = "Restarting container"
+		opType = db.OperationContainerRestart
 		do = func(op *operation) error {
 			c.SetOperation(op)
 			ephemeral := c.IsEphemeral()
@@ -134,6 +136,7 @@ func containerStatePut(d *Daemon, r *http.Request) Response {
 					Devices:      c.LocalDevices(),
 					Ephemeral:    false,
 					Profiles:     c.Profiles(),
+					Project:      c.Project(),
 				}
 
 				err := c.Update(args, false)
@@ -176,7 +179,7 @@ func containerStatePut(d *Daemon, r *http.Request) Response {
 			return BadRequest(fmt.Errorf("This system doesn't support freezing containers"))
 		}
 
-		opDescription = "Freezing container"
+		opType = db.OperationContainerFreeze
 		do = func(op *operation) error {
 			c.SetOperation(op)
 			return c.Freeze()
@@ -186,7 +189,7 @@ func containerStatePut(d *Daemon, r *http.Request) Response {
 			return BadRequest(fmt.Errorf("This system doesn't support unfreezing containers"))
 		}
 
-		opDescription = "Unfreezing container"
+		opType = db.OperationContainerUnfreeze
 		do = func(op *operation) error {
 			c.SetOperation(op)
 			return c.Unfreeze()
@@ -198,7 +201,7 @@ func containerStatePut(d *Daemon, r *http.Request) Response {
 	resources := map[string][]string{}
 	resources["containers"] = []string{name}
 
-	op, err := operationCreate(d.cluster, operationClassTask, opDescription, resources, nil, do, nil, nil)
+	op, err := operationCreate(d.cluster, project, operationClassTask, opType, resources, nil, do, nil, nil)
 	if err != nil {
 		return InternalError(err)
 	}

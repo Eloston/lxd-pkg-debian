@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -144,7 +146,9 @@ func (c *cmdProfileAdd) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf(i18n.G("Profile %s added to %s")+"\n", args[1], resource.name)
+	if !c.global.flagQuiet {
+		fmt.Printf(i18n.G("Profile %s added to %s")+"\n", args[1], resource.name)
+	}
 
 	return nil
 }
@@ -222,7 +226,9 @@ func (c *cmdProfileAssign) Run(cmd *cobra.Command, args []string) error {
 		args[1] = i18n.G("(none)")
 	}
 
-	fmt.Printf(i18n.G("Profiles %s applied to %s")+"\n", args[1], resource.name)
+	if !c.global.flagQuiet {
+		fmt.Printf(i18n.G("Profiles %s applied to %s")+"\n", args[1], resource.name)
+	}
 
 	return nil
 }
@@ -330,7 +336,10 @@ func (c *cmdProfileCreate) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf(i18n.G("Profile %s created")+"\n", resource.name)
+	if !c.global.flagQuiet {
+		fmt.Printf(i18n.G("Profile %s created")+"\n", resource.name)
+	}
+
 	return nil
 }
 
@@ -378,7 +387,9 @@ func (c *cmdProfileDelete) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf(i18n.G("Profile %s deleted")+"\n", resource.name)
+	if !c.global.flagQuiet {
+		fmt.Printf(i18n.G("Profile %s deleted")+"\n", resource.name)
+	}
 
 	return nil
 }
@@ -556,8 +567,9 @@ func (c *cmdProfileGet) Run(cmd *cobra.Command, args []string) error {
 
 // List
 type cmdProfileList struct {
-	global  *cmdGlobal
-	profile *cmdProfile
+	global     *cmdGlobal
+	profile    *cmdProfile
+	flagFormat string
 }
 
 func (c *cmdProfileList) Command() *cobra.Command {
@@ -569,6 +581,7 @@ func (c *cmdProfileList) Command() *cobra.Command {
 		`List profiles`))
 
 	cmd.RunE = c.Run
+	cmd.Flags().StringVar(&c.flagFormat, "format", "table", i18n.G("Format (csv|json|table|yaml)")+"``")
 
 	return cmd
 }
@@ -605,16 +618,49 @@ func (c *cmdProfileList) Run(cmd *cobra.Command, args []string) error {
 		data = append(data, []string{profile.Name, strUsedBy})
 	}
 
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetAutoWrapText(false)
-	table.SetAlignment(tablewriter.ALIGN_LEFT)
-	table.SetRowLine(true)
-	table.SetHeader([]string{
+	header := []string{
 		i18n.G("NAME"),
-		i18n.G("USED BY")})
-	sort.Sort(byName(data))
-	table.AppendBulk(data)
-	table.Render()
+		i18n.G("USED BY")}
+
+	switch c.flagFormat {
+	case listFormatTable:
+		table := tablewriter.NewWriter(os.Stdout)
+		table.SetAutoWrapText(false)
+		table.SetAlignment(tablewriter.ALIGN_LEFT)
+		table.SetRowLine(true)
+		table.SetHeader(header)
+		sort.Sort(byName(data))
+		table.AppendBulk(data)
+		table.Render()
+
+	case listFormatCSV:
+		sort.Sort(byName(data))
+		data = append(data, []string{})
+		copy(data[1:], data[0:])
+		data[0] = header
+		w := csv.NewWriter(os.Stdout)
+		w.WriteAll(data)
+		if err := w.Error(); err != nil {
+			return err
+		}
+
+	case listFormatJSON:
+		enc := json.NewEncoder(os.Stdout)
+		err := enc.Encode(profiles)
+		if err != nil {
+			return err
+		}
+
+	case listFormatYAML:
+		out, err := yaml.Marshal(profiles)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s", out)
+
+	default:
+		return fmt.Errorf(i18n.G("Invalid format %q"), c.flagFormat)
+	}
 
 	return nil
 }
@@ -687,7 +733,10 @@ func (c *cmdProfileRemove) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf(i18n.G("Profile %s removed from %s")+"\n", args[1], resource.name)
+	if !c.global.flagQuiet {
+		fmt.Printf(i18n.G("Profile %s removed from %s")+"\n", args[1], resource.name)
+	}
+
 	return nil
 }
 
@@ -735,7 +784,9 @@ func (c *cmdProfileRename) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf(i18n.G("Profile %s renamed to %s")+"\n", resource.name, args[1])
+	if !c.global.flagQuiet {
+		fmt.Printf(i18n.G("Profile %s renamed to %s")+"\n", resource.name, args[1])
+	}
 
 	return nil
 }

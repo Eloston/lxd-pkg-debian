@@ -45,7 +45,7 @@ import (
 
 // A Daemon can respond to requests from a shared client.
 type Daemon struct {
-	clientCerts  []x509.Certificate
+	clientCerts  map[string]x509.Certificate
 	os           *sys.OS
 	db           *db.Node
 	maas         *maas.Controller
@@ -156,35 +156,60 @@ type Command struct {
 	patch         func(d *Daemon, r *http.Request) Response
 }
 
-// Check whether the request comes from a trusted client.
+// Convenience function around Authenticate
 func (d *Daemon) checkTrustedClient(r *http.Request) error {
-	// Check the cluster certificate first, so we return an error if the
-	// notification header is set but the client is not presenting the
-	// cluster certificate (iow this request does not appear to come from a
-	// cluster node).
-	cert, _ := x509.ParseCertificate(d.endpoints.NetworkCert().KeyPair().Certificate[0])
-	clusterCerts := []x509.Certificate{*cert}
+	trusted, _, err := d.Authenticate(r)
+	if !trusted || err != nil {
+		if err != nil {
+			return err
+		}
+
+		return fmt.Errorf("Not authorized")
+	}
+
+	return nil
+}
+
+// Authenticate validates an incoming http Request
+// It will check over what protocol it came, what type of request it is and
+// will validate the TLS certificate or Macaroon.
+//
+// This does not perform authorization, only validates authentication
+func (d *Daemon) Authenticate(r *http.Request) (bool, string, error) {
+	// Allow internal cluster traffic
 	if r.TLS != nil {
+		cert, _ := x509.ParseCertificate(d.endpoints.NetworkCert().KeyPair().Certificate[0])
+		clusterCerts := map[string]x509.Certificate{"0": *cert}
 		for i := range r.TLS.PeerCertificates {
-			if util.CheckTrustState(*r.TLS.PeerCertificates[i], clusterCerts) {
-				return nil
+			trusted, _ := util.CheckTrustState(*r.TLS.PeerCertificates[i], clusterCerts)
+			if trusted {
+				return true, "", nil
 			}
 		}
 	}
-	if isClusterNotification(r) {
-		return fmt.Errorf("cluster notification not using cluster certificate")
-	}
 
+	// Local unix socket queries
 	if r.RemoteAddr == "@" {
-		// Unix socket
-		return nil
+		return true, "", nil
 	}
 
+	// Devlxd unix socket credentials on main API
+	if r.RemoteAddr == "@devlxd" {
+		return false, "", fmt.Errorf("Main API query can't come from /dev/lxd socket")
+	}
+
+	// Cluster notification with wrong certificate
+	if isClusterNotification(r) {
+		return false, "", fmt.Errorf("Cluster notification isn't using cluster certificate")
+	}
+
+	// Bad query, no TLS found
 	if r.TLS == nil {
-		return fmt.Errorf("no TLS")
+		return false, "", fmt.Errorf("Bad/missing TLS on network query")
 	}
 
 	if d.externalAuth != nil && r.Header.Get(httpbakery.BakeryProtocolHeader) != "" {
+		// Validate external authentication
 		ctx := httpbakery.ContextWithRequest(context.TODO(), r)
 		authChecker := d.externalAuth.bakery.Checker.Auth(httpbakery.RequestMacaroons(r)...)
 
@@ -193,17 +218,31 @@ func (d *Daemon) checkTrustedClient(r *http.Request) error {
 			Action: r.Method,
 		}}
 
-		_, err := authChecker.Allow(ctx, ops...)
-		return err
+		info, err := authChecker.Allow(ctx, ops...)
+		if err != nil {
+			// Bad macaroon
+			return false, "", err
+		}
+
+		if info != nil && info.Identity != nil {
+			// Valid identity macaroon found
+			return true, info.Identity.Id(), nil
+		}
+
+		// Valid macaroon with no identity information
+		return true, "", nil
 	}
 
+	// Validate normal TLS access
 	for i := range r.TLS.PeerCertificates {
-		if util.CheckTrustState(*r.TLS.PeerCertificates[i], d.clientCerts) {
-			return nil
+		trusted, username := util.CheckTrustState(*r.TLS.PeerCertificates[i], d.clientCerts)
+		if trusted {
+			return true, username, nil
 		}
 	}
 
-	return fmt.Errorf("unauthorized")
+	// Reject unauthorized
+	return false, "", nil
 }
 
 func writeMacaroonsRequiredResponse(b *identchecker.Bakery, r *http.Request, w http.ResponseWriter, derr *bakery.DischargeRequiredError, expiry int64) {
@@ -242,7 +281,7 @@ func isJSONRequest(r *http.Request) bool {
 	return false
 }
 
-// State creates a new State instance liked to our internal db and os.
+// State creates a new State instance linked to our internal db and os.
 func (d *Daemon) State() *state.State {
 	return state.NewState(d.db, d.cluster, d.maas, d.os, d.endpoints)
 }
@@ -279,27 +318,33 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c Command) {
 			return
 		}
 
+		// Authentication
+		trusted, username, err := d.Authenticate(r)
+		if err != nil {
+			// If not a macaroon discharge request, return the error
+			_, ok := err.(*bakery.DischargeRequiredError)
+			if !ok {
+				InternalError(err).Render(w)
+				return
+			}
+		}
+
 		untrustedOk := (r.Method == "GET" && c.untrustedGet) || (r.Method == "POST" && c.untrustedPost)
-		err := d.checkTrustedClient(r)
-		if err == nil {
-			logger.Debug(
-				"handling",
-				log.Ctx{"method": r.Method, "url": r.URL.RequestURI(), "ip": r.RemoteAddr})
+		if trusted {
+			logger.Debug("Handling", log.Ctx{"method": r.Method, "url": r.URL.RequestURI(), "ip": r.RemoteAddr, "user": username})
+			r = r.WithContext(context.WithValue(r.Context(), "username", username))
 		} else if untrustedOk && r.Header.Get("X-LXD-authenticated") == "" {
-			logger.Debug(
-				fmt.Sprintf("allowing untrusted %s", r.Method),
-				log.Ctx{"url": r.URL.RequestURI(), "ip": r.RemoteAddr})
+			logger.Debug(fmt.Sprintf("Allowing untrusted %s", r.Method), log.Ctx{"url": r.URL.RequestURI(), "ip": r.RemoteAddr})
 		} else if derr, ok := err.(*bakery.DischargeRequiredError); ok {
 			writeMacaroonsRequiredResponse(d.externalAuth.bakery, r, w, derr, d.externalAuth.expiry)
 			return
 		} else {
-			logger.Warn(
-				"rejecting request from untrusted client",
-				log.Ctx{"ip": r.RemoteAddr})
+			logger.Warn("Rejecting request from untrusted client", log.Ctx{"ip": r.RemoteAddr})
 			Forbidden(nil).Render(w)
 			return
 		}
 
+		// Dump full request JSON when in debug mode
 		if debug && r.Method != "GET" && isJSONRequest(r) {
 			newBody := &bytes.Buffer{}
 			captured := &bytes.Buffer{}
@@ -313,6 +358,7 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c Command) {
 			shared.DebugJson(captured)
 		}
 
+		// Actually process the request
 		var resp Response
 		resp = NotImplemented(nil)
 
@@ -341,6 +387,7 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c Command) {
 			resp = NotFound(fmt.Errorf("Method '%s' not found", r.Method))
 		}
 
+		// Handle errors
 		if err := resp.Render(w); err != nil {
 			err := InternalError(err).Render(w)
 			if err != nil {
@@ -440,6 +487,13 @@ func (d *Daemon) init() error {
 		logger.Infof(" - netnsid-based network retrieval: no")
 	}
 
+	d.os.UeventInjection = CanUseUeventInjection()
+	if d.os.UeventInjection {
+		logger.Infof(" - uevent injection: yes")
+	} else {
+		logger.Infof(" - uevent injection: no")
+	}
+
 	/*
 	 * During daemon startup we're the only thread that touches VFS3Fscaps
 	 * so we don't need to bother with atomic.StoreInt32() when touching
@@ -522,7 +576,17 @@ func (d *Daemon) init() error {
 
 	address, err := node.HTTPSAddress(d.db)
 	if err != nil {
-		return errors.Wrap(err, "failed to fetch node address")
+		return errors.Wrap(err, "Failed to fetch node address")
+	}
+
+	clusterAddress, err := node.ClusterAddress(d.db)
+	if err != nil {
+		return errors.Wrap(err, "Failed to fetch cluster address")
+	}
+
+	debugAddress, err := node.DebugAddress(d.db)
+	if err != nil {
+		return errors.Wrap(err, "Failed to fetch debug address")
 	}
 
 	/* Setup the web server */
@@ -534,6 +598,8 @@ func (d *Daemon) init() error {
 		DevLxdServer:         DevLxdServer(d),
 		LocalUnixSocketGroup: d.config.Group,
 		NetworkAddress:       address,
+		ClusterAddress:       clusterAddress,
+		DebugAddress:         debugAddress,
 	}
 	d.endpoints, err = endpoints.Up(config)
 	if err != nil {
@@ -555,7 +621,7 @@ func (d *Daemon) init() error {
 		}
 
 		d.cluster, err = db.OpenCluster(
-			"db.bin", store, address, dir,
+			"db.bin", store, clusterAddress, dir,
 			d.config.DqliteSetupTimeout,
 			dqlite.WithDialFunc(d.gateway.DialFunc()),
 			dqlite.WithContext(d.gateway.Context()),
@@ -753,6 +819,9 @@ func (d *Daemon) startClusterTasks() {
 	// Cluster update trigger
 	d.clusterTasks.Add(cluster.KeepUpdated(d.State()))
 
+	// Auto-sync images across the cluster (daily)
+	d.clusterTasks.Add(autoSyncImagesTask(d))
+
 	// Start all background tasks
 	d.clusterTasks.Start()
 }
@@ -791,6 +860,15 @@ func (d *Daemon) Ready() error {
 
 		// Auto-update instance types (daily)
 		d.tasks.Add(instanceRefreshTypesTask(d))
+
+		// Remove expired container backups (hourly)
+		d.tasks.Add(pruneExpiredContainerBackupsTask(d))
+
+		// Take snapshot of containers (minutely check of configurable cron expression)
+		d.tasks.Add(autoCreateContainerSnapshotsTask(d))
+
+		// Remove expired container snapshots (minutely)
+		d.tasks.Add(pruneExpiredContainerSnapshotsTask(d))
 	}
 
 	// Start all background tasks

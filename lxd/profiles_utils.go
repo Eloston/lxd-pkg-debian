@@ -6,13 +6,12 @@ import (
 
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/db/query"
-	"github.com/lxc/lxd/lxd/types"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/pkg/errors"
 )
 
-func doProfileUpdate(d *Daemon, name string, id int64, profile *api.Profile, req api.ProfilePut) error {
+func doProfileUpdate(d *Daemon, project, name string, id int64, profile *api.Profile, req api.ProfilePut) error {
 	// Sanity checks
 	err := containerValidConfig(d.os, req.Config, true, false)
 	if err != nil {
@@ -24,7 +23,7 @@ func doProfileUpdate(d *Daemon, name string, id int64, profile *api.Profile, req
 		return err
 	}
 
-	containers, err := getProfileContainersInfo(d.cluster, name)
+	containers, err := getProfileContainersInfo(d.cluster, project, name)
 	if err != nil {
 		return errors.Wrapf(err, "failed to query containers associated with profile '%s'", name)
 	}
@@ -44,7 +43,7 @@ func doProfileUpdate(d *Daemon, name string, id int64, profile *api.Profile, req
 			// Check what profile the device comes from
 			profiles := container.Profiles
 			for i := len(profiles) - 1; i >= 0; i-- {
-				_, profile, err := d.cluster.ProfileGet(profiles[i])
+				_, profile, err := d.cluster.ProfileGet("default", profiles[i])
 				if err != nil {
 					return err
 				}
@@ -150,7 +149,7 @@ func doProfileUpdate(d *Daemon, name string, id int64, profile *api.Profile, req
 
 // Like doProfileUpdate but does not update the database, since it was already
 // updated by doProfileUpdate itself, called on the notifying node.
-func doProfileUpdateCluster(d *Daemon, name string, old api.ProfilePut) error {
+func doProfileUpdateCluster(d *Daemon, project, name string, old api.ProfilePut) error {
 	nodeName := ""
 	err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
 		var err error
@@ -161,7 +160,7 @@ func doProfileUpdateCluster(d *Daemon, name string, old api.ProfilePut) error {
 		return errors.Wrap(err, "failed to query local node name")
 	}
 
-	containers, err := getProfileContainersInfo(d.cluster, name)
+	containers, err := getProfileContainersInfo(d.cluster, project, name)
 	if err != nil {
 		return errors.Wrapf(err, "failed to query containers associated with profile '%s'", name)
 	}
@@ -192,39 +191,23 @@ func doProfileUpdateContainer(d *Daemon, name string, old api.ProfilePut, nodeNa
 		return nil
 	}
 
-	profileConfigs := make([]map[string]string, len(args.Profiles))
-	for i, profileName := range args.Profiles {
-		if profileName == name {
-			// Use the old config.
-			profileConfigs[i] = old.Config
-			continue
-		}
-		// Use the config currently in the database.
-		profileConfig, err := d.cluster.ProfileConfig(profileName)
-		if err != nil {
-			return errors.Wrapf(err, "failed to load profile config for '%s'", profileName)
-		}
-		profileConfigs[i] = profileConfig
+	profiles, err := d.cluster.ProfilesGet(args.Project, args.Profiles)
+	if err != nil {
+		return err
 	}
-
-	profileDevices := make([]types.Devices, len(args.Profiles))
 	for i, profileName := range args.Profiles {
 		if profileName == name {
-			// Use the old devices
-			profileDevices[i] = old.Devices
-			continue
+			// Use the old config and devices.
+			profiles[i].Config = old.Config
+			profiles[i].Devices = old.Devices
+			break
 		}
-		// Use the config currently in the database.
-		devices, err := d.cluster.Devices(profileName, true)
-		if err != nil {
-			return errors.Wrapf(err, "failed to load profile devices for '%s'", profileName)
-		}
-		profileDevices[i] = devices
 	}
 
 	c := containerLXCInstantiate(d.State(), args)
-	c.expandConfigFromProfiles(profileConfigs)
-	c.expandDevicesFromProfiles(profileDevices)
+
+	c.expandConfig(profiles)
+	c.expandDevices(profiles)
 
 	return c.Update(db.ContainerArgs{
 		Architecture: c.Architecture(),
@@ -233,25 +216,31 @@ func doProfileUpdateContainer(d *Daemon, name string, old api.ProfilePut, nodeNa
 		Devices:      c.LocalDevices(),
 		Ephemeral:    c.IsEphemeral(),
 		Profiles:     c.Profiles(),
+		Project:      c.Project(),
 	}, true)
 }
 
 // Query the db for information about containers associated with the given
 // profile.
-func getProfileContainersInfo(cluster *db.Cluster, profile string) ([]db.ContainerArgs, error) {
+func getProfileContainersInfo(cluster *db.Cluster, project, profile string) ([]db.ContainerArgs, error) {
 	// Query the db for information about containers associated with the
 	// given profile.
-	names, err := cluster.ProfileContainersGet(profile)
+	names, err := cluster.ProfileContainersGet(project, profile)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to query containers with profile '%s'", profile)
 	}
 	containers := make([]db.ContainerArgs, len(names))
 	for i, name := range names {
-		container, err := cluster.ContainerGet(name)
+		var container *db.Container
+		err := cluster.Transaction(func(tx *db.ClusterTx) error {
+			var err error
+			container, err = tx.ContainerGet(project, name)
+			return err
+		})
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to query container '%s'", name)
+			return nil, errors.Wrapf(err, "Failed to fetch container '%s'", name)
 		}
-		containers[i] = container
+		containers[i] = db.ContainerToArgs(container)
 	}
 
 	return containers, nil

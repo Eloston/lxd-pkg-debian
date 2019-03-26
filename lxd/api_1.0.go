@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 
@@ -37,6 +38,9 @@ var api10 = []Command{
 	clusterCmd,
 	clusterNodeCmd,
 	clusterNodesCmd,
+	containerBackupCmd,
+	containerBackupExportCmd,
+	containerBackupsCmd,
 	containerCmd,
 	containerConsoleCmd,
 	containerExecCmd,
@@ -58,12 +62,15 @@ var api10 = []Command{
 	networkCmd,
 	networkLeasesCmd,
 	networksCmd,
+	networkStateCmd,
 	operationCmd,
 	operationsCmd,
 	operationWait,
 	operationWebsocket,
 	profileCmd,
 	profilesCmd,
+	projectCmd,
+	projectsCmd,
 	serverResourceCmd,
 	serverResourceCmd,
 	storagePoolCmd,
@@ -71,7 +78,11 @@ var api10 = []Command{
 	storagePoolsCmd,
 	storagePoolVolumesCmd,
 	storagePoolVolumesTypeCmd,
-	storagePoolVolumeTypeCmd,
+	storagePoolVolumeTypeContainerCmd,
+	storagePoolVolumeTypeCustomCmd,
+	storagePoolVolumeTypeImageCmd,
+	storagePoolVolumeSnapshotsTypeCmd,
+	storagePoolVolumeSnapshotTypeCmd,
 }
 
 func api10Get(d *Daemon, r *http.Request) Response {
@@ -161,6 +172,11 @@ func api10Get(d *Daemon, r *http.Request) Response {
 		architectures = append(architectures, architectureName)
 	}
 
+	project := r.FormValue("project")
+	if project == "" {
+		project = "default"
+	}
+
 	env := api.ServerEnvironment{
 		Addresses:              addresses,
 		Architectures:          architectures,
@@ -171,6 +187,7 @@ func api10Get(d *Daemon, r *http.Request) Response {
 		Kernel:                 uname.Sysname,
 		KernelArchitecture:     uname.Machine,
 		KernelVersion:          uname.Release,
+		Project:                project,
 		Server:                 "lxd",
 		ServerPid:              os.Getpid(),
 		ServerVersion:          version.Version,
@@ -269,8 +286,7 @@ func api10Patch(d *Daemon, r *http.Request) Response {
 }
 
 func doApi10Update(d *Daemon, req api.ServerPut, patch bool) Response {
-	// The HTTPS address and maas machine are the only config keys that we
-	// want to save in the node-level database, so handle it here.
+	// First deal with config specific to the local daemon
 	nodeValues := map[string]interface{}{}
 
 	for key := range node.ConfigSchema {
@@ -287,8 +303,18 @@ func doApi10Update(d *Daemon, req api.ServerPut, patch bool) Response {
 		var err error
 		newNodeConfig, err = node.ConfigLoad(tx)
 		if err != nil {
-			return errors.Wrap(err, "failed to load node config")
+			return errors.Wrap(err, "Failed to load node config")
 		}
+
+		// We currently don't allow changing the cluster.https_address
+		// once it's set.
+		curClusterAddress := newNodeConfig.ClusterAddress()
+		newClusterAddress, ok := nodeValues["cluster.https_address"]
+
+		if ok && curClusterAddress != "" && !util.IsAddressCovered(newClusterAddress.(string), curClusterAddress) {
+			return fmt.Errorf("Changing cluster.https_address is currently not supported")
+		}
+
 		if patch {
 			nodeChanged, err = newNodeConfig.Patch(nodeValues)
 		} else {
@@ -305,13 +331,14 @@ func doApi10Update(d *Daemon, req api.ServerPut, patch bool) Response {
 		}
 	}
 
+	// Then deal with cluster wide configuration
 	var clusterChanged map[string]string
 	var newClusterConfig *cluster.Config
 	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
 		var err error
 		newClusterConfig, err = cluster.ConfigLoad(tx)
 		if err != nil {
-			return errors.Wrap(err, "failed to load cluster config")
+			return errors.Wrap(err, "Failed to load cluster config")
 		}
 		if patch {
 			clusterChanged, err = newClusterConfig.Patch(req.Config)
@@ -329,6 +356,7 @@ func doApi10Update(d *Daemon, req api.ServerPut, patch bool) Response {
 		}
 	}
 
+	// Notify the other nodes about changes
 	notifier, err := cluster.NewNotifier(d.State(), d.endpoints.NetworkCert(), cluster.NotifyAlive)
 	if err != nil {
 		return SmartError(err)
@@ -393,17 +421,41 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 			}
 		}
 	}
-	for key, value := range nodeChanged {
-		switch key {
-		case "maas.machine":
-			maasChanged = true
-		case "core.https_address":
-			err := d.endpoints.NetworkUpdateAddress(value)
-			if err != nil {
-				return err
-			}
+
+	// Look for changed values. We do it sequentially because some keys are
+	// correlated with others, and need to be processed first (for example
+	// core.https_address need to be processed before
+	// cluster.https_address).
+
+	_, ok := nodeChanged["maas.machine"]
+	if ok {
+		maasChanged = true
+	}
+
+	value, ok := nodeChanged["core.https_address"]
+	if ok {
+		err := d.endpoints.NetworkUpdateAddress(value)
+		if err != nil {
+			return err
 		}
 	}
+
+	value, ok = nodeChanged["cluster.https_address"]
+	if ok {
+		err := d.endpoints.ClusterUpdateAddress(value)
+		if err != nil {
+			return err
+		}
+	}
+
+	value, ok = nodeChanged["core.debug_address"]
+	if ok {
+		err := d.endpoints.PprofUpdateAddress(value)
+		if err != nil {
+			return err
+		}
+	}
+
 	if maasChanged {
 		url, key := clusterConfig.MAASController()
 		machine := nodeConfig.MAASMachine()

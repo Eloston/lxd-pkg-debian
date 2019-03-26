@@ -88,13 +88,66 @@ func (r *ProtocolLXD) CreateContainerFromBackup(args ContainerBackupArgs) (Opera
 		return nil, fmt.Errorf("The server is missing the required \"container_backup\" API extension")
 	}
 
-	// Send the request
-	op, _, err := r.queryOperation("POST", "/containers", args.BackupFile, "")
+	if args.PoolName == "" {
+		// Send the request
+		op, _, err := r.queryOperation("POST", "/containers", args.BackupFile, "")
+		if err != nil {
+			return nil, err
+		}
+
+		return op, nil
+	}
+
+	if !r.HasExtension("container_backup_override_pool") {
+		return nil, fmt.Errorf("The server is missing the required \"container_backup_override_pool\" API extension")
+	}
+
+	// Prepare the HTTP request
+	reqURL, err := r.setQueryAttributes(fmt.Sprintf("%s/1.0/containers", r.httpHost))
 	if err != nil {
 		return nil, err
 	}
 
-	return op, nil
+	req, err := http.NewRequest("POST", reqURL, args.BackupFile)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-LXD-pool", args.PoolName)
+
+	// Set the user agent
+	if r.httpUserAgent != "" {
+		req.Header.Set("User-Agent", r.httpUserAgent)
+	}
+
+	// Send the request
+	resp, err := r.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	// Handle errors
+	response, _, err := lxdParseResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get to the operation
+	respOperation, err := response.MetadataAsOperation()
+	if err != nil {
+		return nil, err
+	}
+
+	// Setup an Operation wrapper
+	op := operation{
+		Operation: *respOperation,
+		r:         r,
+		chActive:  make(chan bool),
+	}
+
+	return &op, nil
 }
 
 // CreateContainer requests that LXD creates a new container
@@ -753,6 +806,12 @@ func (r *ProtocolLXD) ExecContainer(containerName string, exec api.ContainerExec
 
 				if fds["0"] != "" {
 					args.Stdin.Close()
+
+					// Empty the stdin channel but don't block on it as
+					// stdin may be stuck in Read()
+					go func() {
+						<-dones[0]
+					}()
 				}
 
 				for _, conn := range conns {
@@ -979,6 +1038,11 @@ func (r *ProtocolLXD) GetContainerSnapshot(containerName string, name string) (*
 
 // CreateContainerSnapshot requests that LXD creates a new snapshot for the container
 func (r *ProtocolLXD) CreateContainerSnapshot(containerName string, snapshot api.ContainerSnapshotsPost) (Operation, error) {
+	// Validate the request
+	if snapshot.ExpiresAt != nil && !r.HasExtension("snapshot_expiry_creation") {
+		return nil, fmt.Errorf("The server is missing the required \"snapshot_expiry_creation\" API extension")
+	}
+
 	// Send the request
 	op, _, err := r.queryOperation("POST", fmt.Sprintf("/containers/%s/snapshots", url.QueryEscape(containerName)), snapshot, "")
 	if err != nil {
@@ -1260,6 +1324,22 @@ func (r *ProtocolLXD) MigrateContainerSnapshot(containerName string, name string
 func (r *ProtocolLXD) DeleteContainerSnapshot(containerName string, name string) (Operation, error) {
 	// Send the request
 	op, _, err := r.queryOperation("DELETE", fmt.Sprintf("/containers/%s/snapshots/%s", url.QueryEscape(containerName), url.QueryEscape(name)), nil, "")
+	if err != nil {
+		return nil, err
+	}
+
+	return op, nil
+}
+
+// UpdateContainerSnapshot requests that LXD updates the container snapshot
+func (r *ProtocolLXD) UpdateContainerSnapshot(containerName string, name string, container api.ContainerSnapshotPut, ETag string) (Operation, error) {
+	if !r.HasExtension("snapshot_expiry") {
+		return nil, fmt.Errorf("The server is missing the required \"snapshot_expiry\" API extension")
+	}
+
+	// Send the request
+	op, _, err := r.queryOperation("PUT", fmt.Sprintf("/containers/%s/snapshots/%s",
+		url.QueryEscape(containerName), url.QueryEscape(name)), container, ETag)
 	if err != nil {
 		return nil, err
 	}

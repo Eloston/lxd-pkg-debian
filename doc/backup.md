@@ -37,12 +37,22 @@ to that secondary server every so often, allowing it to act as either an
 offline spare or just as a storage server that you can copy your
 containers back from if needed.
 
+## Container backups
+The `lxc export` command can be used to export containers to a backup tarball.
+Those tarballs will include all snapshots by default and an "optimized"
+tarball can be obtained if you know that you'll be restoring on a LXD
+server using the same storage pool backend.
+
+Those tarballs can be saved any way you want on any filesystem you want
+and can be imported back into LXD using the `lxc import` command.
+
 ## Disaster recovery
 Additionally, LXD maintains a `backup.yaml` file in each container's storage
 volume. This file contains all necessary information to recover a given
 container, such as container configuration, attached devices and storage.
 
-This file can be processed by the `lxd import` command.
+This file can be processed by the `lxd import` command, not to
+be confused with `lxc import`.
 
 To use the disaster recovery mechanism, you must mount the container's
 storage to its expected location, usually under

@@ -563,7 +563,7 @@ func storagePoolDelete(d *Daemon, r *http.Request) Response {
 	}
 
 	for _, volume := range volumeNames {
-		_, imgInfo, err := d.cluster.ImageGet(volume, false, false)
+		_, imgInfo, err := d.cluster.ImageGet("default", volume, false, false)
 		if err != nil {
 			return InternalError(err)
 		}
@@ -622,7 +622,7 @@ func storagePoolDeleteCheckPreconditions(cluster *db.Cluster, poolName string, p
 	}
 
 	if len(volumeNames) > 0 {
-		volumes, err := cluster.StoragePoolVolumesGet(poolID, supportedVolumeTypes)
+		volumes, err := cluster.StoragePoolVolumesGet("default", poolID, supportedVolumeTypes)
 		if err != nil {
 			return InternalError(err)
 		}

@@ -214,7 +214,11 @@ func (c *cmdImageCopy) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Register progress handler
-	progress := utils.ProgressRenderer{Format: i18n.G("Copying the image: %s")}
+	progress := utils.ProgressRenderer{
+		Format: i18n.G("Copying the image: %s"),
+		Quiet:  c.global.flagQuiet,
+	}
+
 	_, err = op.AddHandler(progress.UpdateOp)
 	if err != nil {
 		progress.Done("")
@@ -491,7 +495,11 @@ func (c *cmdImageExport) Run(cmd *cobra.Command, args []string) error {
 	defer destRootfs.Close()
 
 	// Prepare the download request
-	progress := utils.ProgressRenderer{Format: i18n.G("Exporting the image: %s")}
+	progress := utils.ProgressRenderer{
+		Format: i18n.G("Exporting the image: %s"),
+		Quiet:  c.global.flagQuiet,
+	}
+
 	req := lxd.ImageFileRequest{
 		MetaFile:        io.WriteSeeker(dest),
 		RootfsFile:      io.WriteSeeker(destRootfs),
@@ -687,7 +695,11 @@ func (c *cmdImageImport) Run(cmd *cobra.Command, args []string) error {
 		image.Properties[strings.TrimSpace(fields[0])] = strings.TrimSpace(fields[1])
 	}
 
-	progress := utils.ProgressRenderer{Format: i18n.G("Transferring image: %s")}
+	progress := utils.ProgressRenderer{
+		Format: i18n.G("Transferring image: %s"),
+		Quiet:  c.global.flagQuiet,
+	}
+
 	if strings.HasPrefix(imageFile, "https://") {
 		image.Source = &api.ImagesPostSource{}
 		image.Source.Type = "url"
@@ -908,11 +920,13 @@ Column shorthand chars:
 
     l - Shortest image alias (and optionally number of other aliases)
     L - Newline-separated list of all image aliases
-    f - Fingerprint
+    f - Fingerprint (short)
+    F - Fingerprint (long)
     p - Whether image is public
     d - Description
     a - Architecture
-    s - Size`))
+    s - Size
+    u - Upload date`))
 
 	cmd.Flags().StringVarP(&c.flagColumns, "columns", "c", "lfpdasu", i18n.G("Columns")+"``")
 	cmd.Flags().StringVar(&c.flagFormat, "format", "table", i18n.G("Format (csv|json|table|yaml)")+"``")
@@ -926,6 +940,7 @@ func (c *cmdImageList) parseColumns() ([]imageColumn, error) {
 		'l': {i18n.G("ALIAS"), c.aliasColumnData},
 		'L': {i18n.G("ALIASES"), c.aliasesColumnData},
 		'f': {i18n.G("FINGERPRINT"), c.fingerprintColumnData},
+		'F': {i18n.G("FINGERPRINT"), c.fingerprintFullColumnData},
 		'p': {i18n.G("PUBLIC"), c.publicColumnData},
 		'd': {i18n.G("DESCRIPTION"), c.descriptionColumnData},
 		'a': {i18n.G("ARCH"), c.architectureColumnData},
@@ -973,6 +988,10 @@ func (c *cmdImageList) aliasesColumnData(image api.Image) string {
 
 func (c *cmdImageList) fingerprintColumnData(image api.Image) string {
 	return image.Fingerprint[0:12]
+}
+
+func (c *cmdImageList) fingerprintFullColumnData(image api.Image) string {
+	return image.Fingerprint
 }
 
 func (c *cmdImageList) publicColumnData(image api.Image) string {
@@ -1042,6 +1061,7 @@ func (c *cmdImageList) imageShouldShow(filters []string, state *api.Image) bool 
 
 			for configKey, configValue := range state.Properties {
 				list := cmdList{}
+				list.global = c.global
 				if list.dotPrefixMatch(key, configKey) {
 					//try to test filter value as a regexp
 					regexpValue := value
@@ -1241,7 +1261,11 @@ func (c *cmdImageRefresh) Run(cmd *cobra.Command, args []string) error {
 		}
 
 		image := c.image.dereferenceAlias(resource.server, resource.name)
-		progress := utils.ProgressRenderer{Format: i18n.G("Refreshing the image: %s")}
+		progress := utils.ProgressRenderer{
+			Format: i18n.G("Refreshing the image: %s"),
+			Quiet:  c.global.flagQuiet,
+		}
+
 		op, err := resource.server.RefreshImage(image)
 		if err != nil {
 			return err

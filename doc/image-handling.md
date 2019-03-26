@@ -1,4 +1,5 @@
 # Image handling
+
 ## Introduction
 LXD uses an image based workflow. It comes with a built-in image store
 where the user or external tools can import images.
@@ -101,9 +102,7 @@ creation_date: 1424284563
 properties:
   description: Ubuntu 14.04 LTS Intel 64bit
   os: Ubuntu
-  release:
-    - trusty
-    - 14.04
+  release: trusty 14.04
 templates:
   /etc/hosts:
     when:

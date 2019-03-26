@@ -455,9 +455,130 @@ Adds a `nvidia_runtime` config option for containers, setting this to
 true will have the NVIDIA runtime and CUDA libraries passed to the
 container.
 
+## container\_mount\_propagation
+This adds a new "propagation" option to the disk device type, allowing
+the configuration of kernel mount propagation.
+
+## container\_backup
+Add container backup support.
+
+This includes the following new endpoints (see [RESTful API](rest-api.md) for details):
+
+* `GET /1.0/containers/<name>/backups`
+* `POST /1.0/containers/<name>/backups`
+
+* `GET /1.0/containers/<name>/backups/<name>`
+* `POST /1.0/containers/<name>/backups/<name>`
+* `DELETE /1.0/containers/<name>/backups/<name>`
+
+* `GET /1.0/containers/<name>/backups/<name>/export`
+
+The following existing endpoint has been modified:
+
+ * `POST /1.0/containers` accepts the new source type `backup`
+
+## devlxd\_images
+Adds a `security.devlxd.images` config option for containers which
+controls the availability of a `/1.0/images/FINGERPRINT/export` API over
+devlxd. This can be used by a container running nested LXD to access raw
+images from the host.
+
+## container\_local\_cross\_pool\_handling
+This enables copying or moving containers between storage pools on the same LXD
+instance.
+
+## proxy\_unix
+Add support for both unix sockets and abstract unix sockets in proxy devices.
+They can be used by specifying the address as `unix:/path/to/unix.sock` (normal
+socket) or `unix:@/tmp/unix.sock` (abstract socket).
+
+Supported connections are now:
+
+* `TCP <-> TCP`
+* `UNIX <-> UNIX`
+* `TCP <-> UNIX`
+* `UNIX <-> TCP`
+
+## proxy\_udp
+Add support for udp in proxy devices.
+
+Supported connections are now:
+
+* `TCP <-> TCP`
+* `UNIX <-> UNIX`
+* `TCP <-> UNIX`
+* `UNIX <-> TCP`
+* `UDP <-> UDP`
+* `TCP <-> UDP`
+* `UNIX <-> UDP`
+
+## clustering\_join
+This makes GET /1.0/cluster return information about which storage pools and
+networks are required to be created by joining nodes and which node-specific
+configuration keys they are required to use when creating them. Likewise the PUT
+/1.0/cluster endpoint now accepts the same format to pass information about
+storage pools and networks to be automatically created before attempting to join
+a cluster.
+
+## proxy\_tcp\_udp\_multi\_port\_handling
+Adds support for forwarding traffic for multiple ports. Forwarding is allowed
+between a range of ports if the port range is equal for source and target
+(for example `1.2.3.4 0-1000 -> 5.6.7.8 1000-2000`) and between a range of source
+ports and a single target port (for example `1.2.3.4 0-1000 -> 5.6.7.8 1000`).
+
+## network\_state
+Adds support for retrieving a network's state.
+
+This adds the following new endpoint (see [RESTful API](rest-api.md) for details):
+
+* `GET /1.0/networks/<name>/state`
+
+## proxy\_unix\_dac\_properties
+This adds support for gid, uid, and mode properties for non-abstract unix
+sockets.
+
+## container\_protection\_delete
+Enables setting the `security.protection.delete` field which prevents containers
+from being deleted if set to true. Snapshots are not affected by this setting.
+
+## proxy\_priv\_drop
+Adds security.uid and security.gid for the proxy devices, allowing
+privilege dropping and effectively changing the uid/gid used for
+connections to Unix sockets too.
+
+## pprof\_http
+This adds a new core.debug\_address config option to start a debugging HTTP server.
+
+That server currently includes a pprof API and replaces the old
+cpu-profile, memory-profile and print-goroutines debug options.
+
+## proxy\_haproxy\_protocol
+Adds a proxy\_protocol key to the proxy device which controls the use of the HAProxy PROXY protocol header.
+
+## network\_hwaddr
+Adds a bridge.hwaddr key to control the MAC address of the bridge.
+
+## proxy\_nat
+This adds optimized UDP/TCP proxying. If the configuration allows, proxying
+will be done via iptables instead of proxy devices.
+
+## network\_nat\_order
+This introduces the `ipv4.nat.order` and `ipv6.nat.order` configuration keys for LXD bridges.
+Those keys control whether to put the LXD rules before or after any pre-existing rules in the chain.
+
+## container\_full
+This introduces a new recursion=2 mode for `GET /1.0/containers` which allows for the retrieval of
+all container structs, including the state, snapshots and backup structs.
+
+This effectively allows for "lxc list" to get all it needs in one query.
+
 ## candid\_authentication
 This introduces the new candid.api.url config option and removes
 core.macaroon.endpoint.
+
+## backup\_compression
+This introduces a new backups.compression\_algorithm config key which
+allows configuration of backup compression.
 
 ## candid\_config
 This introduces the config keys `candid.domains` and `candid.expiry`. The
@@ -465,12 +586,110 @@ former allows specifying allowed/valid Candid domains, the latter makes the
 macaroon's expiry configurable. The `lxc remote add` command now has a
 `--domain` flag which allows specifying a Candid domain.
 
+## nvidia\_runtime\_config
+This introduces a few extra config keys when using nvidia.runtime and the libnvidia-container library.
+Those keys translate pretty much directly to the matching nvidia-container environment variables:
+
+ - nvidia.driver.capabilities => NVIDIA\_DRIVER\_CAPABILITIES
+ - nvidia.require.cuda => NVIDIA\_REQUIRE\_CUDA
+ - nvidia.require.driver => NVIDIA\_REQUIRE\_DRIVER
+
+## storage\_api\_volume\_snapshots
+Add support for storage volume snapshots. They work like container snapshots,
+only for volumes.
+
+This adds the following new endpoint (see [RESTful API](rest-api.md) for details):
+
+* `GET /1.0/storage-pools/<pool>/volumes/<type>/<name>/snapshots`
+* `POST /1.0/storage-pools/<pool>/volumes/<type>/<name>/snapshots`
+
+* `GET /1.0/storage-pools/<pool>/volumes/<type>/<volume>/snapshots/<name>`
+* `PUT /1.0/storage-pools/<pool>/volumes/<type>/<volume>/snapshots/<name>`
+* `POST /1.0/storage-pools/<pool>/volumes/<type>/<volume>/snapshots/<name>`
+* `DELETE /1.0/storage-pools/<pool>/volumes/<type>/<volume>/snapshots/<name>`
+
+## storage\_unmapped
+Introduces a new `security.unmapped` boolean on storage volumes.
+
+Setting it to true will flush the current map on the volume and prevent
+any further idmap tracking and remapping on the volume.
+
+This can be used to share data between isolated containers after
+attaching it to the container which requires write access.
+
+## projects
+Add a new project API, supporting creation, update and deletion of projects.
+
+Projects can hold containers, profiles or images at this point and let
+you get a separate view of your LXD resources by switching to it.
+
 ## candid\_config\_key
 This introduces a new `candid.api.key` option which allows for setting
 the expected public key for the endpoint, allowing for safe use of a
 HTTP-only candid server.
 
+## network\_vxlan\_ttl
+This adds a new `tunnel.NAME.ttl` network configuration option which
+makes it possible to raise the ttl on VXLAN tunnels.
+
+## container\_incremental\_copy
+This adds support for incremental container copy. When copying a container
+using the `--refresh` flag, only the missing or outdated files will be
+copied over. Should the target container not exist yet, a normal copy operation
+is performed.
+
 ## usb\_optional\_vendorid
 As the name implies, the `vendorid` field on USB devices attached to
 containers has now been made optional, allowing for all USB devices to
 be passed to a container (similar to what's done for GPUs).
+
+## snapshot\_scheduling
+This adds support for snapshot scheduling. It introduces three new
+configuration keys: `snapshots.schedule`, `snapshots.schedule.stopped`, and
+`snapshots.pattern`. Snapshots can be created automatically up to every minute.
+
+## container\_copy\_project
+Introduces a `project` field to the container source dict, allowing for
+copy/move of containers between projects.
+
+## clustering\_server\_address
+This adds support for configuring a server network address which differs from
+the REST API client network address. When bootstrapping a new cluster, clients
+can set the new ```cluster.https_address``` config key to specify the address of
+the initial server. When joining a new server, clients can set the
+```core.https_address``` config key of the joining server to the REST API
+address the joining server should listen at, and set the ```server_address```
+key in the ```PUT /1.0/cluster``` API to the address the joining server should
+use for clustering traffic (the value of ```server_address``` will be
+automatically copied to the ```cluster.https_address``` config key of the
+joining server).
+
+## clustering\_image\_replication
+Enable image replication across the nodes in the cluster.
+A new cluster.images_minimal_replica configuration key was introduced can be used
+to specify to the minimal numbers of nodes for image replication.
+
+## container\_protection\_shift
+Enables setting the `security.protection.shift` option which prevents containers
+from having their filesystem shifted.
+
+## snapshot\_expiry
+This adds support for snapshot expiration. The task is run minutely. The config
+option `snapshots.expiry` takes an expression in the form of `1M 2H 3d 4w 5m
+6y` (1 minute, 2 hours, 3 days, 4 weeks, 5 months, 6 weeks), however not all
+parts have to be used.
+
+Snapshots which are then created will be given an expiry date based on the
+expression. This expiry date, defined by `expires\_at`, can be manually edited
+using the API or `lxc config edit`. Snapshots with a valid expiry date will be
+removed when the task in run. Expiry can be disabled by setting `expires\_at` to
+an empty string or `0001-01-01T00:00:00Z` (zero time). This is the default if
+`snapshots.expiry` is not set.
+
+This adds the following new endpoint (see [RESTful API](rest-api.md) for details):
+
+* `PUT /1.0/containers/<name>/snapshots/<name>`
+
+## snapshot\_expiry\_creation
+Adds `expires\_at` to container creation, allowing for override of a
+snapshot's expiry at creation time.

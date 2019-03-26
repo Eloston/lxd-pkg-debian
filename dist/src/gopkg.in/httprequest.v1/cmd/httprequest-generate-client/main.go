@@ -1,4 +1,4 @@
-// +build go1.6
+// +build go1.8
 
 package main
 
@@ -10,14 +10,14 @@ import (
 	"go/build"
 	"go/format"
 	"go/parser"
+	"go/token"
+	"go/types"
 	"io/ioutil"
 	"os"
 	"strings"
 	"text/template"
 
-	"go/types"
-
-	"golang.org/x/tools/go/loader"
+	"golang.org/x/tools/go/packages"
 	"gopkg.in/errgo.v1"
 )
 
@@ -135,25 +135,27 @@ type method struct {
 	RespType  string
 }
 
+// serverMethods returns the list of server methods and required import packages
+// provided by the given server type within the given server package.
+//
+// The localPkg package will be the one that the code will be generated in.
 func serverMethods(serverPkg, serverType, localPkg string) ([]method, []string, error) {
-	cfg := loader.Config{
-		TypeCheckFuncBodies: func(string) bool {
-			return false
+	cfg := packages.Config{
+		Mode: packages.LoadAllSyntax,
+		ParseFile: func(fset *token.FileSet, filename string, src []byte) (*ast.File, error) {
+			return parser.ParseFile(fset, filename, src, parser.ParseComments)
 		},
-		ImportPkgs: map[string]bool{
-			serverPkg: false, // false means don't load tests.
-		},
-		ParserMode: parser.ParseComments,
 	}
-	prog, err := cfg.Load()
+	pkgs, err := packages.Load(&cfg, serverPkg)
 	if err != nil {
 		return nil, nil, errgo.Notef(err, "cannot load %q", serverPkg)
 	}
-	pkgInfo := prog.Imported[serverPkg]
-	if pkgInfo == nil {
-		return nil, nil, errgo.Newf("cannot find %q in imported code", serverPkg)
+	if len(pkgs) != 1 {
+		return nil, nil, errgo.Newf("packages.Load returned %d packages, not 1", len(pkgs))
 	}
-	pkg := pkgInfo.Pkg
+	pkgInfo := pkgs[0]
+	pkg := pkgInfo.Types
+
 	obj := pkg.Scope().Lookup(serverType)
 	if obj == nil {
 		return nil, nil, errgo.Newf("type %s not found in %s", serverType, serverPkg)
@@ -166,9 +168,9 @@ func serverMethods(serverPkg, serverType, localPkg string) ([]method, []string, 
 	ptrObjType := types.NewPointer(objTypeName.Type())
 
 	imports := map[string]string{
-		"gopkg.in/httprequest.v1":  "httprequest",
-		"golang.org/x/net/context": "context",
-		localPkg:                   "",
+		"gopkg.in/httprequest.v1": "httprequest",
+		"context":                 "context",
+		localPkg:                  "",
 	}
 	var methods []method
 	mset := types.NewMethodSet(ptrObjType)
@@ -186,7 +188,7 @@ func serverMethods(serverPkg, serverType, localPkg string) ([]method, []string, 
 			fmt.Fprintf(os.Stderr, "ignoring method %s: %v\n", name, err)
 			continue
 		}
-		comment := docComment(prog, sel)
+		comment := docComment(pkgInfo, sel)
 		methods = append(methods, method{
 			Name:      name,
 			Doc:       comment,
@@ -204,16 +206,18 @@ func serverMethods(serverPkg, serverType, localPkg string) ([]method, []string, 
 
 // docComment returns the doc comment for the method referred to
 // by the given selection.
-func docComment(prog *loader.Program, sel *types.Selection) string {
+func docComment(pkg *packages.Package, sel *types.Selection) string {
 	obj := sel.Obj()
-	tokFile := prog.Fset.File(obj.Pos())
+	tokFile := pkg.Fset.File(obj.Pos())
 	if tokFile == nil {
 		panic("no file found for method")
 	}
 	filename := tokFile.Name()
-	for _, pkgInfo := range prog.AllPackages {
-		for _, f := range pkgInfo.Files {
-			if tokFile := prog.Fset.File(f.Pos()); tokFile == nil || tokFile.Name() != filename {
+	comment := ""
+	declFound := false
+	packages.Visit([]*packages.Package{pkg}, func(pkg *packages.Package) bool {
+		for _, f := range pkg.Syntax {
+			if tokFile := pkg.Fset.File(f.Pos()); tokFile == nil || tokFile.Name() != filename {
 				continue
 			}
 			// We've found the file we're looking for. Now traverse all
@@ -222,12 +226,18 @@ func docComment(prog *loader.Program, sel *types.Selection) string {
 				fdecl, ok := decl.(*ast.FuncDecl)
 				if ok && fdecl.Name.Pos() == obj.Pos() {
 					// Found it!
-					return commentStr(fdecl.Doc)
+					comment = commentStr(fdecl.Doc)
+					declFound = true
+					return false
 				}
 			}
 		}
+		return true
+	}, nil)
+	if !declFound {
+		panic(fmt.Sprintf("method declaration not found"))
 	}
-	panic("method declaration not found")
+	return comment
 }
 
 func commentStr(c *ast.CommentGroup) string {

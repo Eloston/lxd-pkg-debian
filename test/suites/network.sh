@@ -11,6 +11,8 @@ test_network() {
   lxc network set lxdt$$ ipv4.routing false
   lxc network set lxdt$$ ipv6.routing false
   lxc network set lxdt$$ ipv6.dhcp.stateful true
+  lxc network set lxdt$$ bridge.hwaddr 00:11:22:33:44:55
+  [ "$(cat /sys/class/net/lxdt$$/address)" = "00:11:22:33:44:55" ]
 
   # validate unset and patch
   [ "$(lxc network get lxdt$$ ipv6.dhcp.stateful)" = "true" ]
@@ -56,7 +58,7 @@ test_network() {
   # shellcheck disable=SC2034
   for i in $(seq 10); do
     lxc info nettest | grep -q fd42 && SUCCESS=1 && break
-    sleep 1
+    sleep 0.5
   done
 
   [ "${SUCCESS}" = "0" ] && (echo "Container static IP wasn't applied" && false)

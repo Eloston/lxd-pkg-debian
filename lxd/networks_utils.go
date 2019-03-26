@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/version"
 )
@@ -550,14 +552,40 @@ func networkValidAddressCIDRV4(value string) error {
 	return nil
 }
 
-func networkValidAddressV4(value string) error {
+func networkValidAddress(value string) error {
 	if value == "" {
 		return nil
 	}
 
 	ip := net.ParseIP(value)
 	if ip == nil {
+		return fmt.Errorf("Not an IP address: %s", value)
+	}
+
+	return nil
+}
+
+func networkValidAddressV4(value string) error {
+	if value == "" {
+		return nil
+	}
+
+	ip := net.ParseIP(value)
+	if ip == nil || ip.To4() == nil {
 		return fmt.Errorf("Not an IPv4 address: %s", value)
+	}
+
+	return nil
+}
+
+func networkValidAddressV6(value string) error {
+	if value == "" {
+		return nil
+	}
+
+	ip := net.ParseIP(value)
+	if ip == nil || ip.To4() != nil {
+		return fmt.Errorf("Not an IPv6 address: %s", value)
 	}
 
 	return nil
@@ -656,6 +684,56 @@ func networkFanAddress(underlay *net.IPNet, overlay *net.IPNet) (string, string,
 	ipBytes[3] = 1
 
 	return fmt.Sprintf("%s/%d", ipBytes.String(), overlaySize), dev, ipStr, err
+}
+
+func networkKillForkDNS(name string) error {
+	// Check if we have a running forkdns at all
+	pidPath := shared.VarPath("networks", name, "forkdns.pid")
+	if !shared.PathExists(pidPath) {
+		return nil
+	}
+
+	// Grab the PID
+	content, err := ioutil.ReadFile(pidPath)
+	if err != nil {
+		return err
+	}
+	pid := strings.TrimSpace(string(content))
+
+	// Check for empty string
+	if pid == "" {
+		os.Remove(pidPath)
+		return nil
+	}
+
+	// Check if it's forkdns
+	cmdArgs, err := ioutil.ReadFile(fmt.Sprintf("/proc/%s/cmdline", pid))
+	if err != nil {
+		os.Remove(pidPath)
+		return nil
+	}
+
+	cmdFields := strings.Split(string(bytes.TrimRight(cmdArgs, string("\x00"))), string(byte(0)))
+	if len(cmdFields) < 5 || cmdFields[1] != "forkdns" {
+		os.Remove(pidPath)
+		return nil
+	}
+
+	// Parse the pid
+	pidInt, err := strconv.Atoi(pid)
+	if err != nil {
+		return err
+	}
+
+	// Actually kill the process
+	err = syscall.Kill(pidInt, syscall.SIGKILL)
+	if err != nil {
+		return err
+	}
+
+	// Cleanup
+	os.Remove(pidPath)
+	return nil
 }
 
 func networkKillDnsmasq(name string, reload bool) error {
@@ -797,7 +875,7 @@ func networkUpdateStatic(s *state.State, networkName string) error {
 				entries[d["parent"]] = [][]string{}
 			}
 
-			entries[d["parent"]] = append(entries[d["parent"]], []string{d["hwaddr"], c.Name(), d["ipv4.address"], d["ipv6.address"]})
+			entries[d["parent"]] = append(entries[d["parent"]], []string{d["hwaddr"], projectPrefix(c.Project(), c.Name()), d["ipv4.address"], d["ipv6.address"]})
 		}
 	}
 
@@ -903,13 +981,21 @@ func networkUpdateStatic(s *state.State, networkName string) error {
 	return nil
 }
 
-func networkSysctl(path string, value string) error {
+func networkSysctlGet(path string) (string, error) {
+	// Read the current content
 	content, err := ioutil.ReadFile(fmt.Sprintf("/proc/sys/net/%s", path))
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	if strings.TrimSpace(string(content)) == value {
+	return string(content), nil
+}
+
+func networkSysctlSet(path string, value string) error {
+	// Get current value
+	current, err := networkSysctlGet(path)
+	if err == nil && current == value {
+		// Nothing to update
 		return nil
 	}
 
@@ -1004,4 +1090,79 @@ func networkClearLease(s *state.State, name string, network string, hwaddr strin
 	}
 
 	return nil
+}
+
+func networkGetState(netIf net.Interface) api.NetworkState {
+	netState := "down"
+	netType := "unknown"
+
+	if netIf.Flags&net.FlagBroadcast > 0 {
+		netType = "broadcast"
+	}
+
+	if netIf.Flags&net.FlagPointToPoint > 0 {
+		netType = "point-to-point"
+	}
+
+	if netIf.Flags&net.FlagLoopback > 0 {
+		netType = "loopback"
+	}
+
+	if netIf.Flags&net.FlagUp > 0 {
+		netState = "up"
+	}
+
+	network := api.NetworkState{
+		Addresses: []api.NetworkStateAddress{},
+		Counters:  api.NetworkStateCounters{},
+		Hwaddr:    netIf.HardwareAddr.String(),
+		Mtu:       netIf.MTU,
+		State:     netState,
+		Type:      netType,
+	}
+
+	// Get address information
+	addrs, err := netIf.Addrs()
+	if err == nil {
+		for _, addr := range addrs {
+			fields := strings.SplitN(addr.String(), "/", 2)
+			if len(fields) != 2 {
+				continue
+			}
+
+			family := "inet"
+			if strings.Contains(fields[0], ":") {
+				family = "inet6"
+			}
+
+			scope := "global"
+			if strings.HasPrefix(fields[0], "127") {
+				scope = "local"
+			}
+
+			if fields[0] == "::1" {
+				scope = "local"
+			}
+
+			if strings.HasPrefix(fields[0], "169.254") {
+				scope = "link"
+			}
+
+			if strings.HasPrefix(fields[0], "fe80:") {
+				scope = "link"
+			}
+
+			address := api.NetworkStateAddress{}
+			address.Family = family
+			address.Address = fields[0]
+			address.Netmask = fields[1]
+			address.Scope = scope
+
+			network.Addresses = append(network.Addresses, address)
+		}
+	}
+
+	// Get counters
+	network.Counters = shared.NetworkGetCounters(netIf.Name)
+	return network
 }

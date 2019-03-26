@@ -2,6 +2,8 @@ package main
 
 import (
 	"crypto/x509"
+	"encoding/csv"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"net"
@@ -14,9 +16,7 @@ import (
 	"github.com/olekukonko/tablewriter"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh/terminal"
-	schemaform "gopkg.in/juju/environschema.v1/form"
-	"gopkg.in/macaroon-bakery.v2/httpbakery"
-	"gopkg.in/macaroon-bakery.v2/httpbakery/form"
+	"gopkg.in/yaml.v2"
 
 	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxc/config"
@@ -58,8 +58,8 @@ func (c *cmdRemote) Command() *cobra.Command {
 	cmd.AddCommand(remoteRemoveCmd.Command())
 
 	// Set default
-	remoteSetDefaultCmd := cmdRemoteSetDefault{global: c.global, remote: c}
-	cmd.AddCommand(remoteSetDefaultCmd.Command())
+	remoteSwitchCmd := cmdRemoteSwitch{global: c.global, remote: c}
+	cmd.AddCommand(remoteSwitchCmd.Command())
 
 	// Set URL
 	remoteSetURLCmd := cmdRemoteSetURL{global: c.global, remote: c}
@@ -128,10 +128,6 @@ func (c *cmdRemoteAdd) Run(cmd *cobra.Command, args []string) error {
 
 	if c.flagProtocol == "" {
 		c.flagProtocol = "lxd"
-	}
-
-	if c.flagAuthType == "" {
-		c.flagAuthType = "tls"
 	}
 
 	// Initialize the remotes list if needed
@@ -211,7 +207,7 @@ func (c *cmdRemoteAdd) Run(cmd *cobra.Command, args []string) error {
 	// Finally, actually add the remote, almost...  If the remote is a private
 	// HTTPS server then we need to ensure we have a client certificate before
 	// adding the remote server.
-	if rScheme != "unix" && !c.flagPublic && c.flagAuthType == "tls" {
+	if rScheme != "unix" && !c.flagPublic && (c.flagAuthType == "tls" || c.flagAuthType == "") {
 		if !conf.HasClientCertificate() {
 			fmt.Fprintf(os.Stderr, i18n.G("Generating a client certificate. This may take a minute...")+"\n")
 			err = conf.GenerateClientCertificate()
@@ -220,22 +216,7 @@ func (c *cmdRemoteAdd) Run(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
-	conf.Remotes[server] = config.Remote{Addr: addr, Protocol: c.flagProtocol, AuthType: c.flagAuthType}
-
-	conf.SetAuthInteractor([]httpbakery.Interactor{
-		form.Interactor{Filler: schemaform.IOFiller{}},
-		httpbakery.WebBrowserInteractor{
-			OpenWebBrowser: func(uri *url.URL) error {
-				if c.flagDomain != "" {
-					query := uri.Query()
-					query.Set("domain", c.flagDomain)
-					uri.RawQuery = query.Encode()
-				}
-
-				return httpbakery.OpenWebBrowser(uri)
-			},
-		},
-	})
+	conf.Remotes[server] = config.Remote{Addr: addr, Protocol: c.flagProtocol, AuthType: c.flagAuthType, Domain: c.flagDomain}
 
 	// Attempt to connect
 	var d lxd.ImageServer
@@ -251,6 +232,9 @@ func (c *cmdRemoteAdd) Run(cmd *cobra.Command, args []string) error {
 			return err
 		}
 
+		remote := conf.Remotes[server]
+		remote.AuthType = "tls"
+		conf.Remotes[server] = remote
 		return conf.SaveConfig(c.global.confPath)
 	}
 
@@ -322,6 +306,38 @@ func (c *cmdRemoteAdd) Run(cmd *cobra.Command, args []string) error {
 	srv, _, err := d.(lxd.ContainerServer).GetServer()
 	if err != nil {
 		return err
+	}
+
+	// If not specified, default authentication to Candid
+	if c.flagAuthType == "" {
+		if !srv.Public && shared.StringInSlice("candid", srv.AuthMethods) {
+			c.flagAuthType = "candid"
+
+			// Update the remote configuration
+			remote := conf.Remotes[server]
+			remote.AuthType = c.flagAuthType
+			conf.Remotes[server] = remote
+
+			// Re-setup the client
+			d, err = conf.GetContainerServer(server)
+			if err != nil {
+				return err
+			}
+
+			d.(lxd.ContainerServer).RequireAuthenticated(false)
+
+			srv, _, err = d.(lxd.ContainerServer).GetServer()
+			if err != nil {
+				return err
+			}
+		} else {
+			c.flagAuthType = "tls"
+
+			// Update the remote configuration
+			remote := conf.Remotes[server]
+			remote.AuthType = c.flagAuthType
+			conf.Remotes[server] = remote
+		}
 	}
 
 	if !srv.Public && !shared.StringInSlice(c.flagAuthType, srv.AuthMethods) {
@@ -424,6 +440,8 @@ func (c *cmdRemoteGetDefault) Run(cmd *cobra.Command, args []string) error {
 type cmdRemoteList struct {
 	global *cmdGlobal
 	remote *cmdRemote
+
+	flagFormat string
 }
 
 func (c *cmdRemoteList) Command() *cobra.Command {
@@ -435,6 +453,7 @@ func (c *cmdRemoteList) Command() *cobra.Command {
 		`List the available remotes`))
 
 	cmd.RunE = c.Run
+	cmd.Flags().StringVar(&c.flagFormat, "format", "table", i18n.G("Format (csv|json|table|yaml)")+"``")
 
 	return cmd
 }
@@ -464,8 +483,19 @@ func (c *cmdRemoteList) Run(cmd *cobra.Command, args []string) error {
 		if rc.Protocol == "" {
 			rc.Protocol = "lxd"
 		}
-		if rc.AuthType == "" && !rc.Public {
-			rc.AuthType = "tls"
+
+		if rc.AuthType == "" {
+			if strings.HasPrefix(rc.Addr, "unix:") {
+				rc.AuthType = "file access"
+			} else if rc.Protocol == "simplestreams" {
+				rc.AuthType = "none"
+			} else {
+				rc.AuthType = "tls"
+			}
+		}
+
+		if rc.AuthType == "candid" && rc.Domain != "" {
+			rc.AuthType = fmt.Sprintf("%s (%s)", rc.AuthType, rc.Domain)
 		}
 
 		strName := name
@@ -475,20 +505,51 @@ func (c *cmdRemoteList) Run(cmd *cobra.Command, args []string) error {
 		data = append(data, []string{strName, rc.Addr, rc.Protocol, rc.AuthType, strPublic, strStatic})
 	}
 
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetAutoWrapText(false)
-	table.SetAlignment(tablewriter.ALIGN_LEFT)
-	table.SetRowLine(true)
-	table.SetHeader([]string{
+	header := []string{
 		i18n.G("NAME"),
 		i18n.G("URL"),
 		i18n.G("PROTOCOL"),
 		i18n.G("AUTH TYPE"),
 		i18n.G("PUBLIC"),
-		i18n.G("STATIC")})
-	sort.Sort(byName(data))
-	table.AppendBulk(data)
-	table.Render()
+		i18n.G("STATIC")}
+
+	switch c.flagFormat {
+	case listFormatTable:
+		table := tablewriter.NewWriter(os.Stdout)
+		table.SetAutoWrapText(false)
+		table.SetAlignment(tablewriter.ALIGN_LEFT)
+		table.SetRowLine(true)
+		table.SetHeader(header)
+		sort.Sort(byName(data))
+		table.AppendBulk(data)
+		table.Render()
+	case listFormatCSV:
+		sort.Sort(byName(data))
+		data = append(data, []string{})
+		copy(data[1:], data[0:])
+		data[0] = header
+		w := csv.NewWriter(os.Stdout)
+		w.WriteAll(data)
+		if err := w.Error(); err != nil {
+			return err
+		}
+	case listFormatJSON:
+		data := conf.Remotes
+		enc := json.NewEncoder(os.Stdout)
+		err := enc.Encode(data)
+		if err != nil {
+			return err
+		}
+	case listFormatYAML:
+		data := conf.Remotes
+		out, err := yaml.Marshal(data)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s", out)
+	default:
+		return fmt.Errorf(i18n.G("Invalid format %q"), c.flagFormat)
+	}
 
 	return nil
 }
@@ -599,31 +660,32 @@ func (c *cmdRemoteRemove) Run(cmd *cobra.Command, args []string) error {
 
 	delete(conf.Remotes, args[0])
 
-	certf := conf.ServerCertPath(args[0])
-	os.Remove(certf)
+	os.Remove(conf.ServerCertPath(args[0]))
+	os.Remove(conf.CookiesPath(args[0]))
 
 	return conf.SaveConfig(c.global.confPath)
 }
 
 // Set default
-type cmdRemoteSetDefault struct {
+type cmdRemoteSwitch struct {
 	global *cmdGlobal
 	remote *cmdRemote
 }
 
-func (c *cmdRemoteSetDefault) Command() *cobra.Command {
+func (c *cmdRemoteSwitch) Command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = i18n.G("set-default <remote>")
-	cmd.Short = i18n.G("Set the default remote")
+	cmd.Aliases = []string{"set-default"}
+	cmd.Use = i18n.G("switch <remote>")
+	cmd.Short = i18n.G("Switch the default remote")
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Set the default remote`))
+		`Switch the default remote`))
 
 	cmd.RunE = c.Run
 
 	return cmd
 }
 
-func (c *cmdRemoteSetDefault) Run(cmd *cobra.Command, args []string) error {
+func (c *cmdRemoteSwitch) Run(cmd *cobra.Command, args []string) error {
 	conf := c.global.conf
 
 	// Sanity checks

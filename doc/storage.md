@@ -37,13 +37,14 @@ lxc storage set [<remote>:]<pool> <key> <value>
 ```
 
 ## Storage volume configuration
-Key                     | Type      | Condition                 | Default                               | API Extension | Description
-:--                     | :---      | :--------                 | :------                               | :------------ | :----------
-size                    | string    | appropriate driver        | same as volume.size                   | storage       | Size of the storage volume
-block.filesystem        | string    | block based driver (lvm)  | same as volume.block.filesystem       | storage       | Filesystem of the storage volume
-block.mount\_options    | string    | block based driver (lvm)  | same as volume.block.mount\_options   | storage       | Mount options for block devices
-zfs.remove\_snapshots   | string    | zfs driver                | same as volume.zfs.remove\_snapshots  | storage       | Remove snapshots as needed
-zfs.use\_refquota       | string    | zfs driver                | same as volume.zfs.zfs\_requota       | storage       | Use refquota instead of quota for space.
+Key                     | Type      | Condition                 | Default                               | API Extension     | Description
+:--                     | :---      | :--------                 | :------                               | :------------     | :----------
+size                    | string    | appropriate driver        | same as volume.size                   | storage           | Size of the storage volume
+block.filesystem        | string    | block based driver (lvm)  | same as volume.block.filesystem       | storage           | Filesystem of the storage volume
+block.mount\_options    | string    | block based driver (lvm)  | same as volume.block.mount\_options   | storage           | Mount options for block devices
+security.unmapped       | bool      | custom volume             | false                                 | storage\_unmapped | Disable id mapping for the volume
+zfs.remove\_snapshots   | string    | zfs driver                | same as volume.zfs.remove\_snapshots  | storage           | Remove snapshots as needed
+zfs.use\_refquota       | string    | zfs driver                | same as volume.zfs.zfs\_requota       | storage           | Use refquota instead of quota for space.
 
 Storage volume configuration keys can be set using the lxc tool with:
 
@@ -256,6 +257,14 @@ lxc storage create pool1 btrfs source=/some/path
 lxc storage create pool1 btrfs source=/dev/sdX
 ```
 
+#### Growing a loop backed btrfs pool
+LXD doesn't let you directly grow a loop backed btrfs pool, but you can do so with:
+
+```bash
+sudo truncate -s +5G /var/lib/lxd/disks/<POOL>.img
+sudo btrfs filesystem resize max /var/lib/lxd/storage-pools/<POOL>/
+```
+
 ### LVM
 
  - Uses LVs for images, then LV snapshots for containers and container snapshots.
@@ -380,7 +389,6 @@ lxc storage create pool1 zfs source=/dev/sdX
 ```bash
 lxc storage create pool1 zfs source=/dev/sdX zfs.pool_name=my-tank
 ```
-
 #### Growing a loop backed ZFS pool
 LXD doesn't let you directly grow a loop backed ZFS pool, but you can do so with:
 

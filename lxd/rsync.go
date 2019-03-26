@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/pborman/uuid"
@@ -62,7 +63,7 @@ func rsyncLocalCopy(source string, dest string, bwlimit string) (string, error) 
 	return msg, nil
 }
 
-func rsyncSendSetup(name string, path string, bwlimit string, execPath string) (*exec.Cmd, net.Conn, io.ReadCloser, error) {
+func rsyncSendSetup(name string, path string, bwlimit string, execPath string, features []string) (*exec.Cmd, net.Conn, io.ReadCloser, error) {
 	/*
 	 * The way rsync works, it invokes a subprocess that does the actual
 	 * talking (given to it by a -E argument). Since there isn't an easy
@@ -87,6 +88,7 @@ func rsyncSendSetup(name string, path string, bwlimit string, execPath string) (
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	defer l.Close()
 
 	/*
 	 * Here, the path /tmp/foo is ignored. Since we specify localhost,
@@ -104,22 +106,27 @@ func rsyncSendSetup(name string, path string, bwlimit string, execPath string) (
 		bwlimit = "0"
 	}
 
-	cmd := exec.Command("rsync",
+	args := []string{
 		"-ar",
 		"--devices",
 		"--numeric-ids",
 		"--partial",
 		"--sparse",
-		"--xattrs",
-		"--delete",
-		"--compress",
-		"--compress-level=2",
+	}
+
+	if features != nil && len(features) > 0 {
+		args = append(args, rsyncFeatureArgs(features)...)
+	}
+
+	args = append(args, []string{
 		path,
 		"localhost:/tmp/foo",
 		"-e",
 		rsyncCmd,
 		"--bwlimit",
-		bwlimit)
+		bwlimit}...)
+
+	cmd := exec.Command("rsync", args...)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -130,21 +137,40 @@ func rsyncSendSetup(name string, path string, bwlimit string, execPath string) (
 		return nil, nil, nil, err
 	}
 
-	conn, err := l.Accept()
-	if err != nil {
+	var conn *net.Conn
+	chConn := make(chan *net.Conn, 1)
+
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			chConn <- nil
+			return
+		}
+
+		chConn <- &conn
+	}()
+
+	select {
+	case conn = <-chConn:
+		if conn == nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+			return nil, nil, nil, fmt.Errorf("Failed to connect to rsync socket")
+		}
+
+	case <-time.After(10 * time.Second):
 		cmd.Process.Kill()
 		cmd.Wait()
-		return nil, nil, nil, err
+		return nil, nil, nil, fmt.Errorf("rsync failed to spawn after 10s")
 	}
-	l.Close()
 
-	return cmd, conn, stderr, nil
+	return cmd, *conn, stderr, nil
 }
 
 // RsyncSend sets up the sending half of an rsync, to recursively send the
 // directory pointed to by path over the websocket.
-func RsyncSend(name string, path string, conn *websocket.Conn, readWrapper func(io.ReadCloser) io.ReadCloser, bwlimit string, execPath string) error {
-	cmd, dataSocket, stderr, err := rsyncSendSetup(name, path, bwlimit, execPath)
+func RsyncSend(name string, path string, conn *websocket.Conn, readWrapper func(io.ReadCloser) io.ReadCloser, features []string, bwlimit string, execPath string) error {
+	cmd, dataSocket, stderr, err := rsyncSendSetup(name, path, bwlimit, execPath, features)
 	if err != nil {
 		return err
 	}
@@ -160,14 +186,22 @@ func RsyncSend(name string, path string, conn *websocket.Conn, readWrapper func(
 
 	readDone, writeDone := shared.WebsocketMirror(conn, dataSocket, readPipe, nil, nil)
 
+	chError := make(chan error, 1)
+	go func() {
+		err = cmd.Wait()
+		if err != nil {
+			dataSocket.Close()
+			readPipe.Close()
+		}
+		chError <- err
+	}()
+
 	output, err := ioutil.ReadAll(stderr)
 	if err != nil {
 		cmd.Process.Kill()
-		cmd.Wait()
-		return err
 	}
 
-	err = cmd.Wait()
+	err = <-chError
 	if err != nil {
 		logger.Errorf("Rsync send failed: %s: %s: %s", path, err, string(output))
 	}
@@ -181,7 +215,7 @@ func RsyncSend(name string, path string, conn *websocket.Conn, readWrapper func(
 // RsyncRecv sets up the receiving half of the websocket to rsync (the other
 // half set up by RsyncSend), putting the contents in the directory specified
 // by path.
-func RsyncRecv(path string, conn *websocket.Conn, writeWrapper func(io.WriteCloser) io.WriteCloser, extraArgs []string) error {
+func RsyncRecv(path string, conn *websocket.Conn, writeWrapper func(io.WriteCloser) io.WriteCloser, features []string) error {
 	args := []string{
 		"--server",
 		"-vlogDtpre.iLsfx",
@@ -191,8 +225,8 @@ func RsyncRecv(path string, conn *websocket.Conn, writeWrapper func(io.WriteClos
 		"--sparse",
 	}
 
-	if extraArgs != nil && len(extraArgs) > 0 {
-		args = append(args, extraArgs...)
+	if features != nil && len(features) > 0 {
+		args = append(args, rsyncFeatureArgs(features)...)
 	}
 
 	args = append(args, []string{".", path}...)
@@ -240,4 +274,22 @@ func RsyncRecv(path string, conn *websocket.Conn, writeWrapper func(io.WriteClos
 	<-writeDone
 
 	return err
+}
+
+func rsyncFeatureArgs(features []string) []string {
+	args := []string{}
+	if shared.StringInSlice("xattrs", features) {
+		args = append(args, "--xattrs")
+	}
+
+	if shared.StringInSlice("delete", features) {
+		args = append(args, "--delete")
+	}
+
+	if shared.StringInSlice("compress", features) {
+		args = append(args, "--compress")
+		args = append(args, "--compress-level=2")
+	}
+
+	return args
 }

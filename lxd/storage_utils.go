@@ -111,7 +111,7 @@ func tryUnmount(path string, flags int) error {
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	if err != nil && err == syscall.EBUSY {
+	if err != nil {
 		return err
 	}
 
@@ -119,6 +119,10 @@ func tryUnmount(path string, flags int) error {
 }
 
 func storageValidName(value string) error {
+	if strings.Contains(value, "/") {
+		return fmt.Errorf("Invalid storage volume name \"%s\". Storage volumes cannot contain \"/\" in their name", value)
+	}
+
 	return nil
 }
 

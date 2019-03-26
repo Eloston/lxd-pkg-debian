@@ -4,6 +4,7 @@
 package httprequest
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,7 +12,6 @@ import (
 	"reflect"
 
 	"github.com/julienschmidt/httprouter"
-	"golang.org/x/net/context"
 	"gopkg.in/errgo.v1"
 )
 
@@ -129,8 +129,7 @@ func (srv *Server) Handle(f interface{}) Handler {
 		Method: hf.method,
 		Path:   hf.pathPattern,
 		Handle: func(w http.ResponseWriter, req *http.Request, p httprouter.Params) {
-			ctx, cancel := contextFromRequest(req)
-			defer cancel()
+			ctx := req.Context()
 			p1 := Params{
 				Response:    w,
 				Request:     req,
@@ -164,8 +163,6 @@ func (srv *Server) Handle(f interface{}) Handler {
 // The returned context will be used as the value of Params.Context
 // when Params is passed to any method. It will also be used
 // when writing an error if the function returns an error.
-// Note that it is OK to use both the standard library context.Context
-// or golang.org/x/net/context.Context in the context return value.
 //
 // Handlers will panic if f is not of the required form, no methods are
 // defined on T or any method defined on T is not suitable for Handle.
@@ -197,6 +194,13 @@ func (srv *Server) Handlers(f interface{}) []Handler {
 			}
 			continue
 		}
+		if wt.Kind() != reflect.Interface {
+			// The type in the Method struct includes the receiver type,
+			// which we don't want to look at (and we won't see when
+			// we get the method from the actual value at dispatch time),
+			// so we hide it.
+			m.Type = withoutReceiver(m.Type)
+		}
 		h, err := srv.methodHandler(m, rootv, argInterfacet, hasClose)
 		if err != nil {
 			panic(err)
@@ -210,12 +214,7 @@ func (srv *Server) Handlers(f interface{}) []Handler {
 }
 
 func (srv *Server) methodHandler(m reflect.Method, rootv reflect.Value, argInterfacet reflect.Type, hasClose bool) (Handler, error) {
-	// The type in the Method struct includes the receiver type,
-	// which we don't want to look at (and we won't see when
-	// we get the method from the actual value at dispatch time),
-	// so we hide it.
-	mt := withoutReceiver(m.Type)
-	hf, err := srv.handlerFunc(mt, argInterfacet)
+	hf, err := srv.handlerFunc(m.Type, argInterfacet)
 	if err != nil {
 		return Handler{}, errgo.Notef(err, "bad type for method %s", m.Name)
 	}
@@ -223,8 +222,7 @@ func (srv *Server) methodHandler(m reflect.Method, rootv reflect.Value, argInter
 		return Handler{}, errgo.Notef(err, "method %s does not specify route method and path", m.Name)
 	}
 	handler := func(w http.ResponseWriter, req *http.Request, p httprouter.Params) {
-		ctx, cancel := contextFromRequest(req)
-		defer cancel()
+		ctx := req.Context()
 		p1 := Params{
 			Response:    w,
 			Request:     req,
@@ -468,8 +466,7 @@ type ErrorHandler func(Params) error
 // have its PathPattern set as that information is not available.
 func (srv *Server) HandleJSON(handle JSONHandler) httprouter.Handle {
 	return func(w http.ResponseWriter, req *http.Request, p httprouter.Params) {
-		ctx, cancel := contextFromRequest(req)
-		defer cancel()
+		ctx := req.Context()
 		val, err := handle(Params{
 			Response: headerOnlyResponseWriter{w.Header()},
 			Request:  req,
@@ -495,8 +492,7 @@ func (srv *Server) HandleErrors(handle ErrorHandler) httprouter.Handle {
 		w1 := responseWriter{
 			ResponseWriter: w,
 		}
-		ctx, cancel := contextFromRequest(req)
-		defer cancel()
+		ctx := req.Context()
 		if err := handle(Params{
 			Response: &w1,
 			Request:  req,

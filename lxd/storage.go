@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/gorilla/websocket"
+	"github.com/pkg/errors"
 
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/migration"
@@ -164,15 +165,21 @@ type storage interface {
 	SetStoragePoolVolumeWritable(writable *api.StorageVolumePut)
 	GetStoragePoolVolume() *api.StorageVolume
 
+	// Functions dealing with custom storage volume snapshots.
+	StoragePoolVolumeSnapshotCreate(target *api.StorageVolumeSnapshotsPost) error
+	StoragePoolVolumeSnapshotDelete() error
+	StoragePoolVolumeSnapshotRename(newName string) error
+
 	// Functions dealing with container storage volumes.
 	// ContainerCreate creates an empty container (no rootfs/metadata.yaml)
 	ContainerCreate(container container) error
 
 	// ContainerCreateFromImage creates a container from a image.
-	ContainerCreateFromImage(c container, fingerprint string) error
+	ContainerCreateFromImage(c container, fingerprint string, tracker *ioprogress.ProgressTracker) error
 	ContainerCanRestore(target container, source container) error
 	ContainerDelete(c container) error
 	ContainerCopy(target container, source container, containerOnly bool) error
+	ContainerRefresh(target container, source container, snapshots []container) error
 	ContainerMount(c container) (bool, error)
 	ContainerUmount(c container, path string) (bool, error)
 	ContainerRename(container container, newName string) error
@@ -187,11 +194,14 @@ type storage interface {
 	ContainerSnapshotStart(c container) (bool, error)
 	ContainerSnapshotStop(c container) (bool, error)
 
+	ContainerBackupCreate(backup backup, sourceContainer container) error
+	ContainerBackupLoad(info backupInfo, data io.ReadSeeker, tarArgs []string) error
+
 	// For use in migrating snapshots.
 	ContainerSnapshotCreateEmpty(c container) error
 
 	// Functions dealing with image storage volumes.
-	ImageCreate(fingerprint string) error
+	ImageCreate(fingerprint string, tracker *ioprogress.ProgressTracker) error
 	ImageDelete(fingerprint string) error
 	ImageMount(fingerprint string) (bool, error)
 	ImageUmount(fingerprint string) (bool, error)
@@ -222,19 +232,11 @@ type storage interface {
 	// We leave sending containers which are snapshots of other containers
 	// already present on the target instance as an exercise for the
 	// enterprising developer.
-	MigrationSource(c container, containerOnly bool) (MigrationStorageSourceDriver, error)
-	MigrationSink(
-		live bool,
-		c container,
-		objects []*migration.Snapshot,
-		conn *websocket.Conn,
-		srcIdmap *idmap.IdmapSet,
-		op *operation,
-		containerOnly bool,
-		args MigrationSinkArgs) error
+	MigrationSource(args MigrationSourceArgs) (MigrationStorageSourceDriver, error)
+	MigrationSink(conn *websocket.Conn, op *operation, args MigrationSinkArgs) error
 
-	StorageMigrationSource() (MigrationStorageSourceDriver, error)
-	StorageMigrationSink(conn *websocket.Conn, op *operation, storage storage, args MigrationSinkArgs) error
+	StorageMigrationSource(args MigrationSourceArgs) (MigrationStorageSourceDriver, error)
+	StorageMigrationSink(conn *websocket.Conn, op *operation, args MigrationSinkArgs) error
 }
 
 func storageCoreInit(driver string) (storage, error) {
@@ -291,11 +293,11 @@ func storageCoreInit(driver string) (storage, error) {
 	return nil, fmt.Errorf("invalid storage type")
 }
 
-func storageInit(s *state.State, poolName string, volumeName string, volumeType int) (storage, error) {
+func storageInit(s *state.State, project, poolName, volumeName string, volumeType int) (storage, error) {
 	// Load the storage pool.
 	poolID, pool, err := s.Cluster.StoragePoolGet(poolName)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "Load storage pool %q", poolName)
 	}
 
 	driver := pool.Driver
@@ -308,7 +310,7 @@ func storageInit(s *state.State, poolName string, volumeName string, volumeType 
 	// Load the storage volume.
 	volume := &api.StorageVolume{}
 	if volumeName != "" && volumeType >= 0 {
-		_, volume, err = s.Cluster.StoragePoolNodeVolumeGetType(volumeName, volumeType, poolID)
+		_, volume, err = s.Cluster.StoragePoolNodeVolumeGetTypeByProject(project, volumeName, volumeType, poolID)
 		if err != nil {
 			return nil, err
 		}
@@ -392,16 +394,22 @@ func storageInit(s *state.State, poolName string, volumeName string, volumeType 
 }
 
 func storagePoolInit(s *state.State, poolName string) (storage, error) {
-	return storageInit(s, poolName, "", -1)
+	return storageInit(s, "default", poolName, "", -1)
 }
 
 func storagePoolVolumeAttachInit(s *state.State, poolName string, volumeName string, volumeType int, c container) (storage, error) {
-	st, err := storageInit(s, poolName, volumeName, volumeType)
+	st, err := storageInit(s, "default", poolName, volumeName, volumeType)
 	if err != nil {
 		return nil, err
 	}
 
 	poolVolumePut := st.GetStoragePoolVolumeWritable()
+
+	// Check if unmapped
+	if shared.IsTrue(poolVolumePut.Config["security.unmapped"]) {
+		// No need to look at containers and maps for unmapped volumes
+		return st, nil
+	}
 
 	// get last idmapset
 	var lastIdmap *idmap.IdmapSet
@@ -440,14 +448,14 @@ func storagePoolVolumeAttachInit(s *state.State, poolName string, volumeName str
 	if !reflect.DeepEqual(nextIdmap, lastIdmap) {
 		logger.Debugf("Shifting storage volume")
 		volumeUsedBy, err := storagePoolVolumeUsedByContainersGet(s,
-			volumeName, volumeTypeName)
+			"default", volumeName, volumeTypeName)
 		if err != nil {
 			return nil, err
 		}
 
 		if len(volumeUsedBy) > 1 {
 			for _, ctName := range volumeUsedBy {
-				ct, err := containerLoadByName(s, ctName)
+				ct, err := containerLoadByProjectAndName(s, c.Project(), ctName)
 				if err != nil {
 					continue
 				}
@@ -545,27 +553,27 @@ func storagePoolVolumeAttachInit(s *state.State, poolName string, volumeName str
 	return st, nil
 }
 
-func storagePoolVolumeInit(s *state.State, poolName string, volumeName string, volumeType int) (storage, error) {
+func storagePoolVolumeInit(s *state.State, project, poolName, volumeName string, volumeType int) (storage, error) {
 	// No need to detect storage here, its a new container.
-	return storageInit(s, poolName, volumeName, volumeType)
+	return storageInit(s, project, poolName, volumeName, volumeType)
 }
 
 func storagePoolVolumeImageInit(s *state.State, poolName string, imageFingerprint string) (storage, error) {
-	return storagePoolVolumeInit(s, poolName, imageFingerprint, storagePoolVolumeTypeImage)
+	return storagePoolVolumeInit(s, "default", poolName, imageFingerprint, storagePoolVolumeTypeImage)
 }
 
-func storagePoolVolumeContainerCreateInit(s *state.State, poolName string, containerName string) (storage, error) {
-	return storagePoolVolumeInit(s, poolName, containerName, storagePoolVolumeTypeContainer)
+func storagePoolVolumeContainerCreateInit(s *state.State, project string, poolName string, containerName string) (storage, error) {
+	return storagePoolVolumeInit(s, project, poolName, containerName, storagePoolVolumeTypeContainer)
 }
 
-func storagePoolVolumeContainerLoadInit(s *state.State, containerName string) (storage, error) {
+func storagePoolVolumeContainerLoadInit(s *state.State, project, containerName string) (storage, error) {
 	// Get the storage pool of a given container.
-	poolName, err := s.Cluster.ContainerPool(containerName)
+	poolName, err := s.Cluster.ContainerPool(project, containerName)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "Load storage pool for container %q in project %q", containerName, project)
 	}
 
-	return storagePoolVolumeInit(s, poolName, containerName, storagePoolVolumeTypeContainer)
+	return storagePoolVolumeInit(s, project, poolName, containerName, storagePoolVolumeTypeContainer)
 }
 
 // {LXD_DIR}/storage-pools/<pool>
@@ -573,14 +581,14 @@ func getStoragePoolMountPoint(poolName string) string {
 	return shared.VarPath("storage-pools", poolName)
 }
 
-// ${LXD_DIR}/storage-pools/<pool>containers/<container_name>
-func getContainerMountPoint(poolName string, containerName string) string {
-	return shared.VarPath("storage-pools", poolName, "containers", containerName)
+// ${LXD_DIR}/storage-pools/<pool>/containers/[<project_name>_]<container_name>
+func getContainerMountPoint(project string, poolName string, containerName string) string {
+	return shared.VarPath("storage-pools", poolName, "containers", projectPrefix(project, containerName))
 }
 
-// ${LXD_DIR}/storage-pools/<pool>/snapshots/<snapshot_name>
-func getSnapshotMountPoint(poolName string, snapshotName string) string {
-	return shared.VarPath("storage-pools", poolName, "snapshots", snapshotName)
+// ${LXD_DIR}/storage-pools/<pool>/containers-snapshots/<snapshot_name>
+func getSnapshotMountPoint(project, poolName string, snapshotName string) string {
+	return shared.VarPath("storage-pools", poolName, "containers-snapshots", projectPrefix(project, snapshotName))
 }
 
 // ${LXD_DIR}/storage-pools/<pool>/images/<fingerprint>
@@ -591,6 +599,11 @@ func getImageMountPoint(poolName string, fingerprint string) string {
 // ${LXD_DIR}/storage-pools/<pool>/custom/<storage_volume>
 func getStoragePoolVolumeMountPoint(poolName string, volumeName string) string {
 	return shared.VarPath("storage-pools", poolName, "custom", volumeName)
+}
+
+// ${LXD_DIR}/storage-pools/<pool>/custom-snapshots/<custom volume name>/<snapshot name>
+func getStoragePoolVolumeSnapshotMountPoint(poolName string, snapshotName string) string {
+	return shared.VarPath("storage-pools", poolName, "custom-snapshots", snapshotName)
 }
 
 func createContainerMountpoint(mountPoint string, mountPointSymlink string, privileged bool) error {

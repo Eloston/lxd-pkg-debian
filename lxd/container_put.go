@@ -20,11 +20,13 @@ import (
  * the named snapshot
  */
 func containerPut(d *Daemon, r *http.Request) Response {
+	project := projectParam(r)
+
 	// Get the container
 	name := mux.Vars(r)["name"]
 
 	// Handle requests targeted to a container on a different node
-	response, err := ForwardedResponseIfContainerIsRemote(d, r, name)
+	response, err := ForwardedResponseIfContainerIsRemote(d, r, project, name)
 	if err != nil {
 		return SmartError(err)
 	}
@@ -32,7 +34,7 @@ func containerPut(d *Daemon, r *http.Request) Response {
 		return response
 	}
 
-	c, err := containerLoadByName(d.State(), name)
+	c, err := containerLoadByProjectAndName(d.State(), project, name)
 	if err != nil {
 		return NotFound(err)
 	}
@@ -55,7 +57,7 @@ func containerPut(d *Daemon, r *http.Request) Response {
 	}
 
 	var do func(*operation) error
-	var opDescription string
+	var opType db.OperationType
 	if configRaw.Restore == "" {
 		// Update container configuration
 		do = func(op *operation) error {
@@ -66,6 +68,7 @@ func containerPut(d *Daemon, r *http.Request) Response {
 				Devices:      configRaw.Devices,
 				Ephemeral:    configRaw.Ephemeral,
 				Profiles:     configRaw.Profiles,
+				Project:      project,
 			}
 
 			// FIXME: should set to true when not migrating
@@ -77,20 +80,20 @@ func containerPut(d *Daemon, r *http.Request) Response {
 			return nil
 		}
 
-		opDescription = "Updating container"
+		opType = db.OperationSnapshotUpdate
 	} else {
 		// Snapshot Restore
 		do = func(op *operation) error {
-			return containerSnapRestore(d.State(), name, configRaw.Restore, configRaw.Stateful)
+			return containerSnapRestore(d.State(), project, name, configRaw.Restore, configRaw.Stateful)
 		}
 
-		opDescription = "Restoring snapshot"
+		opType = db.OperationSnapshotRestore
 	}
 
 	resources := map[string][]string{}
 	resources["containers"] = []string{name}
 
-	op, err := operationCreate(d.cluster, operationClassTask, opDescription, resources, nil, do, nil, nil)
+	op, err := operationCreate(d.cluster, project, operationClassTask, opType, resources, nil, do, nil, nil)
 	if err != nil {
 		return InternalError(err)
 	}
@@ -98,18 +101,18 @@ func containerPut(d *Daemon, r *http.Request) Response {
 	return OperationResponse(op)
 }
 
-func containerSnapRestore(s *state.State, name string, snap string, stateful bool) error {
+func containerSnapRestore(s *state.State, project, name, snap string, stateful bool) error {
 	// normalize snapshot name
 	if !shared.IsSnapshot(snap) {
 		snap = name + shared.SnapshotDelimiter + snap
 	}
 
-	c, err := containerLoadByName(s, name)
+	c, err := containerLoadByProjectAndName(s, project, name)
 	if err != nil {
 		return err
 	}
 
-	source, err := containerLoadByName(s, snap)
+	source, err := containerLoadByProjectAndName(s, project, snap)
 	if err != nil {
 		switch err {
 		case db.ErrNoSuchObject:

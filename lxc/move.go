@@ -24,7 +24,9 @@ type cmdMove struct {
 	flagDevice        []string
 	flagMode          string
 	flagStateless     bool
+	flagStorage       string
 	flagTarget        string
+	flagTargetProject string
 }
 
 func (c *cmdMove) Command() *cobra.Command {
@@ -52,7 +54,9 @@ lxc move <container>/<old snapshot name> <container>/<new snapshot name>
 	cmd.Flags().BoolVar(&c.flagContainerOnly, "container-only", false, i18n.G("Move the container without its snapshots"))
 	cmd.Flags().StringVar(&c.flagMode, "mode", moveDefaultMode, i18n.G("Transfer mode. One of pull (default), push or relay.")+"``")
 	cmd.Flags().BoolVar(&c.flagStateless, "stateless", false, i18n.G("Copy a stateful container stateless"))
+	cmd.Flags().StringVarP(&c.flagStorage, "storage", "s", "", i18n.G("Storage pool name")+"``")
 	cmd.Flags().StringVar(&c.flagTarget, "target", "", i18n.G("Cluster member name")+"``")
+	cmd.Flags().StringVar(&c.flagTargetProject, "target-project", "", i18n.G("Copy to a project different from the source")+"``")
 
 	return cmd
 }
@@ -99,7 +103,7 @@ func (c *cmdMove) Run(cmd *cobra.Command, args []string) error {
 	// running, containers that are running should be live migrated (of
 	// course, this changing of hostname isn't supported right now, so this
 	// simply won't work).
-	if sourceRemote == destRemote && c.flagTarget == "" {
+	if sourceRemote == destRemote && c.flagTarget == "" && c.flagStorage == "" && c.flagTargetProject == "" {
 		if c.flagConfig != nil || c.flagDevice != nil || c.flagProfile != nil || c.flagNoProfiles {
 			return fmt.Errorf(i18n.G("Can't override configuration or profiles in local rename"))
 		}
@@ -156,7 +160,9 @@ func (c *cmdMove) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	cpy := cmdCopy{}
+	cpy.global = c.global
 	cpy.flagTarget = c.flagTarget
+	cpy.flagTargetProject = c.flagTargetProject
 	cpy.flagConfig = c.flagConfig
 	cpy.flagDevice = c.flagDevice
 	cpy.flagProfile = c.flagProfile
@@ -166,7 +172,7 @@ func (c *cmdMove) Run(cmd *cobra.Command, args []string) error {
 
 	// A move is just a copy followed by a delete; however, we want to
 	// keep the volatile entries around since we are moving the container.
-	err = cpy.copyContainer(conf, sourceResource, destResource, true, -1, stateful, c.flagContainerOnly, mode)
+	err = cpy.copyContainer(conf, sourceResource, destResource, true, -1, stateful, c.flagContainerOnly, mode, c.flagStorage)
 	if err != nil {
 		return err
 	}

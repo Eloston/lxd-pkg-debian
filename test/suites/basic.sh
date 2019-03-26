@@ -101,7 +101,7 @@ test_basic_usage() {
   lxc list --format json | jq '.[]|select(.name="foo")' | grep '"name": "foo"'
 
   # Test list with --columns and --fast
-  ! lxc list --columns=nsp --fast
+  ! lxc list --columns=nsp --fast || false
 
   # Test container rename
   lxc move foo bar
@@ -177,12 +177,12 @@ test_basic_usage() {
   lxc image delete foo-image2
 
   # Test invalid container names
-  ! lxc init testimage -abc
-  ! lxc init testimage abc-
-  ! lxc init testimage 1234
-  ! lxc init testimage 12test
-  ! lxc init testimage a_b_c
-  ! lxc init testimage aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  ! lxc init testimage -abc || false
+  ! lxc init testimage abc- || false
+  ! lxc init testimage 1234 || false
+  ! lxc init testimage 12test || false
+  ! lxc init testimage a_b_c || false
+  ! lxc init testimage aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa || false
 
   # Test snapshot publish
   lxc snapshot bar
@@ -326,7 +326,7 @@ test_basic_usage() {
   lxc exec foo ip link show | grep eth0
 
   # check that we can get the return code for a non- wait-for-websocket exec
-  op=$(my_curl -X POST "https://${LXD_ADDR}/1.0/containers/foo/exec" -d '{"command": ["sleep", "1"], "environment": {}, "wait-for-websocket": false, "interactive": false}' | jq -r .operation)
+  op=$(my_curl -X POST "https://${LXD_ADDR}/1.0/containers/foo/exec" -d '{"command": ["echo", "test"], "environment": {}, "wait-for-websocket": false, "interactive": false}' | jq -r .operation)
   [ "$(my_curl "https://${LXD_ADDR}${op}/wait" | jq -r .metadata.metadata.return)" != "null" ]
 
   # test file transfer
@@ -478,14 +478,10 @@ test_basic_usage() {
 
   [ "${REBOOTED}" = "true" ]
 
-  # Workaround for LXC bug which causes LXD to double-start containers
-  # on reboot
-  sleep 2
-
   lxc stop foo --force || true
   ! lxc list | grep -q foo || false
 
   # Test renaming/deletion of the default profile
-  ! lxc profile rename default foobar
-  ! lxc profile delete default
+  ! lxc profile rename default foobar || false
+  ! lxc profile delete default || false
 }

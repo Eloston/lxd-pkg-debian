@@ -1,4 +1,5 @@
 # Daemon behavior
+
 ## Introduction
 
 This specification covers some of the daemon's behavior, such as

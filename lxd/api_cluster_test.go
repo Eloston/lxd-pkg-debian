@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"io/ioutil"
+	"os"
 	"testing"
 	"time"
 
@@ -21,8 +23,11 @@ func TestCluster_Bootstrap(t *testing.T) {
 	daemon, cleanup := newDaemon(t)
 	defer cleanup()
 
+	// Simulate what happens when running "lxd init", where a PUT /1.0
+	// request is issued to set both core.https_address and
+	// cluster.https_address to the same value.
 	f := clusterFixture{t: t}
-	f.EnableNetworking(daemon, "")
+	f.EnableNetworkingWithClusterAddress(daemon, "")
 
 	client := f.ClientUnix(daemon)
 
@@ -52,6 +57,37 @@ func TestCluster_Get(t *testing.T) {
 	assert.False(t, cluster.Enabled)
 }
 
+func TestCluster_GetMemberConfig(t *testing.T) {
+	daemon, cleanup := newDaemon(t)
+	defer cleanup()
+
+	client, err := lxd.ConnectLXDUnix(daemon.UnixSocket(), nil)
+	require.NoError(t, err)
+
+	dir, err := ioutil.TempDir("", "lxd-api-cluster-test-")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	err = os.Setenv("LXD_DIR", dir)
+	require.NoError(t, err)
+
+	pool := api.StoragePoolsPost{
+		Name:   "local",
+		Driver: "dir",
+	}
+	err = client.CreateStoragePool(pool)
+	require.NoError(t, err)
+
+	cluster, _, err := client.GetCluster()
+	require.NoError(t, err)
+
+	assert.Len(t, cluster.MemberConfig, 1)
+	config := cluster.MemberConfig[0]
+	assert.Equal(t, config.Entity, "storage-pool")
+	assert.Equal(t, config.Name, "local")
+	assert.Equal(t, config.Key, "source")
+}
+
 // A LXD node which is already configured for networking can join an existing
 // cluster.
 func TestCluster_Join(t *testing.T) {
@@ -61,8 +97,15 @@ func TestCluster_Join(t *testing.T) {
 	f := clusterFixture{t: t}
 	passwords := []string{"sekret", ""}
 
+	// Enable networking on all daemons. The bootstrap daemon will also
+	// have it's cluster.https_address set to the same value as
+	// core.https_address, so it can be bootstrapped.
 	for i, daemon := range daemons {
-		f.EnableNetworking(daemon, passwords[i])
+		if i == 0 {
+			f.EnableNetworkingWithClusterAddress(daemon, passwords[i])
+		} else {
+			f.EnableNetworking(daemon, passwords[i])
+		}
 	}
 
 	// Bootstrap the cluster using the first node.
@@ -147,6 +190,191 @@ func TestCluster_Join(t *testing.T) {
 	assert.Equal(t, "buzz", node.ServerName)
 }
 
+// If the joining LXD node is not yet configured for networking, the user can
+// requests to expose it with the ServerAddress key.
+func TestCluster_JoinServerAddress(t *testing.T) {
+	daemons, cleanup := newDaemons(t, 2)
+	defer cleanup()
+
+	f := clusterFixture{t: t}
+	password := "sekret"
+	f.EnableNetworkingWithClusterAddress(daemons[0], password)
+
+	// Bootstrap the cluster using the first node.
+	client := f.ClientUnix(daemons[0])
+	cluster := api.ClusterPut{}
+	cluster.ServerName = "buzz"
+	cluster.Enabled = true
+	op, err := client.UpdateCluster(cluster, "")
+	require.NoError(t, err)
+	require.NoError(t, op.Wait())
+
+	// Make the second node join the cluster.
+	port, err := shared.AllocatePort()
+	require.NoError(f.t, err)
+	serverAddress := fmt.Sprintf("127.0.0.1:%d", port)
+
+	f.RegisterCertificate(daemons[1], daemons[0], "rusp", "sekret")
+	address := daemons[0].endpoints.NetworkAddress()
+	cert := string(daemons[0].endpoints.NetworkPublicKey())
+	client = f.ClientUnix(daemons[1])
+	cluster = api.ClusterPut{
+		ClusterAddress:     address,
+		ClusterCertificate: cert,
+		ServerAddress:      serverAddress,
+	}
+	cluster.ServerName = "rusp"
+	cluster.Enabled = true
+	op, err = client.UpdateCluster(cluster, "")
+	require.NoError(t, err)
+	require.NoError(t, op.Wait())
+
+	// At least the leader node is listed as database node in the second
+	// node's sqlite database. Depending on the timing of the join request
+	// and of the heartbeat update from the leader, there might be a second
+	// entry for the joining node itself.
+	state := daemons[1].State()
+	err = state.Node.Transaction(func(tx *db.NodeTx) error {
+		nodes, err := tx.RaftNodes()
+		require.NoError(t, err)
+		require.True(t, len(nodes) >= 1, "no rows in raft_nodes table")
+		assert.Equal(t, int64(1), nodes[0].ID)
+		assert.Equal(t, daemons[0].endpoints.NetworkAddress(), nodes[0].Address)
+
+		if len(nodes) == 1 {
+			return nil
+		}
+		require.Len(t, nodes, 2)
+		assert.Equal(t, int64(2), nodes[1].ID)
+		assert.Equal(t, daemons[1].endpoints.NetworkAddress(), nodes[1].Address)
+		return nil
+	})
+	require.NoError(t, err)
+
+	// Changing the configuration on the second node also updates it on the
+	// first, via internal notifications.
+	server, _, err := client.GetServer()
+	require.NoError(t, err)
+	serverPut := server.Writable()
+	serverPut.Config["candid.api.url"] = "foo.bar"
+	require.NoError(t, client.UpdateServer(serverPut, ""))
+
+	for _, daemon := range daemons {
+		assert.NotNil(t, daemon.externalAuth)
+	}
+
+	// The GetClusterMembers client method returns both nodes.
+	nodes, err := client.GetClusterMembers()
+	require.NoError(t, err)
+	assert.Len(t, nodes, 2)
+	assert.Equal(t, "buzz", nodes[0].ServerName)
+	assert.Equal(t, "rusp", nodes[1].ServerName)
+	assert.Equal(t, "Online", nodes[0].Status)
+	assert.Equal(t, "Online", nodes[1].Status)
+
+	// The GetClusterMemberNames client method returns the URLs of both
+	// nodes.
+	urls, err := client.GetClusterMemberNames()
+	require.NoError(t, err)
+	assert.Len(t, urls, 2)
+	assert.Equal(t, "/1.0/cluster/members/buzz", urls[0])
+	assert.Equal(t, "/1.0/cluster/members/rusp", urls[1])
+
+	// The GetNode method returns the requested node.
+	node, _, err := client.GetClusterMember("buzz")
+	require.NoError(t, err)
+	assert.Equal(t, "buzz", node.ServerName)
+}
+
+// If the joining LXD node is already configured for networking, the user can
+// requests to use a different port for clustering, using the ServerAddress
+// key.
+func TestCluster_JoinDifferentServerAddress(t *testing.T) {
+	daemons, cleanup := newDaemons(t, 2)
+	defer cleanup()
+
+	f := clusterFixture{t: t}
+	password := "sekret"
+	f.EnableNetworkingWithClusterAddress(daemons[0], password)
+
+	// Bootstrap the cluster using the first node.
+	client := f.ClientUnix(daemons[0])
+	cluster := api.ClusterPut{}
+	cluster.ServerName = "buzz"
+	cluster.Enabled = true
+	op, err := client.UpdateCluster(cluster, "")
+	require.NoError(t, err)
+	require.NoError(t, op.Wait())
+
+	// Configure the second node for networking.
+	f.EnableNetworking(daemons[1], "")
+
+	// Make the second node join the cluster, specifying a dedicated
+	// cluster address.
+	port, err := shared.AllocatePort()
+	require.NoError(f.t, err)
+	serverAddress := fmt.Sprintf("127.0.0.1:%d", port)
+
+	f.RegisterCertificate(daemons[1], daemons[0], "rusp", "sekret")
+	address := daemons[0].endpoints.NetworkAddress()
+	cert := string(daemons[0].endpoints.NetworkPublicKey())
+	client = f.ClientUnix(daemons[1])
+	cluster = api.ClusterPut{
+		ClusterAddress:     address,
+		ClusterCertificate: cert,
+		ServerAddress:      serverAddress,
+	}
+	cluster.ServerName = "rusp"
+	cluster.Enabled = true
+	op, err = client.UpdateCluster(cluster, "")
+	require.NoError(t, err)
+	require.NoError(t, op.Wait())
+
+	// The GetClusterMembers client method returns both nodes.
+	nodes, err := client.GetClusterMembers()
+	require.NoError(t, err)
+	assert.Len(t, nodes, 2)
+	assert.Equal(t, "buzz", nodes[0].ServerName)
+	assert.Equal(t, "rusp", nodes[1].ServerName)
+	assert.Equal(t, "Online", nodes[0].Status)
+	assert.Equal(t, "Online", nodes[1].Status)
+}
+
+// If an LXD node is already for networking and the user asks to configure a
+// the same address as cluster address, the request still succeeds.
+func TestCluster_JoinSameServerAddress(t *testing.T) {
+	daemons, cleanup := newDaemons(t, 2)
+	defer cleanup()
+
+	f := clusterFixture{t: t}
+	f.EnableNetworkingWithClusterAddress(daemons[0], "sekret")
+	f.EnableNetworking(daemons[1], "")
+
+	// Bootstrap the cluster using the first node.
+	client := f.ClientUnix(daemons[0])
+	cluster := api.ClusterPut{}
+	cluster.ServerName = "buzz"
+	cluster.Enabled = true
+	op, err := client.UpdateCluster(cluster, "")
+	require.NoError(t, err)
+	require.NoError(t, op.Wait())
+
+	// Attempt to join the second node.
+	f.RegisterCertificate(daemons[1], daemons[0], "rusp", "sekret")
+	address := daemons[0].endpoints.NetworkAddress()
+	cert := string(daemons[0].endpoints.NetworkPublicKey())
+	client = f.ClientUnix(daemons[1])
+	cluster = api.ClusterPut{
+		ClusterAddress:     address,
+		ClusterCertificate: cert,
+		ServerAddress:      daemons[1].endpoints.NetworkAddress(),
+	}
+	cluster.ServerName = "rusp"
+	cluster.Enabled = true
+	_, err = client.UpdateCluster(cluster, "")
+	assert.NoError(t, err)
+}
+
 // If the joining node hasn't added its certificate as trusted client
 // certificate, an authorization error is returned.
 func TestCluster_JoinUnauthorized(t *testing.T) {
@@ -154,11 +382,8 @@ func TestCluster_JoinUnauthorized(t *testing.T) {
 	defer cleanup()
 
 	f := clusterFixture{t: t}
-	passwords := []string{"sekret", ""}
-
-	for i, daemon := range daemons {
-		f.EnableNetworking(daemon, passwords[i])
-	}
+	f.EnableNetworkingWithClusterAddress(daemons[0], "sekret")
+	f.EnableNetworking(daemons[1], "")
 
 	// Bootstrap the cluster using the first node.
 	client := f.ClientUnix(daemons[0])
@@ -250,17 +475,17 @@ func TestCluster_LeaveWithImages(t *testing.T) {
 
 	daemon := daemons[1]
 	err := daemon.State().Cluster.ImageInsert(
-		"abc", "foo", 123, false, false, "amd64", time.Now(), time.Now(), nil)
+		"default", "abc", "foo", 123, false, false, "amd64", time.Now(), time.Now(), nil)
 	require.NoError(t, err)
 
 	client := f.ClientUnix(daemons[1])
 	err = client.DeleteClusterMember("rusp-0", false)
-	assert.EqualError(t, err, "node still has the following images: abc")
+	assert.EqualError(t, err, "Node still has the following images: abc")
 
 	// If we now associate the image with the other node as well, leaving
 	// the cluster is fine.
 	daemon = daemons[0]
-	err = daemon.State().Cluster.ImageAssociateNode("abc")
+	err = daemon.State().Cluster.ImageAssociateNode("default", "abc")
 	require.NoError(t, err)
 
 	err = client.DeleteClusterMember("rusp-0", false)
@@ -280,7 +505,7 @@ func TestCluster_LeaveForce(t *testing.T) {
 
 	daemon := daemons[1]
 	err := daemon.State().Cluster.ImageInsert(
-		"abc", "foo", 123, false, false, "amd64", time.Now(), time.Now(), nil)
+		"default", "abc", "foo", 123, false, false, "amd64", time.Now(), time.Now(), nil)
 	require.NoError(t, err)
 
 	client := f.ClientUnix(daemons[1])
@@ -290,7 +515,7 @@ func TestCluster_LeaveForce(t *testing.T) {
 	// The image is gone, since the deleted node was the only one having a
 	// copy of it.
 	daemon = daemons[0]
-	images, err := daemon.State().Cluster.ImagesGet(false)
+	images, err := daemon.State().Cluster.ImagesGet("default", false)
 	require.NoError(t, err)
 	assert.Equal(t, []string{}, images)
 }
@@ -367,11 +592,11 @@ type clusterFixture struct {
 func (f *clusterFixture) FormCluster(daemons []*Daemon) {
 	f.daemons = daemons
 	for i, daemon := range daemons {
-		password := ""
 		if i == 0 {
-			password = "sekret"
+			f.EnableNetworkingWithClusterAddress(daemon, "sekret")
+		} else {
+			f.EnableNetworking(daemon, "")
 		}
-		f.EnableNetworking(daemon, password)
 	}
 
 	// Bootstrap the cluster using the first node.
@@ -416,6 +641,42 @@ func (f *clusterFixture) EnableNetworking(daemon *Daemon, password string) {
 	serverPut := server.Writable()
 	serverPut.Config["core.https_address"] = address
 	serverPut.Config["core.trust_password"] = password
+
+	require.NoError(f.t, client.UpdateServer(serverPut, ""))
+}
+
+// Enable networking in the given daemon, and set cluster.https_address to the
+// same value as core.https address. The password is optional and can be an
+// empty string.
+func (f *clusterFixture) EnableNetworkingWithClusterAddress(daemon *Daemon, password string) {
+	port, err := shared.AllocatePort()
+	require.NoError(f.t, err)
+
+	address := fmt.Sprintf("127.0.0.1:%d", port)
+
+	client := f.ClientUnix(daemon)
+	server, _, err := client.GetServer()
+	require.NoError(f.t, err)
+	serverPut := server.Writable()
+	serverPut.Config["core.https_address"] = address
+	serverPut.Config["core.trust_password"] = password
+	serverPut.Config["cluster.https_address"] = address
+
+	require.NoError(f.t, client.UpdateServer(serverPut, ""))
+}
+
+// Enable a dedicated cluster address in the given daemon.
+func (f *clusterFixture) EnableClusterAddress(daemon *Daemon) {
+	port, err := shared.AllocatePort()
+	require.NoError(f.t, err)
+
+	address := fmt.Sprintf("127.0.0.1:%d", port)
+
+	client := f.ClientUnix(daemon)
+	server, _, err := client.GetServer()
+	require.NoError(f.t, err)
+	serverPut := server.Writable()
+	serverPut.Config["cluster.https_address"] = address
 
 	require.NoError(f.t, client.UpdateServer(serverPut, ""))
 }

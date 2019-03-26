@@ -10,6 +10,7 @@ import (
 	"golang.org/x/net/context"
 	"gopkg.in/yaml.v2"
 
+	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/task"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
@@ -90,9 +91,10 @@ func instanceRefreshTypesTask(d *Daemon) (task.Func, task.Schedule) {
 			}
 		}
 
-		op, err := operationCreate(d.cluster, operationClassTask, "Updating instance types", nil, nil, opRun, nil, nil)
+		op, err := operationCreate(d.cluster, "", operationClassTask, db.OperationInstanceTypesUpdate, nil, nil, opRun, nil, nil)
 		if err != nil {
 			logger.Error("Failed to start instance types update operation", log.Ctx{"err": err})
+			return
 		}
 
 		logger.Info("Updating instance types")

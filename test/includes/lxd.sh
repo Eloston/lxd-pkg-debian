@@ -201,7 +201,7 @@ kill_lxd() {
         rm -f "${daemon_dir}/containers/lxc-monitord.log"
 
         # Support AppArmor policy cache directory
-        if apparmor_parser --help | grep -q -- --'print-cache.dir'; then
+        if apparmor_parser --help | grep -q -- '--print-cache.dir'; then
           apparmor_cache_dir="$(apparmor_parser -L "${daemon_dir}"/security/apparmor/cache --print-cache-dir)"
         else
           apparmor_cache_dir="${daemon_dir}/security/apparmor/cache"
@@ -246,7 +246,6 @@ kill_lxd() {
     "$lxd_backend"_teardown "${daemon_dir}"
 
     # Wipe the daemon directory
-    sleep 2
     wipe "${daemon_dir}"
 
     # Remove the daemon from the list
@@ -271,7 +270,7 @@ shutdown_lxd() {
 
     # Wait for any cleanup activity that might be happening right
     # after the websocket is closed.
-    sleep 2
+    sleep 0.5
 }
 
 wait_for() {

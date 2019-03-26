@@ -87,6 +87,64 @@ func TestOpen(t *testing.T) {
 	}
 }
 
+func TestOpenNoCreate(t *testing.T) {
+	filename := t.Name() + ".sqlite"
+
+	if err := os.Remove(filename); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	defer os.Remove(filename)
+
+	// https://golang.org/pkg/database/sql/#Open
+	// "Open may just validate its arguments without creating a connection
+	// to the database. To verify that the data source name is valid, call Ping."
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?mode=rw", filename))
+	if err == nil {
+		defer db.Close()
+
+		err = db.Ping()
+		if err == nil {
+			t.Fatal("expected error from Open or Ping")
+		}
+	}
+
+	sqlErr, ok := err.(Error)
+	if !ok {
+		t.Fatalf("expected sqlite3.Error, but got %T", err)
+	}
+
+	if sqlErr.Code != ErrCantOpen {
+		t.Fatalf("expected SQLITE_CANTOPEN, but got %v", sqlErr)
+	}
+
+	// make sure database file truly was not created
+	if _, err := os.Stat(filename); !os.IsNotExist(err) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("expected database file to not exist")
+	}
+
+	// verify that it works if the mode is "rwc" instead
+	db, err = sql.Open("sqlite3", fmt.Sprintf("file:%s?mode=rwc", filename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatal(err)
+	}
+
+	// make sure database file truly was created
+	if _, err := os.Stat(filename); err != nil {
+		if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		t.Fatal("expected database file to exist")
+	}
+}
+
 func TestReadonly(t *testing.T) {
 	tempFilename := TempFilename(t)
 	defer os.Remove(tempFilename)
@@ -1609,6 +1667,26 @@ func TestAuthorizer(t *testing.T) {
 		if err == nil {
 			t.Fatalf("Authorizer didn't worked - nil received, but error expected: [%v]", statement)
 		}
+	}
+}
+
+func TestNonColumnString(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var x interface{}
+	if err := db.QueryRow("SELECT 'hello'").Scan(&x); err != nil {
+		t.Fatal(err)
+	}
+	s, ok := x.(string)
+	if !ok {
+		t.Fatalf("non-column string must return string but got %T", x)
+	}
+	if s != "hello" {
+		t.Fatalf("non-column string must return %q but got %q", "hello", s)
 	}
 }
 

@@ -328,15 +328,15 @@ func (c *ClusterTx) NodeIsEmpty(id int64) (string, error) {
 	// Check if the node has any containers.
 	containers, err := query.SelectStrings(c.tx, "SELECT name FROM containers WHERE node_id=?", id)
 	if err != nil {
-		return "", errors.Wrapf(err, "failed to get containers for node %d", id)
+		return "", errors.Wrapf(err, "Failed to get containers for node %d", id)
 	}
 	if len(containers) > 0 {
 		message := fmt.Sprintf(
-			"node still has the following containers: %s", strings.Join(containers, ", "))
+			"Node still has the following containers: %s", strings.Join(containers, ", "))
 		return message, nil
 	}
 
-	// Check if the node has any images available only in.
+	// Check if the node has any images available only in it.
 	images := []struct {
 		fingerprint string
 		nodeID      int64
@@ -357,7 +357,7 @@ SELECT fingerprint, node_id FROM images JOIN images_nodes ON images.id=images_no
 	defer stmt.Close()
 	err = query.SelectObjects(stmt, dest)
 	if err != nil {
-		return "", errors.Wrapf(err, "failed to get image list for node %d", id)
+		return "", errors.Wrapf(err, "Failed to get image list for node %d", id)
 	}
 	index := map[string][]int64{} // Map fingerprints to IDs of nodes
 	for _, image := range images {
@@ -376,7 +376,20 @@ SELECT fingerprint, node_id FROM images JOIN images_nodes ON images.id=images_no
 
 	if len(fingerprints) > 0 {
 		message := fmt.Sprintf(
-			"node still has the following images: %s", strings.Join(fingerprints, ", "))
+			"Node still has the following images: %s", strings.Join(fingerprints, ", "))
+		return message, nil
+	}
+
+	// Check if the node has any custom volumes.
+	volumes, err := query.SelectStrings(
+		c.tx, "SELECT name FROM storage_volumes WHERE node_id=? AND type=?",
+		id, StoragePoolVolumeTypeCustom)
+	if err != nil {
+		return "", errors.Wrapf(err, "Failed to get custom volumes for node %d", id)
+	}
+	if len(volumes) > 0 {
+		message := fmt.Sprintf(
+			"Node still has the following custom volumes: %s", strings.Join(volumes, ", "))
 		return message, nil
 	}
 
@@ -440,8 +453,9 @@ func (c *ClusterTx) NodeOfflineThreshold() (time.Duration, error) {
 	return threshold, nil
 }
 
-// NodeWithLeastContainers returns the name of the non-offline node with
-// with the least number of containers.
+// NodeWithLeastContainers returns the name of the non-offline node with with
+// the least number of containers (either already created or being created with
+// an operation).
 func (c *ClusterTx) NodeWithLeastContainers() (string, error) {
 	threshold, err := c.NodeOfflineThreshold()
 	if err != nil {
@@ -458,10 +472,21 @@ func (c *ClusterTx) NodeWithLeastContainers() (string, error) {
 		if node.IsOffline(threshold) {
 			continue
 		}
-		count, err := query.Count(c.tx, "containers", "node_id=?", node.ID)
+
+		// Fetch the number of containers already created on this node.
+		created, err := query.Count(c.tx, "containers", "node_id=?", node.ID)
 		if err != nil {
-			return "", errors.Wrap(err, "failed to get containers count")
+			return "", errors.Wrap(err, "Failed to get containers count")
 		}
+
+		// Fetch the number of containers currently being created on this node.
+		pending, err := query.Count(
+			c.tx, "operations", "node_id=? AND type=?", node.ID, OperationContainerCreate)
+		if err != nil {
+			return "", errors.Wrap(err, "Failed to get pending containers count")
+		}
+
+		count := created + pending
 		if containers == -1 || count < containers {
 			containers = count
 			name = node.Name

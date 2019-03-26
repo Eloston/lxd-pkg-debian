@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -38,6 +39,7 @@ var apiInternal = []Command{
 	internalClusterRebalanceCmd,
 	internalClusterPromoteCmd,
 	internalClusterContainerMovedCmd,
+	internalGarbageCollectorCmd,
 }
 
 var internalShutdownCmd = Command{
@@ -69,6 +71,11 @@ var internalSQLCmd = Command{
 var internalContainersCmd = Command{
 	name: "containers",
 	post: internalImport,
+}
+
+var internalGarbageCollectorCmd = Command{
+	name: "gc",
+	get:  internalGC,
 }
 
 func internalWaitReady(d *Daemon, r *http.Request) Response {
@@ -337,6 +344,8 @@ type internalImportPost struct {
 }
 
 func internalImport(d *Daemon, r *http.Request) Response {
+	project := projectParam(r)
+
 	req := &internalImportPost{}
 	// Parse the request.
 	err := json.NewDecoder(r.Body).Decode(&req)
@@ -367,7 +376,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 	containerMntPoints := []string{}
 	containerPoolName := ""
 	for _, poolName := range storagePoolNames {
-		containerMntPoint := getContainerMountPoint(poolName, req.Name)
+		containerMntPoint := getContainerMountPoint(project, poolName, req.Name)
 		if shared.PathExists(containerMntPoint) {
 			containerMntPoints = append(containerMntPoints, containerMntPoint)
 			containerPoolName = poolName
@@ -486,7 +495,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 	if len(backup.Snapshots) > 0 {
 		switch backup.Pool.Driver {
 		case "btrfs":
-			snapshotsDirPath := getSnapshotMountPoint(poolName, req.Name)
+			snapshotsDirPath := getSnapshotMountPoint(project, poolName, req.Name)
 			snapshotsDir, err := os.Open(snapshotsDirPath)
 			if err != nil {
 				return InternalError(err)
@@ -498,7 +507,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 			}
 			snapshotsDir.Close()
 		case "dir":
-			snapshotsDirPath := getSnapshotMountPoint(poolName, req.Name)
+			snapshotsDirPath := getSnapshotMountPoint(project, poolName, req.Name)
 			snapshotsDir, err := os.Open(snapshotsDirPath)
 			if err != nil {
 				return InternalError(err)
@@ -539,7 +548,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 
 			onDiskPoolName := backup.Pool.Config["ceph.osd.pool_name"]
 			snaps, err := cephRBDVolumeListSnapshots(clusterName,
-				onDiskPoolName, req.Name,
+				onDiskPoolName, projectPrefix(project, req.Name),
 				storagePoolVolumeTypeNameContainer, userName)
 			if err != nil {
 				if err != db.ErrNoSuchObject {
@@ -612,10 +621,10 @@ func internalImport(d *Daemon, r *http.Request) Response {
 		switch backup.Pool.Driver {
 		case "btrfs":
 			snapName := fmt.Sprintf("%s/%s", req.Name, od)
-			err = btrfsSnapshotDeleteInternal(poolName, snapName)
+			err = btrfsSnapshotDeleteInternal(project, poolName, snapName)
 		case "dir":
 			snapName := fmt.Sprintf("%s/%s", req.Name, od)
-			err = dirSnapshotDeleteInternal(poolName, snapName)
+			err = dirSnapshotDeleteInternal(project, poolName, snapName)
 		case "lvm":
 			onDiskPoolName := backup.Pool.Config["lvm.vg_name"]
 			if onDiskPoolName == "" {
@@ -623,7 +632,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 			}
 			snapName := fmt.Sprintf("%s/%s", req.Name, od)
 			snapPath := containerPath(snapName, true)
-			err = lvmContainerDeleteInternal(poolName, req.Name,
+			err = lvmContainerDeleteInternal(project, poolName, req.Name,
 				true, onDiskPoolName, snapPath)
 		case "ceph":
 			clusterName := "ceph"
@@ -637,9 +646,9 @@ func internalImport(d *Daemon, r *http.Request) Response {
 			}
 
 			onDiskPoolName := backup.Pool.Config["ceph.osd.pool_name"]
-			snapName := fmt.Sprintf("snapshot_%s", od)
+			snapName := fmt.Sprintf("snapshot_%s", projectPrefix(project, od))
 			ret := cephContainerSnapshotDelete(clusterName,
-				onDiskPoolName, req.Name,
+				onDiskPoolName, projectPrefix(project, req.Name),
 				storagePoolVolumeTypeNameContainer, snapName, userName)
 			if ret < 0 {
 				err = fmt.Errorf(`Failed to delete snapshot`)
@@ -647,7 +656,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 		case "zfs":
 			onDiskPoolName := backup.Pool.Config["zfs.pool_name"]
 			snapName := fmt.Sprintf("%s/%s", req.Name, od)
-			err = zfsSnapshotDeleteInternal(poolName, snapName,
+			err = zfsSnapshotDeleteInternal(project, poolName, snapName,
 				onDiskPoolName)
 		}
 		if err != nil {
@@ -658,7 +667,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 	for _, snap := range backup.Snapshots {
 		switch backup.Pool.Driver {
 		case "btrfs":
-			snpMntPt := getSnapshotMountPoint(backup.Pool.Name, snap.Name)
+			snpMntPt := getSnapshotMountPoint(project, backup.Pool.Name, snap.Name)
 			if !shared.PathExists(snpMntPt) || !isBtrfsSubVolume(snpMntPt) {
 				if req.Force {
 					continue
@@ -666,7 +675,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 				return BadRequest(needForce)
 			}
 		case "dir":
-			snpMntPt := getSnapshotMountPoint(backup.Pool.Name, snap.Name)
+			snpMntPt := getSnapshotMountPoint(project, backup.Pool.Name, snap.Name)
 			if !shared.PathExists(snpMntPt) {
 				if req.Force {
 					continue
@@ -702,6 +711,8 @@ func internalImport(d *Daemon, r *http.Request) Response {
 
 			onDiskPoolName := backup.Pool.Config["ceph.osd.pool_name"]
 			ctName, csName, _ := containerGetParentAndSnapshotName(snap.Name)
+			ctName = projectPrefix(project, ctName)
+			csName = projectPrefix(project, csName)
 			snapshotName := fmt.Sprintf("snapshot_%s", csName)
 
 			exists := cephRBDSnapshotExists(clusterName,
@@ -783,7 +794,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 
 		// Remove the storage volume db entry for the container since
 		// force was specified.
-		err := d.cluster.StoragePoolVolumeDelete(req.Name,
+		err := d.cluster.StoragePoolVolumeDelete("default", req.Name,
 			storagePoolVolumeTypeContainer, poolID)
 		if err != nil {
 			return SmartError(err)
@@ -793,7 +804,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 	if containerErr == nil {
 		// Remove the storage volume db entry for the container since
 		// force was specified.
-		err := d.cluster.ContainerRemove(req.Name)
+		err := d.cluster.ContainerRemove(project, req.Name)
 		if err != nil {
 			return SmartError(err)
 		}
@@ -846,14 +857,14 @@ func internalImport(d *Daemon, r *http.Request) Response {
 		}
 
 		if snapErr == nil {
-			err := d.cluster.ContainerRemove(snap.Name)
+			err := d.cluster.ContainerRemove(project, snap.Name)
 			if err != nil {
 				return SmartError(err)
 			}
 		}
 
 		if csVolErr == nil {
-			err := d.cluster.StoragePoolVolumeDelete(snap.Name,
+			err := d.cluster.StoragePoolVolumeDelete("default", snap.Name,
 				storagePoolVolumeTypeContainer, poolID)
 			if err != nil {
 				return SmartError(err)
@@ -887,14 +898,15 @@ func internalImport(d *Daemon, r *http.Request) Response {
 		}
 
 		_, err = containerCreateInternal(d.State(), db.ContainerArgs{
+			Project:      project,
 			Architecture: arch,
 			BaseImage:    baseImage,
 			Config:       snap.Config,
-			CreationDate: snap.CreationDate,
+			CreationDate: snap.CreatedAt,
 			Ctype:        db.CTypeSnapshot,
 			Devices:      snap.Devices,
 			Ephemeral:    snap.Ephemeral,
-			LastUsedDate: snap.LastUsedDate,
+			LastUsedDate: snap.LastUsedAt,
 			Name:         snap.Name,
 			Profiles:     snap.Profiles,
 			Stateful:     snap.Stateful,
@@ -904,14 +916,13 @@ func internalImport(d *Daemon, r *http.Request) Response {
 		}
 
 		// Recreate missing mountpoints and symlinks.
-		snapshotMountPoint := getSnapshotMountPoint(backup.Pool.Name,
+		snapshotMountPoint := getSnapshotMountPoint(project, backup.Pool.Name,
 			snap.Name)
 		sourceName, _, _ := containerGetParentAndSnapshotName(snap.Name)
-		snapshotMntPointSymlinkTarget := shared.VarPath("storage-pools",
-			backup.Pool.Name, "snapshots", sourceName)
+		sourceName = projectPrefix(project, sourceName)
+		snapshotMntPointSymlinkTarget := shared.VarPath("storage-pools", backup.Pool.Name, "containers-snapshots", sourceName)
 		snapshotMntPointSymlink := shared.VarPath("snapshots", sourceName)
-		err = createSnapshotMountpoint(snapshotMountPoint,
-			snapshotMntPointSymlinkTarget, snapshotMntPointSymlink)
+		err = createSnapshotMountpoint(snapshotMountPoint, snapshotMntPointSymlinkTarget, snapshotMntPointSymlink)
 		if err != nil {
 			return InternalError(err)
 		}
@@ -943,6 +954,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 		return SmartError(err)
 	}
 	_, err = containerCreateInternal(d.State(), db.ContainerArgs{
+		Project:      project,
 		Architecture: arch,
 		BaseImage:    baseImage,
 		Config:       backup.Container.Config,
@@ -961,7 +973,7 @@ func internalImport(d *Daemon, r *http.Request) Response {
 		return SmartError(err)
 	}
 
-	containerPath := containerPath(req.Name, false)
+	containerPath := containerPath(projectPrefix(project, req.Name), false)
 	isPrivileged := false
 	if backup.Container.Config["security.privileged"] == "" {
 		isPrivileged = true
@@ -971,6 +983,14 @@ func internalImport(d *Daemon, r *http.Request) Response {
 	if err != nil {
 		return InternalError(err)
 	}
+
+	return EmptySyncResponse
+}
+
+func internalGC(d *Daemon, r *http.Request) Response {
+	logger.Infof("Started forced garbage collection run")
+	runtime.GC()
+	logger.Infof("Completed forced garbage collection run")
 
 	return EmptySyncResponse
 }

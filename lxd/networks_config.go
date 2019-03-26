@@ -26,7 +26,8 @@ var networkConfigKeys = map[string]func(value string) error{
 
 		return nil
 	},
-	"bridge.mtu": shared.IsInt64,
+	"bridge.hwaddr": shared.IsAny,
+	"bridge.mtu":    shared.IsInt64,
 	"bridge.mode": func(value string) error {
 		return shared.IsOneOf(value, []string{"standard", "fan"})
 	},
@@ -46,12 +47,13 @@ var networkConfigKeys = map[string]func(value string) error{
 	"tunnel.TARGET.protocol": func(value string) error {
 		return shared.IsOneOf(value, []string{"gre", "vxlan"})
 	},
-	"tunnel.TARGET.local":     networkValidAddressV4,
-	"tunnel.TARGET.remote":    networkValidAddressV4,
+	"tunnel.TARGET.local":     networkValidAddress,
+	"tunnel.TARGET.remote":    networkValidAddress,
 	"tunnel.TARGET.port":      networkValidPort,
-	"tunnel.TARGET.group":     networkValidAddressV4,
+	"tunnel.TARGET.group":     networkValidAddress,
 	"tunnel.TARGET.id":        shared.IsInt64,
 	"tunnel.TARGET.interface": networkValidName,
+	"tunnel.TARGET.ttl":       shared.IsUint8,
 
 	"ipv4.address": func(value string) error {
 		if shared.IsOneOf(value, []string{"none", "auto"}) == nil {
@@ -60,8 +62,11 @@ var networkConfigKeys = map[string]func(value string) error{
 
 		return networkValidAddressCIDRV4(value)
 	},
-	"ipv4.firewall":     shared.IsBool,
-	"ipv4.nat":          shared.IsBool,
+	"ipv4.firewall": shared.IsBool,
+	"ipv4.nat":      shared.IsBool,
+	"ipv4.nat.order": func(value string) error {
+		return shared.IsOneOf(value, []string{"before", "after"})
+	},
 	"ipv4.dhcp":         shared.IsBool,
 	"ipv4.dhcp.gateway": networkValidAddressV4,
 	"ipv4.dhcp.expiry":  shared.IsAny,
@@ -76,8 +81,11 @@ var networkConfigKeys = map[string]func(value string) error{
 
 		return networkValidAddressCIDRV6(value)
 	},
-	"ipv6.firewall":      shared.IsBool,
-	"ipv6.nat":           shared.IsBool,
+	"ipv6.firewall": shared.IsBool,
+	"ipv6.nat":      shared.IsBool,
+	"ipv6.nat.order": func(value string) error {
+		return shared.IsOneOf(value, []string{"before", "after"})
+	},
 	"ipv6.dhcp":          shared.IsBool,
 	"ipv6.dhcp.expiry":   shared.IsAny,
 	"ipv6.dhcp.stateful": shared.IsBool,

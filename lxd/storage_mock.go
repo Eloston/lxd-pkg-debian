@@ -1,14 +1,14 @@
 package main
 
 import (
-	"fmt"
+	"io"
 
 	"github.com/gorilla/websocket"
 
 	"github.com/lxc/lxd/lxd/migration"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/shared/api"
-	"github.com/lxc/lxd/shared/idmap"
+	"github.com/lxc/lxd/shared/ioprogress"
 	"github.com/lxc/lxd/shared/logger"
 )
 
@@ -118,7 +118,7 @@ func (s *storageMock) ContainerCreate(container container) error {
 }
 
 func (s *storageMock) ContainerCreateFromImage(
-	container container, imageFingerprint string) error {
+	container container, imageFingerprint string, tracker *ioprogress.ProgressTracker) error {
 
 	return nil
 }
@@ -132,6 +132,10 @@ func (s *storageMock) ContainerDelete(container container) error {
 }
 
 func (s *storageMock) ContainerCopy(target container, source container, containerOnly bool) error {
+	return nil
+}
+
+func (s *storageMock) ContainerRefresh(target container, source container, snapshots []container) error {
 	return nil
 }
 
@@ -189,7 +193,15 @@ func (s *storageMock) ContainerSnapshotCreateEmpty(snapshotContainer container) 
 	return nil
 }
 
-func (s *storageMock) ImageCreate(fingerprint string) error {
+func (s *storageMock) ContainerBackupCreate(backup backup, sourceContainer container) error {
+	return nil
+}
+
+func (s *storageMock) ContainerBackupLoad(info backupInfo, data io.ReadSeeker, tarArgs []string) error {
+	return nil
+}
+
+func (s *storageMock) ImageCreate(fingerprint string, tracker *ioprogress.ProgressTracker) error {
 	return nil
 }
 
@@ -213,11 +225,11 @@ func (s *storageMock) PreservesInodes() bool {
 	return false
 }
 
-func (s *storageMock) MigrationSource(container container, containerOnly bool) (MigrationStorageSourceDriver, error) {
-	return nil, fmt.Errorf("not implemented")
+func (s *storageMock) MigrationSource(args MigrationSourceArgs) (MigrationStorageSourceDriver, error) {
+	return nil, nil
 }
 
-func (s *storageMock) MigrationSink(live bool, container container, snapshots []*migration.Snapshot, conn *websocket.Conn, srcIdmap *idmap.IdmapSet, op *operation, containerOnly bool, args MigrationSinkArgs) error {
+func (s *storageMock) MigrationSink(conn *websocket.Conn, op *operation, args MigrationSinkArgs) error {
 	return nil
 }
 
@@ -233,11 +245,11 @@ func (s *storageMock) StoragePoolVolumeCopy(source *api.StorageVolumeSource) err
 	return nil
 }
 
-func (s *storageMock) StorageMigrationSource() (MigrationStorageSourceDriver, error) {
+func (s *storageMock) StorageMigrationSource(args MigrationSourceArgs) (MigrationStorageSourceDriver, error) {
 	return nil, nil
 }
 
-func (s *storageMock) StorageMigrationSink(conn *websocket.Conn, op *operation, storage storage, args MigrationSinkArgs) error {
+func (s *storageMock) StorageMigrationSink(conn *websocket.Conn, op *operation, args MigrationSinkArgs) error {
 	return nil
 }
 
@@ -250,5 +262,17 @@ func (s *storageMock) GetStoragePoolVolume() *api.StorageVolume {
 }
 
 func (s *storageMock) GetState() *state.State {
+	return nil
+}
+
+func (s *storageMock) StoragePoolVolumeSnapshotCreate(target *api.StorageVolumeSnapshotsPost) error {
+	return nil
+}
+
+func (s *storageMock) StoragePoolVolumeSnapshotDelete() error {
+	return nil
+}
+
+func (s *storageMock) StoragePoolVolumeSnapshotRename(newName string) error {
 	return nil
 }
