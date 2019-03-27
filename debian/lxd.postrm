@@ -8,8 +8,6 @@ if [ "$1" = "remove" ]; then
     # Manual init script handling
     if [ -d /run/systemd/system ]; then
         deb-systemd-invoke stop lxd-containers.service lxd.service lxd.socket >/dev/null || true
-    elif [ -x "/etc/init.d/lxd" ] || [ -e "/etc/init/lxd.conf" ]; then
-        invoke-rc.d lxd stop || true
     fi
 
     # dnsmasq config handling

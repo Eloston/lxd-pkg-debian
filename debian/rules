@@ -143,8 +143,6 @@ override_dh_shlibdeps:
 	LD_LIBRARY_PATH=$(PKGDIR)/usr/lib/lxd/:${LD_LIBRARY_PATH} dh_shlibdeps -v
 
 override_dh_installinit:
-	# Disable upstart integration on artful+
-	rm -f debian/lxd.upstart
 	cp debian/lxd.maintscript.in debian/lxd.maintscript
 	# We handle starting and restarting things ourselves
 	dh_systemd_enable -plxd --name=lxd-containers lxd-containers.service
@@ -154,7 +152,6 @@ override_dh_installinit:
 
 	# Update arch-specific paths
 	sed -i "s#@LIBEXECDIR@#/usr/lib/${DEB_HOST_MULTIARCH}#g" debian/lxd/lib/systemd/system/lxd.service
-	sed -i "s#@LIBEXECDIR@#/usr/lib/${DEB_HOST_MULTIARCH}#g" debian/lxd/etc/init.d/lxd
 
 override_dh_systemd_start:
 	echo "Not running dh_systemd_start"

@@ -11,8 +11,6 @@ if [ -d /run/systemd/system ]; then
     if ! systemctl -q is-active lxd.service; then
         deb-systemd-invoke restart lxd-containers.service >/dev/null || true
     fi
-elif  [ -x "/etc/init.d/lxd" ] || [ -e "/etc/init/lxd.conf" ]; then
-    invoke-rc.d lxd start || exit $?
 fi
 
 # Configure dnsmasq
