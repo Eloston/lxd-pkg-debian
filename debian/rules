@@ -101,9 +101,6 @@ endif
 	mv ${GOPATH}/lxd.tmp ${GOPATH}/src/github.com/lxc/lxd
 
 override_dh_install:
-	# Install lxc-to-lxd
-	cp scripts/lxc-to-lxd $(PKGDIR)/usr/bin/lxc-to-lxd
-
 	# Install the manpages
 	mkdir -p $(PKGDIR)/usr/share/man/man1/
 	help2man $(PKGDIR)/usr/bin/fuidshift -n "uid/gid shifter" --no-info > $(PKGDIR)/usr/share/man/man1/fuidshift.1
@@ -111,10 +108,6 @@ override_dh_install:
 	help2man $(PKGDIR)/usr/bin/lxd-benchmark -n "The container lightervisor - benchmark" --no-info --no-discard-stderr > $(PKGDIR)/usr/share/man/man1/lxd-benchmark.1
 	LD_LIBRARY_PATH=$(PKGDIR)/dist/sqlite/.libs/:$(CURDIR)/dist/dqlite/.libs/:${LD_LIBRARY_PATH} $(PKGDIR)/usr/bin/lxd manpage $(PKGDIR)/usr/share/man/man1/
 	$(PKGDIR)/usr/bin/lxc manpage $(PKGDIR)/usr/share/man/man1/
-
-	# Install bash completion scripts
-	mkdir -p $(PKGDIR)/usr/share/bash-completion/completions/
-	cp scripts/bash/lxd-client $(PKGDIR)/usr/share/bash-completion/completions/lxc
 
 	# Prepare dev package
 	rm -Rf $(PKGDIR)/usr/share/gocode/src/github.com/lxc/

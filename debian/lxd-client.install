@@ -1,4 +1,3 @@
 usr/bin/lxc
-usr/share/bash-completion/completions/lxc
 usr/share/man/man1/lxc.*.1
 usr/share/man/man1/lxc.1
