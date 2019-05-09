@@ -1,5 +1,6 @@
-#include <assert.h>
 #include <stdlib.h>
+
+#include "./lib/assert.h"
 
 #include "metrics.h"
 

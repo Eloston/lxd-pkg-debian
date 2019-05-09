@@ -17,7 +17,6 @@ package rafttest
 import (
 	"context"
 	"fmt"
-	"log"
 	"runtime"
 	"testing"
 	"time"
@@ -27,13 +26,14 @@ import (
 	"github.com/CanonicalLtd/raft-test/internal/fsms"
 	"github.com/CanonicalLtd/raft-test/internal/network"
 	"github.com/hashicorp/raft"
+	"github.com/hashicorp/go-hclog"
 )
 
 // Control the events happening in a cluster of raft servers, such has leadership
 // changes, failures and shutdowns.
 type Control struct {
 	t        testing.TB
-	logger   *log.Logger
+	logger   hclog.Logger
 	election *election.Tracker
 	network  *network.Network
 	watcher  *fsms.Watcher
@@ -55,7 +55,7 @@ type Control struct {
 //
 // It must be called by every test creating a test cluster with Cluster().
 func (c *Control) Close() {
-	c.logger.Printf("[DEBUG] raft-test: close: start")
+	c.logger.Debug("[DEBUG] raft-test: close: start")
 
 	// First tell the election tracker that we don't care anymore about
 	// notifications. Any value received from the NotifyCh's will be dropped
@@ -69,7 +69,7 @@ func (c *Control) Close() {
 	// sending to NotifyCh's.
 	c.election.Close()
 
-	c.logger.Printf("[DEBUG] raft-test: close: done")
+	c.logger.Debug("[DEBUG] raft-test: close: done")
 }
 
 // Elect a server as leader.
@@ -79,7 +79,7 @@ func (c *Control) Close() {
 func (c *Control) Elect(id raft.ServerID) *Term {
 	c.t.Helper()
 
-	c.logger.Printf("[DEBUG] raft-test: elect: start (server %s)", id)
+	c.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: elect: start (server %s)", id))
 
 	// Wait for the current leader (if any) to be fully deposed.
 	if c.deposing != nil {
@@ -103,7 +103,7 @@ func (c *Control) Elect(id raft.ServerID) *Term {
 		// We did not acquire leadership, let's retry.
 		if leadership == nil {
 			if n < maxElectionRounds {
-				c.logger.Printf("[DEBUG] raft-test: elect: server %s: retry %d ", id, n+1)
+				c.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: elect: server %s: retry %d ", id, n+1))
 				continue
 			}
 		}
@@ -113,7 +113,7 @@ func (c *Control) Elect(id raft.ServerID) *Term {
 		// become followers.
 		if !c.waitLeadershipPropagated(id, leadership) {
 			if n < maxElectionRounds {
-				c.logger.Printf("[DEBUG] raft-test: elect: server %s: retry %d ", id, n+1)
+				c.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: elect: server %s: retry %d ", id, n+1))
 				continue
 			}
 		}
@@ -128,7 +128,7 @@ func (c *Control) Elect(id raft.ServerID) *Term {
 		// F1 ---> F2
 		//
 		// This way the cluster is fully connected. foo
-		c.logger.Printf("[DEBUG] raft-test: elect: done")
+		c.logger.Debug("[DEBUG] raft-test: elect: done")
 		term := &Term{
 			control:    c,
 			id:         id,
@@ -274,7 +274,7 @@ func (c *Control) shutdownServer(id raft.ServerID) {
 	var err error
 	select {
 	case err = <-ch:
-		c.logger.Printf("[DEBUG] raft-test: close: server %s: shutdown done", id)
+		c.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: close: server %s: shutdown done", id))
 	case <-time.After(timeout):
 		err = fmt.Errorf("timeout (%s)", timeout)
 	}
@@ -282,7 +282,7 @@ func (c *Control) shutdownServer(id raft.ServerID) {
 		return
 	}
 
-	c.logger.Printf("[DEBUG] raft-test: close: server %s: shutdown failed: %s", id, err)
+	c.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: close: server %s: shutdown failed: %s", id, err))
 
 	buf := make([]byte, 1<<16)
 	n := runtime.Stack(buf, true)
@@ -311,11 +311,11 @@ func (c *Control) waitLeadershipAcquired(id raft.ServerID) *election.Leadership 
 	c.network.Electing(id)
 
 	// First wait for the given node to become leader.
-	c.logger.Printf("[DEBUG] raft-test: elect: server %s: wait to become leader within %s", id, timeout)
+	c.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: elect: server %s: wait to become leader within %s", id, timeout))
 
 	leadership, err := future.Done()
 	if err != nil {
-		c.logger.Printf("[DEBUG] raft-test: elect: server %s: did not become leader", id)
+		c.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: elect: server %s: did not become leader", id))
 	}
 	return leadership
 
@@ -328,7 +328,7 @@ func (c *Control) waitLeadershipPropagated(id raft.ServerID, leadership *electio
 	// The leadership propagation needs to happen within the leader lease
 	// timeout, otherwise the newly elected leader will step down.
 	timeout := maximumLeaderLeaseTimeout(c.confs)
-	c.logger.Printf("[DEBUG] raft-test: elect: server %s: wait for other servers to become followers within %s", id, timeout)
+	c.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: elect: server %s: wait for other servers to become followers within %s", id, timeout))
 
 	// Get the current configuration, so we wait only for servers that are
 	// actually currently part of the cluster (some of them might have been
@@ -353,7 +353,7 @@ func (c *Control) waitLeadershipPropagated(id raft.ServerID, leadership *electio
 			select {
 			case <-leadership.Lost():
 				c.network.Deposing(id)
-				c.logger.Printf("[DEBUG] raft-test: elect: server %s: lost leadership", id)
+				c.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: elect: server %s: lost leadership", id))
 				return false
 			case <-timer:
 				c.t.Fatalf("raft-test: elect: server %s: followers did not settle", id)
@@ -365,7 +365,7 @@ func (c *Control) waitLeadershipPropagated(id raft.ServerID, leadership *electio
 			// able to append at least one log entry to it (when a
 			// server becomes leader, it always sends a LogNoop).
 			if r.State() == raft.Follower && r.Leader() == address && c.network.HasAppendedLogsFromTo(id, other) {
-				c.logger.Printf("[DEBUG] raft-test: elect: server %s: became follower", other)
+				c.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: elect: server %s: became follower", other))
 				break
 			}
 			time.Sleep(time.Millisecond)
@@ -408,7 +408,7 @@ func (c *Control) deposeUponEvent(event *event.Event, id raft.ServerID, leadersh
 
 	timeout := maximumLeaderLeaseTimeout(c.confs)
 
-	c.logger.Printf("[DEBUG] raft-test: node %s: state: wait leadership lost (timeout=%s)", id, timeout)
+	c.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: node %s: state: wait leadership lost (timeout=%s)", id, timeout))
 
 	select {
 	case <-leadership.Lost():
@@ -419,7 +419,7 @@ func (c *Control) deposeUponEvent(event *event.Event, id raft.ServerID, leadersh
 	event.Ack()
 
 	if !c.errored {
-		c.logger.Printf("[DEBUG] raft-test: server %s: leadership lost", id)
+		c.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: server %s: leadership lost", id))
 	}
 
 	c.deposing <- struct{}{}
@@ -431,7 +431,7 @@ func (c *Control) deposeUponEvent(event *event.Event, id raft.ServerID, leadersh
 func (c *Control) snapshotUponEvent(event *event.Event, id raft.ServerID) {
 	<-event.Watch()
 
-	c.logger.Printf("[DEBUG] raft-test: server %s: control: take snapshot", id)
+	c.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: server %s: control: take snapshot", id))
 
 	r := c.servers[id]
 	c.snapshotFuture = r.Snapshot()

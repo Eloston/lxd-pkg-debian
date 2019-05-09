@@ -6,9 +6,6 @@ env:
   - DEBUG="--enable-debug"
 
 script:
-  - git rev-parse --git-dir >/dev/null
-  - git log -1 --format=format:%ci%n | sed -e 's/ [-+].*$//;s/ /T/;s/^/D /' > manifest
-  - echo $(git log -1 --format=format:%H) > manifest.uuid
   - ./configure --enable-wal-replication ${DEBUG}
   - make
   - make testfixture

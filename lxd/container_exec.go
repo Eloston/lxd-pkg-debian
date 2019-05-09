@@ -21,6 +21,7 @@ import (
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
+	"github.com/lxc/lxd/shared/netutils"
 	"github.com/lxc/lxd/shared/version"
 
 	log "github.com/lxc/lxd/shared/log15"
@@ -238,7 +239,7 @@ func (s *execWs) Do(op *operation) error {
 			s.connsLock.Unlock()
 
 			logger.Debugf("Starting to mirror websocket")
-			readDone, writeDone := shared.WebsocketExecMirror(conn, ptys[0], ptys[0], attachedChildIsDead, int(ptys[0].Fd()))
+			readDone, writeDone := netutils.WebsocketExecMirror(conn, ptys[0], ptys[0], attachedChildIsDead, int(ptys[0].Fd()))
 
 			<-readDone
 			<-writeDone
@@ -426,7 +427,7 @@ func containerExecPost(d *Daemon, r *http.Request) Response {
 		ws := &execWs{}
 		ws.fds = map[int]string{}
 
-		idmapset, err := c.IdmapSet()
+		idmapset, err := c.CurrentIdmap()
 		if err != nil {
 			return InternalError(err)
 		}

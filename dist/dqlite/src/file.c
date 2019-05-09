@@ -1,33 +1,36 @@
-#include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <sqlite3.h>
 
+#include "./lib/assert.h"
+
 #include "format.h"
 
 /* Guess the file type by looking the filename. */
-static int dqlite__file_guess_type(const char *filename) {
+static int guess_file_type(const char *filename)
+{
 	/* TODO: improve the check. */
 	if (strstr(filename, "-wal") != NULL) {
-		return DQLITE__FORMAT_WAL;
+		return FORMAT__WAL;
 	}
 
-	return DQLITE__FORMAT_DB;
+	return FORMAT__DB;
 }
 
 int dqlite_file_read(const char *vfs_name,
-                     const char *filename,
-                     uint8_t **  buf,
-                     size_t *    len) {
-	sqlite3_vfs * vfs;
-	int           type;
-	int           flags;
+		     const char *filename,
+		     uint8_t **buf,
+		     size_t *len)
+{
+	sqlite3_vfs *vfs;
+	int type;
+	int flags;
 	sqlite3_file *file;
-	unsigned      page_size;
+	unsigned page_size;
 	sqlite3_int64 offset;
-	int           rc;
+	int rc;
 
 	assert(vfs_name != NULL);
 	assert(filename != NULL);
@@ -41,12 +44,12 @@ int dqlite_file_read(const char *vfs_name,
 		goto err;
 	}
 
-	type = dqlite__file_guess_type(filename);
+	type = guess_file_type(filename);
 
 	/* Common flags */
 	flags = SQLITE_OPEN_READWRITE;
 
-	if (type == DQLITE__FORMAT_DB) {
+	if (type == FORMAT__DB) {
 		flags |= SQLITE_OPEN_MAIN_DB;
 	} else {
 		flags |= SQLITE_OPEN_WAL;
@@ -85,13 +88,13 @@ int dqlite_file_read(const char *vfs_name,
 
 	/* Read the header. The buffer size is enough for both database and WAL
 	 * files. */
-	rc = file->pMethods->xRead(file, *buf, DQLITE__FORMAT_WAL_HDR_SIZE, 0);
+	rc = file->pMethods->xRead(file, *buf, FORMAT__WAL_HDR_SIZE, 0);
 	if (rc != SQLITE_OK) {
 		goto err_after_buf_malloc;
 	}
 
 	/* Figure the page size. */
-	rc = dqlite__format_get_page_size(type, *buf, &page_size);
+	rc = format__get_page_size(type, *buf, &page_size);
 	if (rc != SQLITE_OK) {
 		goto err_after_buf_malloc;
 	}
@@ -100,22 +103,22 @@ int dqlite_file_read(const char *vfs_name,
 
 	/* If this is a WAL file , we have already read the header and we can
 	 * move on. */
-	if (type == DQLITE__FORMAT_WAL) {
-		offset += DQLITE__FORMAT_WAL_HDR_SIZE;
+	if (type == FORMAT__WAL) {
+		offset += FORMAT__WAL_HDR_SIZE;
 	}
 
 	while ((size_t)offset < *len) {
 		uint8_t *pos = (*buf) + offset;
 
-		if (type == DQLITE__FORMAT_WAL) {
+		if (type == FORMAT__WAL) {
 			/* Read the frame header */
 			rc = file->pMethods->xRead(
-			    file, pos, DQLITE__FORMAT_WAL_FRAME_HDR_SIZE, offset);
+			    file, pos, FORMAT__WAL_FRAME_HDR_SIZE, offset);
 			if (rc != SQLITE_OK) {
 				goto err_after_buf_malloc;
 			}
-			offset += DQLITE__FORMAT_WAL_FRAME_HDR_SIZE;
-			pos += DQLITE__FORMAT_WAL_FRAME_HDR_SIZE;
+			offset += FORMAT__WAL_FRAME_HDR_SIZE;
+			pos += FORMAT__WAL_FRAME_HDR_SIZE;
 		}
 
 		/* Read the page */
@@ -151,17 +154,18 @@ err:
 }
 
 int dqlite_file_write(const char *vfs_name,
-                      const char *filename,
-                      uint8_t *   buf,
-                      size_t      len) {
-	sqlite3_vfs * vfs;
+		      const char *filename,
+		      uint8_t *buf,
+		      size_t len)
+{
+	sqlite3_vfs *vfs;
 	sqlite3_file *file;
-	int           type;
-	int           flags;
-	unsigned int  page_size;
+	int type;
+	int flags;
+	unsigned int page_size;
 	sqlite3_int64 offset;
-	uint8_t *     pos;
-	int           rc;
+	uint8_t *pos;
+	int rc;
 
 	assert(vfs_name != NULL);
 	assert(filename != NULL);
@@ -176,12 +180,12 @@ int dqlite_file_write(const char *vfs_name,
 	}
 
 	/* Determine if this is a database or a WAL file. */
-	type = dqlite__file_guess_type(filename);
+	type = guess_file_type(filename);
 
 	/* Common flags */
 	flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
 
-	if (type == DQLITE__FORMAT_DB) {
+	if (type == FORMAT__DB) {
 		flags |= SQLITE_OPEN_MAIN_DB;
 	} else {
 		flags |= SQLITE_OPEN_WAL;
@@ -205,35 +209,35 @@ int dqlite_file_write(const char *vfs_name,
 	}
 
 	/* Figure out the page size */
-	rc = dqlite__format_get_page_size(type, buf, &page_size);
+	rc = format__get_page_size(type, buf, &page_size);
 	if (rc != SQLITE_OK) {
 		goto err_after_file_open;
 	}
 
 	offset = 0;
-	pos    = buf;
+	pos = buf;
 
 	/* If this is a WAL file , write the header first. */
-	if (type == DQLITE__FORMAT_WAL) {
-		rc = file->pMethods->xWrite(
-		    file, pos, DQLITE__FORMAT_WAL_HDR_SIZE, offset);
+	if (type == FORMAT__WAL) {
+		rc = file->pMethods->xWrite(file, pos, FORMAT__WAL_HDR_SIZE,
+					    offset);
 		if (rc != SQLITE_OK) {
 			goto err_after_file_open;
 		}
-		offset += DQLITE__FORMAT_WAL_HDR_SIZE;
-		pos += DQLITE__FORMAT_WAL_HDR_SIZE;
+		offset += FORMAT__WAL_HDR_SIZE;
+		pos += FORMAT__WAL_HDR_SIZE;
 	}
 
 	while ((size_t)offset < len) {
-		if (type == DQLITE__FORMAT_WAL) {
+		if (type == FORMAT__WAL) {
 			/* Write the frame header */
 			rc = file->pMethods->xWrite(
-			    file, pos, DQLITE__FORMAT_WAL_FRAME_HDR_SIZE, offset);
+			    file, pos, FORMAT__WAL_FRAME_HDR_SIZE, offset);
 			if (rc != SQLITE_OK) {
 				goto err_after_file_open;
 			}
-			offset += DQLITE__FORMAT_WAL_FRAME_HDR_SIZE;
-			pos += DQLITE__FORMAT_WAL_FRAME_HDR_SIZE;
+			offset += FORMAT__WAL_FRAME_HDR_SIZE;
+			pos += FORMAT__WAL_FRAME_HDR_SIZE;
 		}
 
 		/* Write the page */

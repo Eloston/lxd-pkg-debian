@@ -16,16 +16,16 @@ package network
 
 import (
 	"fmt"
-	"log"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 )
 
 // Wrap a regular raft.AppendPipeline, adding support for triggering events at
 // specific times.
 type eventPipeline struct {
-	logger *log.Logger
+	logger hclog.Logger
 
 	// Server ID sending RPCs.
 	source raft.ServerID
@@ -60,7 +60,7 @@ type eventPipeline struct {
 func (p *eventPipeline) AppendEntries(
 	args *raft.AppendEntriesRequest, resp *raft.AppendEntriesResponse) (raft.AppendFuture, error) {
 
-	p.logger.Printf("[DEBUG] raft-test: server %s: pipeline: append to %s: %s", p.source, p.target, stringifyLogs(args.Entries))
+	p.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: server %s: pipeline: append to %s: %s", p.source, p.target, stringifyLogs(args.Entries)))
 
 	peer := p.peers.Get(p.target)
 	faulty := false
@@ -68,18 +68,18 @@ func (p *eventPipeline) AppendEntries(
 		n := peer.CommandLogsCount()
 		args, faulty = p.schedule.FilterRequest(n, args)
 		if faulty && p.schedule.IsEnqueueFault() {
-			p.logger.Printf(
-				"[DEBUG] raft-test: server %s: pipeline: append to: %s: enqueue fault: command %d", p.source, p.target, p.schedule.Command())
+			p.logger.Debug(fmt.Sprintf(
+				"[DEBUG] raft-test: server %s: pipeline: append to: %s: enqueue fault: command %d", p.source, p.target, p.schedule.Command()))
 		}
 	}
 
 	if p.peers.DisconnectedAndNotSyncing(p.target) {
-		p.logger.Printf("[DEBUG] raft-test: server %s: pipeline: append to %s: not connected", p.source, p.target)
+		p.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: server %s: pipeline: append to %s: not connected", p.source, p.target))
 		return nil, fmt.Errorf("cannot reach server %s", p.target)
 	}
 
 	if faulty && p.schedule.IsAppendFault() {
-		p.logger.Printf("[DEBUG] raft-test: server %s: pipeline: append to %s: append fault: command %d", p.source, p.target, p.schedule.n)
+		p.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: server %s: pipeline: append to %s: append fault: command %d", p.source, p.target, p.schedule.n))
 		p.failure = args.Entries[0].Index
 	}
 

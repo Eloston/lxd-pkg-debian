@@ -16,10 +16,10 @@ package election
 
 import (
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 )
 
@@ -27,7 +27,7 @@ import (
 // tracking when elections occur.
 type Tracker struct {
 	// For debugging raft-test itself or its consumers.
-	logger *log.Logger
+	logger hclog.Logger
 
 	// Watchers for individual servers.
 	//
@@ -50,7 +50,7 @@ type Tracker struct {
 
 // NewTracker creates a new Tracker for watching leadership
 // changes in a raft cluster.
-func NewTracker(logger *log.Logger) *Tracker {
+func NewTracker(logger hclog.Logger) *Tracker {
 	return &Tracker{
 		logger:    logger,
 		observers: make(map[raft.ServerID]*notifier),

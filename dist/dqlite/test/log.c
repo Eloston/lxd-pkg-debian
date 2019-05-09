@@ -1,6 +1,3 @@
-#define _GNU_SOURCE
-
-#include <assert.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,15 +8,13 @@
 #include "log.h"
 #include "munit.h"
 
-static void test_logger_logf(void *ctx, int level, const char *format, ...) {
-	va_list args;
+static void emit(void *ctx, int level, const char *format, va_list args) {
 	char *  msg;
 	int     err;
 
 	(void)ctx;
 	(void)level;
 
-	va_start(args, format);
 	err = vasprintf(&msg, format, args);
 	va_end(args);
 
@@ -35,8 +30,8 @@ static void test_logger_logf(void *ctx, int level, const char *format, ...) {
 dqlite_logger *test_logger() {
 	dqlite_logger *logger = munit_malloc(sizeof *logger);
 
-	logger->ctx   = NULL;
-	logger->xLogf = test_logger_logf;
+	logger->data   = NULL;
+	logger->emit = emit;
 
 	return logger;
 }
@@ -70,31 +65,19 @@ test_log *test_log_open() {
 }
 
 FILE *test_log_stream(test_log *log) {
-	assert(log);
-	assert(log->stream);
-
 	return log->stream;
 }
 
 int test_log_is_empty(test_log *log) {
-	assert(log);
-	assert(log->buffer);
-
 	return log->size == 0;
 }
 
 char *test_log_output(test_log *log) {
-	assert(log);
-	assert(log->buffer);
-
 	return log->buffer;
 }
 
 void test_log_close(test_log *log) {
 	int err;
-
-	assert(log);
-	assert(log->stream);
 
 	err = fclose(log->stream);
 
@@ -107,9 +90,6 @@ void test_log_close(test_log *log) {
 }
 
 void test_log_destroy(test_log *log) {
-	assert(log);
-	assert(log->buffer);
-
 	free(log->buffer);
 	free(log);
 }

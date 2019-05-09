@@ -33,19 +33,16 @@ import (
 type imageStreamCacheEntry struct {
 	Aliases      []api.ImageAliasesEntry `yaml:"aliases"`
 	Certificate  string                  `yaml:"certificate"`
+	Expiry       time.Time               `yaml:"expiry"`
 	Fingerprints []string                `yaml:"fingerprints"`
-
-	expiry time.Time
-	remote lxd.ImageServer
 }
 
-var imageStreamCache = map[string]*imageStreamCacheEntry{}
 var imageStreamCacheLock sync.Mutex
 
 var imagesDownloading = map[string]chan bool{}
 var imagesDownloadingLock sync.Mutex
 
-func imageSaveStreamCache(os *sys.OS) error {
+func imageSaveStreamCache(os *sys.OS, imageStreamCache map[string]*imageStreamCacheEntry) error {
 	data, err := yaml.Marshal(&imageStreamCache)
 	if err != nil {
 		return err
@@ -59,41 +56,25 @@ func imageSaveStreamCache(os *sys.OS) error {
 	return nil
 }
 
-func imageLoadStreamCache(d *Daemon) error {
-	imageStreamCacheLock.Lock()
-	defer imageStreamCacheLock.Unlock()
+func imageGetStreamCache(d *Daemon) (map[string]*imageStreamCacheEntry, error) {
+	imageStreamCache := map[string]*imageStreamCacheEntry{}
 
 	simplestreamsPath := filepath.Join(d.os.CacheDir, "simplestreams.yaml")
 	if !shared.PathExists(simplestreamsPath) {
-		return nil
+		return imageStreamCache, nil
 	}
 
 	content, err := ioutil.ReadFile(simplestreamsPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	err = yaml.Unmarshal(content, imageStreamCache)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	for url, entry := range imageStreamCache {
-		if entry.remote == nil {
-			remote, err := lxd.ConnectSimpleStreams(url, &lxd.ConnectionArgs{
-				TLSServerCert: entry.Certificate,
-				UserAgent:     version.UserAgent,
-				Proxy:         d.proxy,
-			})
-			if err != nil {
-				continue
-			}
-
-			entry.remote = remote
-		}
-	}
-
-	return nil
+	return imageStreamCache, nil
 }
 
 // ImageDownload resolves the image fingerprint and if not in the database, downloads it
@@ -115,8 +96,14 @@ func (d *Daemon) ImageDownload(op *operation, server string, protocol string, ce
 	// Attempt to resolve the alias
 	if protocol == "simplestreams" {
 		imageStreamCacheLock.Lock()
+		imageStreamCache, err := imageGetStreamCache(d)
+		if err != nil {
+			imageStreamCacheLock.Unlock()
+			return nil, err
+		}
+
 		entry, _ := imageStreamCache[server]
-		if entry == nil || entry.expiry.Before(time.Now()) {
+		if entry == nil || entry.Expiry.Before(time.Now()) {
 			// Add a new entry to the cache
 			refresh := func() (*imageStreamCacheEntry, error) {
 				// Setup simplestreams client
@@ -147,9 +134,9 @@ func (d *Daemon) ImageDownload(op *operation, server string, protocol string, ce
 				}
 
 				// Generate cache entry
-				entry = &imageStreamCacheEntry{remote: remote, Aliases: aliases, Certificate: certificate, Fingerprints: fingerprints, expiry: time.Now().Add(time.Hour)}
+				entry = &imageStreamCacheEntry{Aliases: aliases, Certificate: certificate, Fingerprints: fingerprints, Expiry: time.Now().Add(time.Hour)}
 				imageStreamCache[server] = entry
-				imageSaveStreamCache(d.os)
+				imageSaveStreamCache(d.os, imageStreamCache)
 
 				return entry, nil
 			}
@@ -161,7 +148,7 @@ func (d *Daemon) ImageDownload(op *operation, server string, protocol string, ce
 			} else if entry != nil {
 				// Failed to fetch entry but existing cache
 				logger.Warn("Unable to refresh cache, using stale entry", log.Ctx{"server": server})
-				entry.expiry = time.Now().Add(time.Hour)
+				entry.Expiry = time.Now().Add(time.Hour)
 			} else {
 				// Failed to fetch entry and nothing in cache
 				imageStreamCacheLock.Unlock()
@@ -169,8 +156,17 @@ func (d *Daemon) ImageDownload(op *operation, server string, protocol string, ce
 			}
 		} else {
 			// use the existing entry
-			logger.Debug("Using SimpleStreams cache entry", log.Ctx{"server": server, "expiry": entry.expiry})
-			remote = entry.remote
+			logger.Debug("Using SimpleStreams cache entry", log.Ctx{"server": server, "expiry": entry.Expiry})
+
+			remote, err = lxd.ConnectSimpleStreams(server, &lxd.ConnectionArgs{
+				TLSServerCert: entry.Certificate,
+				UserAgent:     version.UserAgent,
+				Proxy:         d.proxy,
+			})
+			if err != nil {
+				imageStreamCacheLock.Unlock()
+				return nil, err
+			}
 		}
 		imageStreamCacheLock.Unlock()
 
@@ -532,6 +528,8 @@ func (d *Daemon) ImageDownload(op *operation, server string, protocol string, ce
 		info.CreatedAt = time.Unix(imageMeta.CreationDate, 0)
 		info.ExpiresAt = time.Unix(imageMeta.ExpiryDate, 0)
 		info.Properties = imageMeta.Properties
+	} else {
+		return nil, fmt.Errorf("Unsupported protocol: %v", protocol)
 	}
 
 	// Override visiblity

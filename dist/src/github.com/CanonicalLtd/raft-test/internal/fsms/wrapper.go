@@ -16,18 +16,19 @@ package fsms
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
-	"log"
 	"sync"
 
 	"github.com/CanonicalLtd/raft-test/internal/event"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/pkg/errors"
 )
 
 // Wraps a raft.FSM, adding control on logs, snapshots and restores.
 type fsmWrapper struct {
-	logger *log.Logger
+	logger hclog.Logger
 
 	// ID of of the raft server associated with this FSM.
 	id raft.ServerID
@@ -50,7 +51,7 @@ type fsmWrapper struct {
 	mu sync.RWMutex
 }
 
-func newFSMWrapper(logger *log.Logger, id raft.ServerID, fsm raft.FSM) *fsmWrapper {
+func newFSMWrapper(logger hclog.Logger, id raft.ServerID, fsm raft.FSM) *fsmWrapper {
 	return &fsmWrapper{
 		logger: logger,
 		id:     id,
@@ -66,7 +67,7 @@ func (f *fsmWrapper) Apply(log *raft.Log) interface{} {
 	f.commands++
 	f.mu.Unlock()
 
-	f.logger.Printf("[DEBUG] raft-test: fsm %s: applied %d", f.id, f.commands)
+	f.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: fsm %s: applied %d", f.id, f.commands))
 	if events, ok := f.events[f.commands]; ok {
 		for _, event := range events {
 			event.Fire()

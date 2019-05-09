@@ -6,15 +6,12 @@ package environschema_test
 import (
 	"bytes"
 	"strings"
+	"testing"
 
-	gc "gopkg.in/check.v1"
+	qt "github.com/frankban/quicktest"
 
 	"gopkg.in/juju/environschema.v1"
 )
-
-type sampleSuite struct{}
-
-var _ = gc.Suite(&sampleSuite{})
 
 var sampleYAMLTests = []struct {
 	about  string
@@ -285,12 +282,13 @@ var sampleYAMLTests = []struct {
 	`,
 }}
 
-func (*sampleSuite) TestSampleYAML(c *gc.C) {
+func TestSampleYAML(t *testing.T) {
+	c := qt.New(t)
 	for i, test := range sampleYAMLTests {
 		c.Logf("test %d. %s\n", i, test.about)
 		var buf bytes.Buffer
 		err := environschema.SampleYAML(&buf, 0, test.attrs, test.fields)
-		c.Assert(err, gc.IsNil)
+		c.Assert(err, qt.IsNil)
 		diff(c, buf.String(), unbeautify(test.expect[1:]))
 	}
 }
@@ -304,9 +302,9 @@ func unbeautify(s string) string {
 	return indentReplacer.Replace(s)
 }
 
-func diff(c *gc.C, have, want string) {
+func diff(c *qt.C, have, want string) {
 	// Final sanity check in case the below logic is flawed.
-	defer c.Check(have, gc.Equals, want)
+	defer c.Check(have, qt.Equals, want)
 
 	haveLines := strings.Split(have, "\n")
 	wantLines := strings.Split(want, "\n")
@@ -317,7 +315,7 @@ func diff(c *gc.C, have, want string) {
 			return
 		}
 		haveLine := haveLines[i]
-		if !c.Check(haveLine, gc.Equals, wantLine, gc.Commentf("line %d", i+1)) {
+		if !c.Check(haveLine, qt.Equals, wantLine, qt.Commentf("line %d", i+1)) {
 			return
 		}
 	}

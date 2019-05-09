@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-
-	jc "github.com/juju/testing/checkers"
-	gc "gopkg.in/check.v1"
+	"testing"
+	
+	qt "github.com/frankban/quicktest"
 )
 
 // newInteractionChecker returns a object that can be used to check a sequence of
@@ -39,12 +39,12 @@ import (
 //	fmt.Fprintf(checker, "And your age: ")
 //	n, _ = checker.Read(buf)
 //	age, err := strconv.Atoi(strings.TrimSpace(string(buf[0:n])))
-//	c.Assert(err, gc.IsNil)
+//	c.Assert(err, qt.IsNil)
 //	if age > 90 {
 //		fmt.Fprintf(checker, "You're very old, %s!\n", name)
 //	}
 //	checker.Close()
-func newInteractionChecker(c *gc.C, userInputMarker, text string) *interactionChecker {
+func newInteractionChecker(c *qt.C, userInputMarker, text string) *interactionChecker {
 	var ios []ioInteraction
 	for {
 		i := strings.Index(text, userInputMarker)
@@ -54,8 +54,8 @@ func newInteractionChecker(c *gc.C, userInputMarker, text string) *interactionCh
 		}
 		if i > 0 {
 			ios = append(ios, ioInteraction{
-				isInput: false,
-				data:    text[0:i],
+				IsInput: false,
+				Data:    text[0:i],
 			})
 			text = text[i:]
 		}
@@ -68,8 +68,8 @@ func newInteractionChecker(c *gc.C, userInputMarker, text string) *interactionCh
 			c.Errorf("no newline found after expected input %q", text)
 		}
 		ios = append(ios, ioInteraction{
-			isInput: true,
-			data:    text[0 : endLine+1],
+			IsInput: true,
+			Data:    text[0 : endLine+1],
 		})
 		text = text[endLine+1:]
 	}
@@ -80,12 +80,12 @@ func newInteractionChecker(c *gc.C, userInputMarker, text string) *interactionCh
 }
 
 type ioInteraction struct {
-	isInput bool
-	data    string
+	IsInput bool
+	Data    string
 }
 
 type interactionChecker struct {
-	c   *gc.C
+	c   *qt.C
 	ios []ioInteraction
 }
 
@@ -97,12 +97,12 @@ func (c *interactionChecker) Read(buf []byte) (int, error) {
 		c.c.Fatalf("got read when expecting interaction to have finished")
 	}
 	io := &c.ios[0]
-	if !io.isInput {
-		c.c.Fatalf("got read when expecting write %q", io.data)
+	if !io.IsInput {
+		c.c.Fatalf("got read when expecting write %q", io.Data)
 	}
-	n := copy(buf, io.data)
-	io.data = io.data[n:]
-	if len(io.data) == 0 {
+	n := copy(buf, io.Data)
+	io.Data = io.Data[n:]
+	if len(io.Data) == 0 {
 		c.ios = c.ios[1:]
 	}
 	return n, nil
@@ -116,18 +116,18 @@ func (c *interactionChecker) Write(buf []byte) (int, error) {
 		c.c.Fatalf("got write %q when expecting interaction to have finished", buf)
 	}
 	io := &c.ios[0]
-	if io.isInput {
-		c.c.Fatalf("got write %q when expecting read %q", buf, io.data)
+	if io.IsInput {
+		c.c.Fatalf("got write %q when expecting read %q", buf, io.Data)
 	}
-	if len(buf) > len(io.data) {
-		c.c.Fatalf("write too long; got %q want %q", buf, io.data)
+	if len(buf) > len(io.Data) {
+		c.c.Fatalf("write too long; got %q want %q", buf, io.Data)
 	}
-	checkData := io.data[0:len(buf)]
+	checkData := io.Data[0:len(buf)]
 	if string(buf) != checkData {
-		c.c.Fatalf("unexpected write got %q want %q", buf, io.data)
+		c.c.Fatalf("unexpected write got %q want %q", buf, io.Data)
 	}
-	io.data = io.data[len(buf):]
-	if len(io.data) == 0 {
+	io.Data = io.Data[len(buf):]
+	if len(io.Data) == 0 {
 		c.ios = c.ios[1:]
 	}
 	return len(buf), nil
@@ -141,34 +141,31 @@ func (c *interactionChecker) Close() error {
 	}
 	io := &c.ios[0]
 	what := "write"
-	if io.isInput {
+	if io.IsInput {
 		what = "read"
 	}
-	c.c.Fatalf("filler terminated too early; expected %s %q", what, io.data)
+	c.c.Fatalf("filler terminated too early; expected %s %q", what, io.Data)
 	return nil
 }
 
-type interactionCheckerSuite struct{}
-
-var _ = gc.Suite(&interactionCheckerSuite{})
-
-func (*interactionCheckerSuite) TestNewIOChecker(c *gc.C) {
+func TestNewIOChecker(t *testing.T) {
+	c := qt.New(t)
 	checker := newInteractionChecker(c, "»", `What is your name: »Bob
 And your age: »148
 You're very old, Bob!
 `)
-	c.Assert(checker.ios, jc.DeepEquals, []ioInteraction{{
-		data: "What is your name: ",
+	c.Assert(checker.ios, qt.DeepEquals, []ioInteraction{{
+		Data: "What is your name: ",
 	}, {
-		isInput: true,
-		data:    "Bob\n",
+		IsInput: true,
+		Data:    "Bob\n",
 	}, {
-		data: "And your age: ",
+		Data: "And your age: ",
 	}, {
-		isInput: true,
-		data:    "148\n",
+		IsInput: true,
+		Data:    "148\n",
 	}, {
-		data: "You're very old, Bob!\n",
+		Data: "You're very old, Bob!\n",
 	}})
 	fmt.Fprintf(checker, "What is your name: ")
 	buf := make([]byte, 100)
@@ -177,11 +174,11 @@ You're very old, Bob!
 	fmt.Fprintf(checker, "And your age: ")
 	n, _ = checker.Read(buf)
 	age, err := strconv.Atoi(strings.TrimSpace(string(buf[0:n])))
-	c.Assert(err, gc.IsNil)
+	c.Assert(err, qt.IsNil)
 	if age > 90 {
 		fmt.Fprintf(checker, "You're very old, %s!\n", name)
 	}
 	checker.Close()
 
-	c.Assert(checker.ios, gc.HasLen, 0)
+	c.Assert(checker.ios, qt.HasLen, 0)
 }

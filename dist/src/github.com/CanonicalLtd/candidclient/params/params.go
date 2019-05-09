@@ -317,3 +317,16 @@ type DischargeTokenForUserRequest struct {
 type DischargeTokenForUserResponse struct {
 	DischargeToken *bakery.Macaroon
 }
+
+// IDPChoice lists available IDPs for authentication.
+type IDPChoice struct {
+	IDPs []IDPChoiceDetails `json:"idps"`
+}
+
+// IDPChoiceDetails provides details about a IDP choice for authentication.
+type IDPChoiceDetails struct {
+	Domain      string `json:"domain"`
+	Description string `json:"description"`
+	Name        string `json:"name"`
+	URL         string `json:"url"`
+}

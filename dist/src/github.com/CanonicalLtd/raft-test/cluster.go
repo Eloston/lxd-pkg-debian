@@ -15,7 +15,7 @@
 package rafttest
 
 import (
-	"log"
+	"fmt"
 	"strconv"
 	"testing"
 	"time"
@@ -24,6 +24,7 @@ import (
 	"github.com/CanonicalLtd/raft-test/internal/fsms"
 	"github.com/CanonicalLtd/raft-test/internal/logging"
 	"github.com/CanonicalLtd/raft-test/internal/network"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 )
 
@@ -53,7 +54,7 @@ import (
 // that factor. See also the Duration helper.
 func Cluster(t testing.TB, fsms []raft.FSM, options ...Option) (map[raft.ServerID]*raft.Raft, *Control) {
 	logger := logging.New(t, "DEBUG")
-	logger.Printf("[DEBUG] raft-test: setup: start (%d servers)", len(fsms))
+	logger.Debug(fmt.Sprintf("[DEBUG] raft-test: setup: start (%d servers)", len(fsms)))
 
 	// Create a set of default dependencies for each server.
 	dependencies := make([]*dependencies, len(fsms))
@@ -89,10 +90,10 @@ func Cluster(t testing.TB, fsms []raft.FSM, options ...Option) (map[raft.ServerI
 	confs := make(map[raft.ServerID]*raft.Config)
 	for _, d := range dependencies {
 		id := d.Conf.LocalID
-		logger.Printf("[DEBUG] raft-test: setup: server %s: start", id)
+		logger.Debug(fmt.Sprintf("[DEBUG] raft-test: setup: server %s: start", id))
 		raft, err := newRaft(d)
 		if err != nil {
-			logger.Printf("[DEBUG] raft-test: setup: error: server %s failed to start: %v", id, err)
+			logger.Debug(fmt.Sprintf("[DEBUG] raft-test: setup: error: server %s failed to start: %v", id, err))
 		}
 		confs[id] = d.Conf
 		servers[id] = raft
@@ -109,7 +110,7 @@ func Cluster(t testing.TB, fsms []raft.FSM, options ...Option) (map[raft.ServerI
 		servers:  servers,
 	}
 
-	logger.Printf("[DEBUG] raft-test: setup: done")
+	logger.Debug("[DEBUG] raft-test: setup: done")
 
 	return servers, control
 }
@@ -131,7 +132,7 @@ type dependencies struct {
 }
 
 // Create default dependencies for a single raft server.
-func newDefaultDependencies(t testing.TB, logger *log.Logger, i int, fsm raft.FSM) *dependencies {
+func newDefaultDependencies(t testing.TB, logger hclog.Logger, i int, fsm raft.FSM) *dependencies {
 	// Use the server's index as its server ID and address.
 	addr := strconv.Itoa(i)
 	_, transport := raft.NewInmemTransport(raft.ServerAddress(addr))
@@ -177,7 +178,7 @@ func setTimeouts(dependencies []*dependencies) {
 }
 
 // Set leader notification channels on all servers.
-func instrumentConfigs(t testing.TB, logger *log.Logger, dependencies []*dependencies) *election.Tracker {
+func instrumentConfigs(t testing.TB, logger hclog.Logger, dependencies []*dependencies) *election.Tracker {
 	t.Helper()
 
 	tracker := election.NewTracker(logger)
@@ -199,7 +200,7 @@ func instrumentConfigs(t testing.TB, logger *log.Logger, dependencies []*depende
 // Replace the dependencies.Trans object on each server with a faulty transport
 // that wraps the real transport. Return a network object that knows about the
 // these wrappers and that inject various kind of failures.
-func instrumentTransports(logger *log.Logger, dependencies []*dependencies) *network.Network {
+func instrumentTransports(logger hclog.Logger, dependencies []*dependencies) *network.Network {
 	// Connect to each others all the servers that use a LoopbackTransport
 	// (the default). However, actual connectivity control will be
 	// performed by the network object
@@ -217,7 +218,7 @@ func instrumentTransports(logger *log.Logger, dependencies []*dependencies) *net
 // Replace the dependencies.FSM object on each server with a wrapper FSM that
 // wraps the real FSM. Return a watcher object that can be used to get notified
 // of various events.
-func instrumentFSMs(logger *log.Logger, dependencies []*dependencies) *fsms.Watcher {
+func instrumentFSMs(logger hclog.Logger, dependencies []*dependencies) *fsms.Watcher {
 	watcher := fsms.New(logger)
 
 	for _, d := range dependencies {
@@ -250,7 +251,7 @@ func connectLoobackTransports(dependencies []*dependencies) {
 
 // Bootstrap the cluster, including in the initial configuration of each voting
 // server.
-func bootstrapCluster(t testing.TB, logger *log.Logger, dependencies []*dependencies) {
+func bootstrapCluster(t testing.TB, logger hclog.Logger, dependencies []*dependencies) {
 	t.Helper()
 
 	// Figure out which servers should be part of the initial
@@ -261,7 +262,7 @@ func bootstrapCluster(t testing.TB, logger *log.Logger, dependencies []*dependen
 		if !d.Voter {
 			// If the server is not initially part of the cluster,
 			// there's nothing to do.
-			logger.Printf("[DEBUG] raft-test: setup: server %s: skip bootstrap (not part of initial configuration)", id)
+			logger.Debug(fmt.Sprintf("[DEBUG] raft-test: setup: server %s: skip bootstrap (not part of initial configuration)", id))
 			continue
 		}
 		server := raft.Server{
@@ -279,7 +280,7 @@ func bootstrapCluster(t testing.TB, logger *log.Logger, dependencies []*dependen
 		if !d.Voter {
 			continue
 		}
-		logger.Printf("[DEBUG] raft-test: setup: server %s: bootstrap", id)
+		logger.Debug(fmt.Sprintf("[DEBUG] raft-test: setup: server %s: bootstrap", id))
 		err := raft.BootstrapCluster(
 			d.Conf,
 			d.Logs,

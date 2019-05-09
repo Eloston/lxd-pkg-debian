@@ -14,6 +14,7 @@ import (
 
 	"github.com/lxc/lxd/lxd/migration"
 	"github.com/lxc/lxd/lxd/state"
+	"github.com/lxc/lxd/lxd/storage/quota"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/ioprogress"
@@ -22,6 +23,8 @@ import (
 
 type storageDir struct {
 	storageShared
+
+	volumeID int64
 }
 
 // Only initialize the minimal information we need about a given storage type.
@@ -334,7 +337,7 @@ func (s *storageDir) StoragePoolVolumeCreate() error {
 		return fmt.Errorf("no \"source\" property found for the storage pool")
 	}
 
-	isSnapshot := strings.Contains(s.volume.Name, "/")
+	isSnapshot := shared.IsSnapshot(s.volume.Name)
 
 	var storageVolumePath string
 
@@ -345,6 +348,11 @@ func (s *storageDir) StoragePoolVolumeCreate() error {
 	}
 
 	err = os.MkdirAll(storageVolumePath, 0711)
+	if err != nil {
+		return err
+	}
+
+	err = s.initQuota(storageVolumePath, s.volumeID)
 	if err != nil {
 		return err
 	}
@@ -366,7 +374,12 @@ func (s *storageDir) StoragePoolVolumeDelete() error {
 		return nil
 	}
 
-	err := os.RemoveAll(storageVolumePath)
+	err := s.deleteQuota(storageVolumePath, s.volumeID)
+	if err != nil {
+		return err
+	}
+
+	err = os.RemoveAll(storageVolumePath)
 	if err != nil {
 		return err
 	}
@@ -503,6 +516,11 @@ func (s *storageDir) ContainerCreate(container container) error {
 		deleteContainerMountpoint(containerMntPoint, container.Path(), s.GetStorageTypeName())
 	}()
 
+	err = s.initQuota(containerMntPoint, s.volumeID)
+	if err != nil {
+		return err
+	}
+
 	err = container.TemplateApply("create")
 	if err != nil {
 		return errors.Wrap(err, "Apply template")
@@ -542,17 +560,15 @@ func (s *storageDir) ContainerCreateFromImage(container container, imageFingerpr
 		s.ContainerDelete(container)
 	}()
 
+	err = s.initQuota(containerMntPoint, s.volumeID)
+	if err != nil {
+		return err
+	}
+
 	imagePath := shared.VarPath("images", imageFingerprint)
 	err = unpackImage(imagePath, containerMntPoint, storageTypeDir, s.s.OS.RunningInUserNS, nil)
 	if err != nil {
 		return errors.Wrap(err, "Unpack image")
-	}
-
-	if !privileged {
-		err := s.shiftRootfs(container, nil)
-		if err != nil {
-			return errors.Wrap(err, "Shift rootfs")
-		}
 	}
 
 	err = container.TemplateApply("create")
@@ -587,6 +603,12 @@ func (s *storageDir) ContainerDelete(container container) error {
 	// ${POOL}/containers/<container_name>
 	containerName := container.Name()
 	containerMntPoint := getContainerMountPoint(container.Project(), s.pool.Name, containerName)
+
+	err = s.deleteQuota(containerMntPoint, s.volumeID)
+	if err != nil {
+		return err
+	}
+
 	if shared.PathExists(containerMntPoint) {
 		err := os.RemoveAll(containerMntPoint)
 		if err != nil {
@@ -640,15 +662,15 @@ func (s *storageDir) copyContainer(target container, source container) error {
 		return err
 	}
 
+	err = s.initQuota(targetContainerMntPoint, s.volumeID)
+	if err != nil {
+		return err
+	}
+
 	bwlimit := s.pool.Config["rsync.bwlimit"]
 	output, err := rsyncLocalCopy(sourceContainerMntPoint, targetContainerMntPoint, bwlimit)
 	if err != nil {
 		return fmt.Errorf("failed to rsync container: %s: %s", string(output), err)
-	}
-
-	err = s.setUnprivUserACL(source, targetContainerMntPoint)
-	if err != nil {
-		return err
 	}
 
 	err = target.TemplateApply("copy")
@@ -875,17 +897,25 @@ func (s *storageDir) ContainerRestore(container container, sourceContainer conta
 		return fmt.Errorf("failed to rsync container: %s: %s", string(output), err)
 	}
 
-	// Now allow unprivileged users to access its data.
-	if err := s.setUnprivUserACL(sourceContainer, targetPath); err != nil {
-		return err
-	}
-
 	logger.Debugf("Restored DIR storage volume for container \"%s\" from %s to %s", s.volume.Name, sourceContainer.Name(), container.Name())
 	return nil
 }
 
-func (s *storageDir) ContainerGetUsage(container container) (int64, error) {
-	return -1, fmt.Errorf("The directory container backend doesn't support quotas")
+func (s *storageDir) ContainerGetUsage(c container) (int64, error) {
+	path := getContainerMountPoint(c.Project(), s.pool.Name, c.Name())
+
+	ok, err := quota.Supported(path)
+	if err != nil || !ok {
+		return -1, fmt.Errorf("The backing filesystem doesn't support quotas")
+	}
+
+	projectID := uint32(s.volumeID + 10000)
+	size, err := quota.GetProjectUsage(path, projectID)
+	if err != nil {
+		return -1, err
+	}
+
+	return size, nil
 }
 
 func (s *storageDir) ContainerSnapshotCreate(snapshotContainer container, sourceContainer container) error {
@@ -1106,6 +1136,7 @@ func (s *storageDir) ContainerBackupCreate(backup backup, source container) erro
 	if err != nil {
 		return err
 	}
+	defer os.RemoveAll(tmpPath)
 
 	// Prepare for rsync
 	rsync := func(oldPath string, newPath string, bwlimit string) error {
@@ -1280,7 +1311,69 @@ func (s *storageDir) MigrationSink(conn *websocket.Conn, op *operation, args Mig
 }
 
 func (s *storageDir) StorageEntitySetQuota(volumeType int, size int64, data interface{}) error {
-	logger.Warnf("Skipping setting disk quota for '%s' as DIR backend doesn't support them", s.volume.Name)
+	var path string
+	switch volumeType {
+	case storagePoolVolumeTypeContainer:
+		c := data.(container)
+		path = getContainerMountPoint(c.Project(), s.pool.Name, c.Name())
+	case storagePoolVolumeTypeCustom:
+		path = getStoragePoolVolumeMountPoint(s.pool.Name, s.volume.Name)
+	}
+
+	ok, err := quota.Supported(path)
+	if err != nil || !ok {
+		logger.Warnf("Skipping setting disk quota for '%s' as the underlying filesystem doesn't support them", s.volume.Name)
+		return nil
+	}
+
+	projectID := uint32(s.volumeID + 10000)
+	err = quota.SetProjectQuota(path, projectID, size)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *storageDir) initQuota(path string, id int64) error {
+	if s.volumeID == 0 {
+		return fmt.Errorf("Missing volume ID")
+	}
+
+	ok, err := quota.Supported(path)
+	if err != nil || !ok {
+		return nil
+	}
+
+	projectID := uint32(s.volumeID + 10000)
+	err = quota.SetProject(path, projectID)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *storageDir) deleteQuota(path string, id int64) error {
+	if s.volumeID == 0 {
+		return fmt.Errorf("Missing volume ID")
+	}
+
+	ok, err := quota.Supported(path)
+	if err != nil || !ok {
+		return nil
+	}
+
+	err = quota.SetProject(path, 0)
+	if err != nil {
+		return err
+	}
+
+	projectID := uint32(s.volumeID + 10000)
+	err = quota.SetProjectQuota(path, projectID, 0)
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -1308,46 +1401,37 @@ func (s *storageDir) StoragePoolVolumeCopy(source *api.StorageVolumeSource) erro
 			return err
 		}
 
-		ourMount, err := srcStorage.StoragePoolVolumeMount()
+		ourMount, err := srcStorage.StoragePoolMount()
 		if err != nil {
 			logger.Errorf("Failed to mount DIR storage volume \"%s\" on storage pool \"%s\": %s", s.volume.Name, s.pool.Name, err)
 			return err
 		}
 		if ourMount {
-			defer srcStorage.StoragePoolVolumeUmount()
+			defer srcStorage.StoragePoolUmount()
 		}
 	}
 
-	err := s.StoragePoolVolumeCreate()
+	err := s.copyVolume(source.Pool, source.Name, s.volume.Name)
 	if err != nil {
-		logger.Errorf("Failed to create DIR storage volume \"%s\" on storage pool \"%s\": %s", s.volume.Name, s.pool.Name, err)
 		return err
 	}
 
-	var srcMountPoint string
-	var dstMountPoint string
-
-	isSrcSnapshot := strings.Contains(source.Name, "/")
-	isDstSnapshot := strings.Contains(s.volume.Name, "/")
-
-	if isSrcSnapshot {
-		srcMountPoint = getStoragePoolVolumeSnapshotMountPoint(source.Pool, source.Name)
-	} else {
-		srcMountPoint = getStoragePoolVolumeMountPoint(source.Pool, source.Name)
+	if source.VolumeOnly {
+		logger.Infof(successMsg)
+		return nil
 	}
 
-	if isDstSnapshot {
-		dstMountPoint = getStoragePoolVolumeSnapshotMountPoint(s.pool.Name, s.volume.Name)
-	} else {
-		dstMountPoint = getStoragePoolVolumeMountPoint(s.pool.Name, s.volume.Name)
-	}
-
-	bwlimit := s.pool.Config["rsync.bwlimit"]
-	_, err = rsyncLocalCopy(srcMountPoint, dstMountPoint, bwlimit)
+	snapshots, err := storagePoolVolumeSnapshotsGet(s.s, source.Pool, source.Name, storagePoolVolumeTypeCustom)
 	if err != nil {
-		os.RemoveAll(dstMountPoint)
-		logger.Errorf("Failed to rsync into DIR storage volume \"%s\" on storage pool \"%s\": %s", s.volume.Name, s.pool.Name, err)
 		return err
+	}
+
+	for _, snap := range snapshots {
+		_, snapOnlyName, _ := containerGetParentAndSnapshotName(snap)
+		err = s.copyVolumeSnapshot(source.Pool, snap, fmt.Sprintf("%s/%s", s.volume.Name, snapOnlyName))
+		if err != nil {
+			return err
+		}
 	}
 
 	logger.Infof(successMsg)
@@ -1448,7 +1532,7 @@ func (s *storageDir) StoragePoolVolumeSnapshotRename(newName string) error {
 	logger.Infof("Renaming DIR storage volume on storage pool \"%s\" from \"%s\" to \"%s\"", s.pool.Name, s.volume.Name, newName)
 	var fullSnapshotName string
 
-	if strings.Contains(newName, "/") {
+	if shared.IsSnapshot(newName) {
 		// When renaming volume snapshots, newName will contain the full snapshot name
 		fullSnapshotName = newName
 	} else {
@@ -1478,4 +1562,58 @@ func (s *storageDir) StoragePoolVolumeSnapshotRename(newName string) error {
 	logger.Infof("Renamed DIR storage volume on storage pool \"%s\" from \"%s\" to \"%s\"", s.pool.Name, s.volume.Name, newName)
 
 	return s.s.Cluster.StoragePoolVolumeRename("default", s.volume.Name, fullSnapshotName, storagePoolVolumeTypeCustom, s.poolID)
+}
+
+func (s *storageDir) copyVolume(sourcePool string, source string, target string) error {
+	var srcMountPoint string
+
+	if shared.IsSnapshot(source) {
+		srcMountPoint = getStoragePoolVolumeSnapshotMountPoint(sourcePool, source)
+	} else {
+		srcMountPoint = getStoragePoolVolumeMountPoint(sourcePool, source)
+	}
+
+	dstMountPoint := getStoragePoolVolumeMountPoint(s.pool.Name, target)
+
+	err := os.MkdirAll(dstMountPoint, 0711)
+	if err != nil {
+		return err
+	}
+
+	err = s.initQuota(dstMountPoint, s.volumeID)
+	if err != nil {
+		return err
+	}
+
+	bwlimit := s.pool.Config["rsync.bwlimit"]
+
+	_, err = rsyncLocalCopy(srcMountPoint, dstMountPoint, bwlimit)
+	if err != nil {
+		os.RemoveAll(dstMountPoint)
+		logger.Errorf("Failed to rsync into DIR storage volume \"%s\" on storage pool \"%s\": %s", s.volume.Name, s.pool.Name, err)
+		return err
+	}
+
+	return nil
+}
+
+func (s *storageDir) copyVolumeSnapshot(sourcePool string, source string, target string) error {
+	srcMountPoint := getStoragePoolVolumeSnapshotMountPoint(sourcePool, source)
+	dstMountPoint := getStoragePoolVolumeSnapshotMountPoint(s.pool.Name, target)
+
+	err := os.MkdirAll(dstMountPoint, 0711)
+	if err != nil {
+		return err
+	}
+
+	bwlimit := s.pool.Config["rsync.bwlimit"]
+
+	_, err = rsyncLocalCopy(srcMountPoint, dstMountPoint, bwlimit)
+	if err != nil {
+		os.RemoveAll(dstMountPoint)
+		logger.Errorf("Failed to rsync into DIR storage volume \"%s\" on storage pool \"%s\": %s", target, s.pool.Name, err)
+		return err
+	}
+
+	return nil
 }

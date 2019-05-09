@@ -1,8 +1,7 @@
 go-md2man
 =========
 
-** Work in Progress **
-This still needs a lot of help to be complete, or even usable!
+Converts markdown into roff (man pages).
 
 Uses blackfriday to process markdown into man pages.
 
@@ -12,10 +11,5 @@ Uses blackfriday to process markdown into man pages.
 
 ### How to contribute
 
-We use [dep](https://github.com/golang/dep/) for vendoring Go packages.
-See dep documentation for how to update.
-
-### TODO
-
-- Needs oh so much testing love
-- Look into blackfriday's 2.0 API
+We use go modules to manage dependencies.
+As such you must be using at lest go1.11.

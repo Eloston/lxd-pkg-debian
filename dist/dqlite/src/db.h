@@ -1,63 +1,30 @@
-#ifndef DQLITE_DB_H
-#define DQLITE_DB_H
+#ifndef DB_H_
+#define DB_H_
 
-#include <sqlite3.h>
+#include "./lib/queue.h"
 
-#include "../include/dqlite.h"
+#include "options.h"
+#include "tx.h"
 
-#include "error.h"
-#include "stmt.h"
+struct leader;
 
-/* Hold state for a single open SQLite database */
-struct dqlite__db {
-	/* public */
-	dqlite_cluster *cluster; /* Cluster API implementation  */
-
-	/* read-only */
-	size_t        id;    /* Database ID */
-	dqlite__error error; /* Last error occurred */
-
-	/* private */
-	sqlite3 *db; /* Underlying SQLite database */
-	struct dqlite__stmt_registry
-	    stmts; /* Registry of prepared statements */
+struct db
+{
+	struct options *options;
+	char *filename;
+	sqlite3 *follower;
+	struct tx *tx;
+	queue leaders;
+	queue queue;
 };
 
-/* Initialize a database state object */
-void dqlite__db_init(struct dqlite__db *db);
+void db__init(struct db *db, struct options *options, const char *filename);
+void db__close(struct db *db);
 
-/* Close a database state object, releasing all associated resources. */
-void dqlite__db_close(struct dqlite__db *db);
+int db__open_follower(struct db *db);
 
-/* No-op hash function (hashing is not supported for dqlite__db). */
-const char *dqlite__db_hash(struct dqlite__db *db);
+int db__create_tx(struct db *db, unsigned long long id, sqlite3 *conn);
 
-/* Open the underlying db. */
-int dqlite__db_open(struct dqlite__db *db,
-                    const char *       name,
-                    int                flags,
-                    const char *       vfs,
-                    uint16_t           page_size,
-                    const char *       wal_replication);
+void db__delete_tx(struct db *db);
 
-/* Prepare a statement using the underlying db. */
-int dqlite__db_prepare(struct dqlite__db *   db,
-                       const char *          sql,
-                       struct dqlite__stmt **stmt);
-
-/* Lookup the statement with the given ID. */
-struct dqlite__stmt *dqlite__db_stmt(struct dqlite__db *db, uint32_t stmt_id);
-
-/* Finalize a statement. */
-int dqlite__db_finalize(struct dqlite__db *db, struct dqlite__stmt *stmt);
-
-/* Begin a transaction. */
-int dqlite__db_begin(struct dqlite__db *db);
-
-/* Commit a transaction. */
-int dqlite__db_commit(struct dqlite__db *db);
-
-/* Rollback a transaction. */
-int dqlite__db_rollback(struct dqlite__db *db);
-
-#endif /* DQLITE_DB_H */
+#endif /* DB_H_*/

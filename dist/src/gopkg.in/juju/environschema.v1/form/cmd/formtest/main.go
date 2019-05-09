@@ -21,7 +21,7 @@ func main() {
 	f := form.IOFiller{
 		ShowDescriptions: *showDescriptions,
 	}
-	fmt.Println(`formtest:
+	fmt.Print(`formtest:
 This is a simple interactive test program for environschema forms.
 Expect the prompts to be as follows:
 
@@ -31,6 +31,7 @@ password:
 PIN [****]: 
 
 The entered values will be displayed at the end.
+
 `)
 	os.Setenv("PIN", "1234")
 	os.Setenv("EMAIL", "user@example.com")

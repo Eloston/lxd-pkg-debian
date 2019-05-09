@@ -16,9 +16,9 @@ package rafttest
 
 import (
 	"io/ioutil"
-	"log"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 )
 
@@ -84,7 +84,9 @@ func Latency(factor float64) Option {
 // raft's logger to ioutil.Discard.
 func DiscardLogger() Option {
 	return Config(func(i int, config *raft.Config) {
-		config.Logger = log.New(ioutil.Discard, "", 0)
+		config.Logger = hclog.New(&hclog.LoggerOptions{
+			Name: "raft-test",
+			Output: ioutil.Discard})
 	})
 }
 

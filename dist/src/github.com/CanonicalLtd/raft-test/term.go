@@ -15,6 +15,8 @@
 package rafttest
 
 import (
+	"fmt"
+
 	"github.com/CanonicalLtd/raft-test/internal/election"
 	"github.com/CanonicalLtd/raft-test/internal/event"
 	"github.com/hashicorp/raft"
@@ -58,7 +60,7 @@ func (t *Term) Disconnect(id raft.ServerID) {
 		t.control.t.Fatalf("raft-test: term: disconnect error: server %s is the leader", t.id)
 	}
 
-	t.control.logger.Printf("[DEBUG] raft-test: term: disconnect %s", id)
+	t.control.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: term: disconnect %s", id))
 
 	t.disconnected = id
 	t.control.network.Disconnect(t.id, id)

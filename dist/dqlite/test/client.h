@@ -17,8 +17,8 @@
 
 struct test_client {
 	int                     fd;
-	struct dqlite__request  request;
-	struct dqlite__response response;
+	struct request  request;
+	struct response response;
 	uv_buf_t                bufs[3];
 };
 
@@ -34,7 +34,7 @@ struct test_client_row {
 };
 
 struct test_client_rows {
-	struct dqlite__message *message;
+	struct message *message;
 	uint64_t                column_count;
 	const char **           column_names;
 	struct test_client_row *next;

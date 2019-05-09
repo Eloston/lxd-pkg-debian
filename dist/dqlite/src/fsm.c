@@ -1,105 +1,178 @@
-#include <assert.h>
+#include <raft.h>
 
-#include <sqlite3.h>
+#include "./lib/assert.h"
+#include "./lib/logger.h"
 
-#include "../include/dqlite.h"
-
+#include "command.h"
 #include "fsm.h"
-#include "lifecycle.h"
 
-void dqlite__fsm_init(struct dqlite__fsm *            f,
-                      struct dqlite__fsm_state *      states,
-                      struct dqlite__fsm_event *      events,
-                      struct dqlite__fsm_transition **transitions) {
-	int                             i;
-	int                             j;
-	struct dqlite__fsm_transition **cursor;
+struct fsm
+{
+	struct dqlite_logger *logger;
+	struct registry *registry;
+};
 
-	assert(f != NULL);
+static int fsm__apply_open(struct fsm *f, const struct command_open *c)
+{
+	struct db *db;
+	int rc;
 
-	assert(states != NULL);
-	assert(events != NULL);
-	assert(transitions != NULL);
-
-	dqlite__lifecycle_init(DQLITE__LIFECYCLE_FSM);
-
-	f->events      = events;
-	f->states      = states;
-	f->transitions = transitions;
-
-	f->curr_state_id = 0;
-	f->next_state_id = 0;
-	f->jump_state_id = -1;
-
-	/* Count the number of valid events */
-	f->events_count = 0;
-	for (i = 0; events[i].id != DQLITE__FSM_NULL; i++) {
-		assert(events[i].id == i);
-		f->events_count++;
+	rc = registry__db_get(f->registry, c->filename, &db);
+	if (rc != 0) {
+		return rc;
 	}
-
-	/* Count the number of valid states */
-	f->states_count = 0;
-	for (i = 0; states[i].id != DQLITE__FSM_NULL; i++) {
-		assert(states[i].id == i);
-		f->states_count++;
+	rc = db__open_follower(db);
+	if (rc != 0) {
+		return rc;
 	}
-
-	/* Verify the transitions index */
-	for (i = 0; i < f->states_count; i++) {
-		cursor = &f->transitions[i];
-
-		for (j = 0; j < f->events_count; j++) {
-			assert(j == (*cursor)[j].event_id);
-		}
-	}
-}
-
-void dqlite__fsm_close(struct dqlite__fsm *f) {
-	assert(f != NULL);
-
-	/* No-op */
-
-	dqlite__lifecycle_close(DQLITE__LIFECYCLE_FSM);
-}
-
-int dqlite__fsm_step(struct dqlite__fsm *f, int event_id, void *arg) {
-	int                            err;
-	struct dqlite__fsm_transition *transition;
-
-	assert(f != NULL);
-	assert(arg != NULL);
-	assert(event_id < f->events_count);
-
-	transition = &f->transitions[f->curr_state_id][event_id];
-
-	assert(transition != NULL);
-	assert(transition->next_state_id < f->states_count);
-
-	assert(transition->callback != NULL);
-
-	err = (*transition->callback)(arg);
-	if (err != 0)
-		return err;
-
-	/* Handlers can set jump_state_id if they want to skip the normal FSM
-	 * flow and jump to a different state. */
-	if (f->jump_state_id != -1) {
-		assert(-f->jump_state_id < f->states_count);
-		f->next_state_id = f->jump_state_id;
-		f->jump_state_id = -1;
-	} else {
-		f->next_state_id = transition->next_state_id;
-	}
-
-	f->curr_state_id = f->next_state_id;
 
 	return 0;
 }
 
-const char *dqlite__fsm_state(struct dqlite__fsm *f) {
-	assert(f != NULL);
-	assert(f->curr_state_id < f->states_count);
+static int fsm__apply_frames(struct fsm *f, const struct command_frames *c)
+{
+	struct db *db;
+	struct tx *tx;
+	unsigned *page_numbers;
+	void *pages;
+	bool is_begin = true;
+	int rc;
 
-	return f->states[f->curr_state_id].name;
+	rc = registry__db_get(f->registry, c->filename, &db);
+	assert(rc == 0); /* We have registered this filename before */
+
+	assert(db->follower != NULL); /* We have issued an open command */
+
+	tx = db->tx;
+
+	if (tx != NULL) {
+		/* TODO: handle leftover leader zombie transactions with lower
+		 * ID */
+		assert(tx->id == c->tx_id);
+
+		if (tx__is_leader(tx)) {
+			if (tx->is_zombie) {
+				/* TODO */
+			} else {
+				/* We're executing this FSM command in during
+				 * the execution of the replication->frames()
+				 * hook. */
+			}
+		} else {
+			/* We're executing the Frames command as followers. The
+			 * transaction must be in the Writing state. */
+			assert(tx->state == TX__WRITING);
+			is_begin = false;
+		}
+	} else {
+		/* We don't know about this transaction, it must be a new
+		 * follower transaction. */
+		rc = db__create_tx(db, c->tx_id, db->follower);
+		if (rc != 0) {
+			return rc;
+		}
+		tx = db->tx;
+	}
+
+	rc = command_frames__page_numbers(c, &page_numbers);
+	if (rc != 0) {
+		return rc;
+	}
+
+	command_frames__pages(c, &pages);
+
+	rc = tx__frames(tx, is_begin, c->page_size, c->n_pages, page_numbers,
+			pages, c->truncate, c->is_commit);
+	if (rc != 0) {
+		return rc;
+	}
+
+	sqlite3_free(page_numbers);
+
+	/* If the commit flag is on, this is the final write of a transaction, */
+	if (c->is_commit) {
+		/* Save the ID of this transaction in the buffer of recently committed
+		 * transactions. */
+		/* TODO: f.registry.TxnCommittedAdd(txn) */
+
+		/* If it's a follower, we also unregister it. */
+		if (!tx__is_leader(tx)) {
+			db__delete_tx(db);
+		}
+	}
+
+	return 0;
+}
+
+static int fsm__apply(struct raft_fsm *fsm, const struct raft_buffer *buf)
+{
+	struct fsm *f = fsm->data;
+	int type;
+	void *command;
+	int rc;
+	rc = command__decode(buf, &type, &command);
+	if (rc != 0) {
+		errorf(f->logger, "fsm: decode command: %d", rc);
+		goto err;
+	}
+	switch (type) {
+		case COMMAND_OPEN:
+			rc = fsm__apply_open(f, command);
+			break;
+		case COMMAND_FRAMES:
+			rc = fsm__apply_frames(f, command);
+			break;
+		default:
+			rc = RAFT_ERR_IO_MALFORMED;
+			goto err_after_command_decode;
+	}
+	raft_free(command);
+
+	return 0;
+err_after_command_decode:
+	raft_free(command);
+err:
+	return rc;
+}
+
+static int fsm__snapshot(struct raft_fsm *fsm,
+			 struct raft_buffer *bufs[],
+			 unsigned *n_bufs)
+{
+	struct fsm *f = fsm->data;
+	return 0;
+}
+
+static int fsm__restore(struct raft_fsm *fsm, struct raft_buffer *buf)
+{
+	struct fsm *f = fsm->data;
+	return 0;
+}
+
+int fsm__init(struct raft_fsm *fsm,
+	      struct dqlite_logger *logger,
+	      struct registry *registry)
+{
+	struct fsm *f = raft_malloc(sizeof *fsm);
+
+	if (f == NULL) {
+		return DQLITE_NOMEM;
+	}
+
+	f->logger = logger;
+	f->registry = registry;
+
+	fsm->version = 1;
+	fsm->data = f;
+	fsm->apply = fsm__apply;
+	fsm->snapshot = fsm__snapshot;
+	fsm->restore = fsm__restore;
+
+	return 0;
+}
+
+void fsm__close(struct raft_fsm *fsm)
+{
+	struct fsm *f = fsm->data;
+	raft_free(f);
 }

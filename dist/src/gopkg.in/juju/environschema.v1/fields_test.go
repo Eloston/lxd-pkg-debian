@@ -4,16 +4,13 @@
 package environschema_test
 
 import (
+	"testing"
+
 	"github.com/juju/schema"
-	jc "github.com/juju/testing/checkers"
-	gc "gopkg.in/check.v1"
+	qt "github.com/frankban/quicktest"
 
 	"gopkg.in/juju/environschema.v1"
 )
-
-type suite struct{}
-
-var _ = gc.Suite(&suite{})
 
 type valueTest struct {
 	about       string
@@ -214,25 +211,26 @@ var validationSchemaTests = []struct {
 	expectError: `stringvalue: invalid type "nontype"`,
 }}
 
-func (*suite) TestValidationSchema(c *gc.C) {
+func TestValidationSchema(t *testing.T) {
+	c := qt.New(t)
 	for i, test := range validationSchemaTests {
 		c.Logf("test %d: %s", i, test.about)
 		sfields, sdefaults, err := test.fields.ValidationSchema()
 		if test.expectError != "" {
-			c.Assert(err, gc.ErrorMatches, test.expectError)
+			c.Assert(err, qt.ErrorMatches, test.expectError)
 			continue
 		}
-		c.Assert(err, gc.IsNil)
+		c.Assert(err, qt.IsNil)
 		checker := schema.FieldMap(sfields, sdefaults)
 		for j, vtest := range test.tests {
 			c.Logf("- test %d: %s", j, vtest.about)
 			val, err := checker.Coerce(vtest.val, nil)
 			if vtest.expectError != "" {
-				c.Assert(err, gc.ErrorMatches, vtest.expectError)
+				c.Assert(err, qt.ErrorMatches, vtest.expectError)
 				continue
 			}
-			c.Assert(err, gc.IsNil)
-			c.Assert(val, jc.DeepEquals, vtest.expectVal)
+			c.Assert(err, qt.IsNil)
+			c.Assert(val, qt.DeepEquals, vtest.expectVal)
 		}
 	}
 }

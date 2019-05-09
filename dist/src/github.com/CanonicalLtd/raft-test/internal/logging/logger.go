@@ -15,21 +15,25 @@
 package logging
 
 import (
-	"log"
 	"testing"
 
 	"github.com/hashicorp/logutils"
+	"github.com/hashicorp/go-hclog"
 )
 
-// New returns a standard log.Logger that will write entries at or above the
+// New returns a standard hclog.Logger that will write entries at or above the
 // specified level to the testing log.
-func New(t testing.TB, level logutils.LogLevel) *log.Logger {
+func New(t testing.TB, level logutils.LogLevel) hclog.Logger {
 	filter := &logutils.LevelFilter{
 		Levels:   []logutils.LogLevel{"DEBUG", "WARN", "ERROR", "INFO"},
 		MinLevel: level,
 		Writer:   &testingWriter{t},
 	}
-	return log.New(filter, "", log.Ltime|log.Lmicroseconds)
+
+	return hclog.New(&hclog.LoggerOptions{
+		Name: "raft-test",
+		Output: filter,
+	})
 }
 
 // Implement io.Writer and forward what it receives to a

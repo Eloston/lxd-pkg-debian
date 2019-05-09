@@ -16,23 +16,23 @@ package network
 
 import (
 	"fmt"
-	"log"
 
 	"github.com/CanonicalLtd/raft-test/internal/event"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 )
 
 // Network provides control over all transports of a cluster, injecting
 // disconnections and failures.
 type Network struct {
-	logger *log.Logger
+	logger hclog.Logger
 
 	// Transport wrappers.
 	transports map[raft.ServerID]*eventTransport
 }
 
 // New create a new network for controlling the underlying transports.
-func New(logger *log.Logger) *Network {
+func New(logger hclog.Logger) *Network {
 	return &Network{
 		logger:     logger,
 		transports: make(map[raft.ServerID]*eventTransport),
@@ -60,7 +60,7 @@ func (n *Network) Add(id raft.ServerID, trans raft.Transport) raft.Transport {
 // to transition to the leader state, and before any append entries RPC is
 // made.
 func (n *Network) Electing(id raft.ServerID) {
-	n.logger.Printf("[DEBUG] raft-test: server %s: establish outbound connection to all other nodes", id)
+	n.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: server %s: establish outbound connection to all other nodes", id))
 
 	// Sanity check that the network is fully disconnected at this time.
 	for id, transport := range n.transports {
@@ -77,7 +77,7 @@ func (n *Network) Electing(id raft.ServerID) {
 // given ID to all its peers, allowing only append entries RPCs for peers that
 // are lagging behind in terms of applied logs to be performed.
 func (n *Network) Deposing(id raft.ServerID) {
-	n.logger.Printf("[DEBUG] raft-test: server %s: dropping outbound connection to all other nodes", id)
+	n.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: server %s: dropping outbound connection to all other nodes", id))
 	n.transports[id].Deposing()
 }
 
@@ -96,14 +96,14 @@ func (n *Network) ConnectAllServers(id raft.ServerID) {
 // Disconnect disables connectivity from the transport of the leader
 // server with the given ID to the peer with the given ID.
 func (n *Network) Disconnect(id, follower raft.ServerID) {
-	n.logger.Printf("[DEBUG] raft-test: server %s: disconnecting follower %s", id, follower)
+	n.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: server %s: disconnecting follower %s", id, follower))
 	n.transports[id].Disconnect(follower)
 }
 
 // Reconnect re-enables connectivity from the transport of the leader
 // server with the given ID to the peer with the given ID.
 func (n *Network) Reconnect(id, follower raft.ServerID) {
-	n.logger.Printf("[DEBUG] raft-test: server %s: reconnecting follower %s", id, follower)
+	n.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: server %s: reconnecting follower %s", id, follower))
 	n.transports[id].Reconnect(follower)
 }
 

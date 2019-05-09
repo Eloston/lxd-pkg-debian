@@ -15,22 +15,21 @@
 package fsms
 
 import (
-	"log"
-
 	"github.com/CanonicalLtd/raft-test/internal/event"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 )
 
 // Watcher watches all FSMs of a cluster, firing events at certain moments.
 type Watcher struct {
-	logger *log.Logger
+	logger hclog.Logger
 
 	// FSM wrappers.
 	fsms map[raft.ServerID]*fsmWrapper
 }
 
 // New create a new FSMs watcher for watching the underlying FSMs.
-func New(logger *log.Logger) *Watcher {
+func New(logger hclog.Logger) *Watcher {
 	return &Watcher{
 		logger: logger,
 		fsms:   make(map[raft.ServerID]*fsmWrapper),

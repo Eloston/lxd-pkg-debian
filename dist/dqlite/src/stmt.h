@@ -47,41 +47,48 @@
 
 #include <sqlite3.h>
 
+#include "./lib/registry.h"
+
 #include "error.h"
 #include "message.h"
-#include "registry.h"
 
 /* Hold state for a single open SQLite database */
-struct dqlite__stmt {
-	size_t        id;    /* Statement ID */
-	sqlite3 *     db;    /* Underlying database info */
+struct stmt
+{
+	size_t id;	   /* Statement ID */
+	sqlite3 *db;	 /* Underlying database info */
 	sqlite3_stmt *stmt;  /* Underlying SQLite statement handle */
-	const char *  tail;  /* Unparsed SQL portion */
+	const char *tail;    /* Unparsed SQL portion */
 	dqlite__error error; /* Last dqlite-specific error */
 };
 
 /* Initialize a statement state object */
-void dqlite__stmt_init(struct dqlite__stmt *s);
+void stmt__init(struct stmt *s);
 
 /* Close a statement state object, releasing all associated resources. */
-void dqlite__stmt_close(struct dqlite__stmt *s);
+void stmt__close(struct stmt *s);
 
-/* No-op hash function (hashing is not supported for dqlite__stmt). This is
+/* No-op hash function (hashing is not supported for stmt). This is
  * required by the registry interface. */
-const char *dqlite__stmt_hash(struct dqlite__stmt *stmt);
+const char *stmt__hash(struct stmt *stmt);
+
+/* TODO: change registry naming pattern */
+#define stmt_init stmt__init
+#define stmt_close stmt__close
+#define stmt_hash stmt__hash
 
 /* Bind the parameters of the underlying statement by decoding the given
  * message. */
-int dqlite__stmt_bind(struct dqlite__stmt *s, struct dqlite__message *message);
+int stmt__bind(struct stmt *s, struct message *message);
 
-int dqlite__stmt_exec(struct dqlite__stmt *s,
-                      uint64_t *           last_insert_id,
-                      uint64_t *           rows_affected);
+int stmt__exec(struct stmt *s,
+	       uint64_t *last_insert_id,
+	       uint64_t *rows_affected);
 
 /* Step through a query statement and fill the given message with the rows it
  * yields. */
-int dqlite__stmt_query(struct dqlite__stmt *s, struct dqlite__message *message);
+int stmt__query(struct stmt *s, struct message *message);
 
-DQLITE__REGISTRY(dqlite__stmt_registry, dqlite__stmt);
+REGISTRY(stmt__registry, stmt);
 
 #endif /* DQLITE_STMT_H */

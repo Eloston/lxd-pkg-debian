@@ -1,11 +1,12 @@
 #include "../src/error.h"
 #include "../src/message.h"
 #include "../src/schema.h"
-#include "../src/binary.h"
+#include "../src/lib/byte.h"
 
-#include "leak.h"
-#include "message.h"
-#include "munit.h"
+#include "./lib/message.h"
+#include "./lib/runner.h"
+
+TEST_MODULE(schema);
 
 /******************************************************************************
  *
@@ -17,15 +18,15 @@
 	X(uint64, id, __VA_ARGS__)                                             \
 	X(text, name, __VA_ARGS__)
 
-DQLITE__SCHEMA_DEFINE(test_foo, TEST_SCHEMA_FOO);
-DQLITE__SCHEMA_IMPLEMENT(test_foo, TEST_SCHEMA_FOO);
+SCHEMA__DEFINE(test_foo, TEST_SCHEMA_FOO);
+SCHEMA__IMPLEMENT(test_foo, TEST_SCHEMA_FOO);
 
 #define TEST_SCHEMA_BAR(X, ...)                                                \
 	X(uint64, i, __VA_ARGS__)                                              \
 	X(uint64, j, __VA_ARGS__)
 
-DQLITE__SCHEMA_DEFINE(test_bar, TEST_SCHEMA_BAR);
-DQLITE__SCHEMA_IMPLEMENT(test_bar, TEST_SCHEMA_BAR);
+SCHEMA__DEFINE(test_bar, TEST_SCHEMA_BAR);
+SCHEMA__IMPLEMENT(test_bar, TEST_SCHEMA_BAR);
 
 /* Type codes */
 #define TEST_FOO 0
@@ -35,8 +36,8 @@ DQLITE__SCHEMA_IMPLEMENT(test_bar, TEST_SCHEMA_BAR);
 	X(TEST_FOO, test_foo, foo, __VA_ARGS__)                                \
 	X(TEST_BAR, test_bar, bar, __VA_ARGS__)
 
-DQLITE__SCHEMA_HANDLER_DEFINE(test_handler, TEST_SCHEMA_TYPES);
-DQLITE__SCHEMA_HANDLER_IMPLEMENT(test_handler, TEST_SCHEMA_TYPES);
+SCHEMA__HANDLER_DEFINE(test_handler, TEST_SCHEMA_TYPES);
+SCHEMA__HANDLER_IMPLEMENT(test_handler, TEST_SCHEMA_TYPES);
 
 /******************************************************************************
  *
@@ -61,8 +62,7 @@ static void tear_down(void *data) {
 	struct test_handler *handler = data;
 
 	test_handler_close(handler);
-
-	test_assert_no_leaks();
+	free(handler);
 }
 
 /******************************************************************************
@@ -71,8 +71,12 @@ static void tear_down(void *data) {
  *
  ******************************************************************************/
 
-static MunitResult test_encode_two_uint64(const MunitParameter params[],
-                                          void *               data) {
+TEST_SUITE(encode);
+TEST_SETUP(encode, setup);
+TEST_TEAR_DOWN(encode, tear_down);
+
+TEST_CASE(encode, two_uint64, NULL)
+{
 	struct test_handler *handler = data;
 	int                  err;
 
@@ -88,14 +92,14 @@ static MunitResult test_encode_two_uint64(const MunitParameter params[],
 	munit_assert_int(handler->message.type, ==, TEST_BAR);
 	munit_assert_int(handler->message.offset1, ==, 16);
 
-	munit_assert_int(dqlite__flip64(*(uint64_t *)handler->message.body1), ==, 99);
-	munit_assert_int(dqlite__flip64(*(uint64_t *)(handler->message.body1 + 8)), ==, 17);
+	munit_assert_int(byte__flip64(*(uint64_t *)handler->message.body1), ==, 99);
+	munit_assert_int(byte__flip64(*(uint64_t *)(handler->message.body1 + 8)), ==, 17);
 
 	return MUNIT_OK;
 }
 
-static MunitResult test_encode_uint64_and_text(const MunitParameter params[],
-                                               void *               data) {
+TEST_CASE(encode, uint64_and_text, NULL)
+{
 	struct test_handler *handler = data;
 	int                  err;
 
@@ -111,14 +115,14 @@ static MunitResult test_encode_uint64_and_text(const MunitParameter params[],
 	munit_assert_int(handler->message.type, ==, TEST_FOO);
 	munit_assert_int(handler->message.offset1, ==, 24);
 
-	munit_assert_int(dqlite__flip64(*(uint64_t *)handler->message.body1), ==, 123);
+	munit_assert_int(byte__flip64(*(uint64_t *)handler->message.body1), ==, 123);
 	munit_assert_string_equal((const char *)(handler->message.body1 + 8),
 	                          "hello world!");
 	return MUNIT_OK;
 }
 
-static MunitResult test_encode_unknown_type(const MunitParameter params[],
-                                            void *               data) {
+TEST_CASE(encode, unknown_type, NULL)
+{
 	struct test_handler *handler = data;
 	int                  err;
 
@@ -134,25 +138,18 @@ static MunitResult test_encode_unknown_type(const MunitParameter params[],
 	return MUNIT_OK;
 }
 
-static MunitTest dqlite__schema_encode_tests[] = {
-    {"/two-uint64", test_encode_two_uint64, setup, tear_down, 0, NULL},
-    {"/uint64-and-text",
-     test_encode_uint64_and_text,
-     setup,
-     tear_down,
-     0,
-     NULL},
-    {"/unknown-type", test_encode_unknown_type, setup, tear_down, 0, NULL},
-    {NULL, NULL, NULL, NULL, 0, NULL},
-};
-
 /******************************************************************************
  *
  * Tests for the _decode method.
  *
  ******************************************************************************/
-static MunitResult test_decode_invalid_text(const MunitParameter params[],
-                                            void *               data) {
+
+TEST_SUITE(decode);
+TEST_SETUP(decode, setup);
+TEST_TEAR_DOWN(decode, tear_down);
+
+TEST_CASE(decode, invalid_text, NULL)
+{
 	struct test_handler *handler = data;
 	int                  err;
 
@@ -174,8 +171,8 @@ static MunitResult test_decode_invalid_text(const MunitParameter params[],
 	return MUNIT_OK;
 }
 
-static MunitResult test_decode_unknown_type(const MunitParameter params[],
-                                            void *               data) {
+TEST_CASE(decode, unknown_type, NULL)
+{
 	struct test_handler *handler = data;
 	int                  err;
 
@@ -192,8 +189,8 @@ static MunitResult test_decode_unknown_type(const MunitParameter params[],
 	return MUNIT_OK;
 }
 
-static MunitResult test_decode_two_uint64(const MunitParameter params[],
-                                          void *               data) {
+TEST_CASE(decode, two_uint64, NULL)
+{
 	struct test_handler *      handler = data;
 	static struct test_handler handler2;
 	int                        err;
@@ -221,29 +218,10 @@ static MunitResult test_decode_two_uint64(const MunitParameter params[],
 	munit_assert_int(handler2.bar.i, ==, 99);
 	munit_assert_int(handler2.bar.j, ==, 17);
 
-	dqlite__message_recv_reset(&handler2.message);
-	dqlite__message_send_reset(&handler->message);
+	message__recv_reset(&handler2.message);
+	message__send_reset(&handler->message);
 
 	test_handler_close(&handler2);
 
 	return MUNIT_OK;
 }
-
-static MunitTest dqlite__schema_decode_tests[] = {
-    {"/invalid-text", test_decode_invalid_text, setup, tear_down, 0, NULL},
-    {"/unknown-type", test_decode_unknown_type, setup, tear_down, 0, NULL},
-    {"/two-uint64-fields", test_decode_two_uint64, setup, tear_down, 0, NULL},
-    {NULL, NULL, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
-};
-
-/******************************************************************************
- *
- * Suite
- *
- ******************************************************************************/
-
-MunitSuite dqlite__schema_suites[] = {
-    {"_encode", dqlite__schema_encode_tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
-    {"_decode", dqlite__schema_decode_tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
-    {NULL, NULL, NULL, 0, MUNIT_SUITE_OPTION_NONE},
-};

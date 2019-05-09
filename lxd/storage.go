@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"reflect"
 	"sync"
 	"sync/atomic"
 
@@ -309,8 +308,9 @@ func storageInit(s *state.State, project, poolName, volumeName string, volumeTyp
 
 	// Load the storage volume.
 	volume := &api.StorageVolume{}
-	if volumeName != "" && volumeType >= 0 {
-		_, volume, err = s.Cluster.StoragePoolNodeVolumeGetTypeByProject(project, volumeName, volumeType, poolID)
+	volumeID := int64(-1)
+	if volumeName != "" {
+		volumeID, volume, err = s.Cluster.StoragePoolNodeVolumeGetTypeByProject(project, volumeName, volumeType, poolID)
 		if err != nil {
 			return nil, err
 		}
@@ -338,6 +338,7 @@ func storageInit(s *state.State, project, poolName, volumeName string, volumeTyp
 		dir.poolID = poolID
 		dir.pool = pool
 		dir.volume = volume
+		dir.volumeID = volumeID
 		dir.s = s
 		err = dir.StoragePoolInit()
 		if err != nil {
@@ -411,7 +412,7 @@ func storagePoolVolumeAttachInit(s *state.State, poolName string, volumeName str
 		return st, nil
 	}
 
-	// get last idmapset
+	// Get the on-disk idmap for the volume
 	var lastIdmap *idmap.IdmapSet
 	if poolVolumePut.Config["volatile.idmap.last"] != "" {
 		lastIdmap, err = idmapsetFromString(poolVolumePut.Config["volatile.idmap.last"])
@@ -421,8 +422,13 @@ func storagePoolVolumeAttachInit(s *state.State, poolName string, volumeName str
 		}
 	}
 
-	// get next idmapset
-	nextIdmap, err := c.IdmapSet()
+	// Get the container's idmap
+	var nextIdmap *idmap.IdmapSet
+	if c.IsRunning() {
+		nextIdmap, err = c.CurrentIdmap()
+	} else {
+		nextIdmap, err = c.NextIdmap()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -445,7 +451,7 @@ func storagePoolVolumeAttachInit(s *state.State, poolName string, volumeName str
 		return nil, err
 	}
 
-	if !reflect.DeepEqual(nextIdmap, lastIdmap) {
+	if !nextIdmap.Equals(lastIdmap) {
 		logger.Debugf("Shifting storage volume")
 		volumeUsedBy, err := storagePoolVolumeUsedByContainersGet(s,
 			"default", volumeName, volumeTypeName)
@@ -460,13 +466,18 @@ func storagePoolVolumeAttachInit(s *state.State, poolName string, volumeName str
 					continue
 				}
 
-				ctNextIdmap, err := ct.IdmapSet()
+				var ctNextIdmap *idmap.IdmapSet
+				if ct.IsRunning() {
+					ctNextIdmap, err = ct.CurrentIdmap()
+				} else {
+					ctNextIdmap, err = ct.NextIdmap()
+				}
 				if err != nil {
 					return nil, fmt.Errorf("Failed to retrieve idmap of container")
 				}
 
-				if !reflect.DeepEqual(nextIdmap, ctNextIdmap) {
-					return nil, fmt.Errorf("Idmaps of container %v and storage volume %v are not identical", ctNextIdmap, nextIdmap)
+				if !nextIdmap.Equals(ctNextIdmap) {
+					return nil, fmt.Errorf("Idmaps of container %v and storage volume %v are not identical", ctName, volumeName)
 				}
 			}
 		} else if len(volumeUsedBy) == 1 {
@@ -744,10 +755,8 @@ func deleteSnapshotMountpoint(snapshotMountpoint string, snapshotsSymlinkTarget 
 	return nil
 }
 
-// ShiftIfNecessary sets the volatile.last_state.idmap key to the idmap last
-// used by the container.
-func ShiftIfNecessary(container container, srcIdmap *idmap.IdmapSet) error {
-	dstIdmap, err := container.IdmapSet()
+func resetContainerDiskIdmap(container container, srcIdmap *idmap.IdmapSet) error {
+	dstIdmap, err := container.DiskIdmap()
 	if err != nil {
 		return err
 	}
@@ -756,7 +765,7 @@ func ShiftIfNecessary(container container, srcIdmap *idmap.IdmapSet) error {
 		dstIdmap = new(idmap.IdmapSet)
 	}
 
-	if !reflect.DeepEqual(srcIdmap, dstIdmap) {
+	if !srcIdmap.Equals(dstIdmap) {
 		var jsonIdmap string
 		if srcIdmap != nil {
 			idmapBytes, err := json.Marshal(srcIdmap.Idmap)

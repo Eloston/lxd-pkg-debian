@@ -16,16 +16,16 @@ package election
 
 import (
 	"fmt"
-	"log"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 )
 
 // Notifiy about leadership changes in a single raft server.
 type notifier struct {
 	// For debugging raft-test itself or its consumers.
-	logger *log.Logger
+	logger hclog.Logger
 
 	// ID of the raft server we're observing.
 	id raft.ServerID
@@ -47,7 +47,7 @@ type notifier struct {
 }
 
 // Create a new notifier.
-func newNotifier(logger *log.Logger, id raft.ServerID, notifyCh chan bool) *notifier {
+func newNotifier(logger hclog.Logger, id raft.ServerID, notifyCh chan bool) *notifier {
 	observer := &notifier{
 		logger:     logger,
 		id:         id,
@@ -133,7 +133,7 @@ func (n *notifier) start() {
 				panic(fmt.Sprintf("server %s %s leadership twice in a row", n.id, verb))
 			}
 			last = acquired
-			n.logger.Printf("[DEBUG] raft-test: server %s: leadership: %s", n.id, verb)
+			n.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: server %s: leadership: %s", n.id, verb))
 			select {
 			case <-ch:
 				panic(fmt.Sprintf("server %s: duplicate leadership %s notification", n.id, verb))
@@ -141,7 +141,7 @@ func (n *notifier) start() {
 				close(ch)
 			}
 		case <-n.shutdownCh:
-			n.logger.Printf("[DEBUG] raft-test: server %s: leadership: stop watching", n.id)
+			n.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: server %s: leadership: stop watching", n.id))
 			close(n.shutdownCh)
 			return
 		}

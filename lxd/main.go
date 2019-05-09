@@ -108,6 +108,10 @@ func main() {
 	forkmigrateCmd := cmdForkmigrate{global: &globalCmd}
 	app.AddCommand(forkmigrateCmd.Command())
 
+	// forkmknod sub-command
+	forkmknodCmd := cmdForkmknod{global: &globalCmd}
+	app.AddCommand(forkmknodCmd.Command())
+
 	// forkmount sub-command
 	forkmountCmd := cmdForkmount{global: &globalCmd}
 	app.AddCommand(forkmountCmd.Command())
@@ -127,6 +131,10 @@ func main() {
 	// forkuevent sub-command
 	forkueventCmd := cmdForkuevent{global: &globalCmd}
 	app.AddCommand(forkueventCmd.Command())
+
+	// forkzfs sub-command
+	forkzfsCmd := cmdForkZFS{global: &globalCmd}
+	app.AddCommand(forkzfsCmd.Command())
 
 	// import sub-command
 	importCmd := cmdImport{global: &globalCmd}

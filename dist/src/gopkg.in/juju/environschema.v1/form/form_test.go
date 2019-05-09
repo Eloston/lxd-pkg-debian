@@ -6,22 +6,15 @@ package form_test
 import (
 	"bytes"
 	"strings"
+	"testing"
 
 	"github.com/juju/schema"
-	"github.com/juju/testing"
-	jc "github.com/juju/testing/checkers"
-	gc "gopkg.in/check.v1"
+	qt "github.com/frankban/quicktest"
 	"gopkg.in/errgo.v1"
 
 	"gopkg.in/juju/environschema.v1"
 	"gopkg.in/juju/environschema.v1/form"
 )
-
-type formSuite struct {
-	testing.OsEnvSuite
-}
-
-var _ = gc.Suite(&formSuite{})
 
 var _ form.Filler = form.IOFiller{}
 
@@ -678,12 +671,13 @@ var ioFillerTests = []struct {
 	},
 }}
 
-func (s *formSuite) TestIOFiller(c *gc.C) {
+func TestIOFiller(t *testing.T) {
+	c := qt.New(t)
 	for i, test := range ioFillerTests {
-		func() {
+		c.Run(test.about, func(c *qt.C) {
 			c.Logf("%d. %s", i, test.about)
 			for k, v := range test.environment {
-				defer testing.PatchEnvironment(k, v)()
+				c.Setenv(k, v)
 			}
 			ioChecker := newInteractionChecker(c, "»", strings.TrimPrefix(unbeautify(test.expectIO), "\n"))
 			ioFiller := test.filler
@@ -691,18 +685,19 @@ func (s *formSuite) TestIOFiller(c *gc.C) {
 			ioFiller.Out = ioChecker
 			result, err := ioFiller.Fill(test.form)
 			if test.expectError != "" {
-				c.Assert(err, gc.ErrorMatches, test.expectError)
-				c.Assert(result, gc.IsNil)
+				c.Assert(err, qt.ErrorMatches, test.expectError)
+				c.Assert(result, qt.IsNil)
 			} else {
 				ioChecker.Close()
-				c.Assert(err, gc.IsNil)
-				c.Assert(result, jc.DeepEquals, test.expectResult)
+				c.Assert(err, qt.IsNil)
+				c.Assert(result, qt.DeepEquals, test.expectResult)
 			}
-		}()
+		})
 	}
 }
 
-func (s *formSuite) TestIOFillerReadError(c *gc.C) {
+func TestIOFillerReadError(t *testing.T) {
+	c := qt.New(t)
 	r := errorReader{}
 	var out bytes.Buffer
 	ioFiller := form.IOFiller{
@@ -717,15 +712,16 @@ func (s *formSuite) TestIOFillerReadError(c *gc.C) {
 			},
 		},
 	})
-	c.Check(out.String(), gc.Equals, "Press return to select a default value, or enter - to omit an entry.\na: ")
-	c.Assert(err, gc.ErrorMatches, `cannot complete form: cannot read input: some read error`)
-	c.Assert(result, gc.IsNil)
+	c.Check(out.String(), qt.Equals, "Press return to select a default value, or enter - to omit an entry.\na: ")
+	c.Assert(err, qt.ErrorMatches, `cannot complete form: cannot read input: some read error`)
+	c.Assert(result, qt.IsNil)
 	// Verify that the cause is masked. Maybe it shouldn't
 	// be, but test the code as it is.
-	c.Assert(errgo.Cause(err), gc.Not(gc.Equals), errRead)
+	c.Assert(errgo.Cause(err), qt.Not(qt.Equals), errRead)
 }
 
-func (s *formSuite) TestIOFillerUnexpectedEOF(c *gc.C) {
+func TestIOFillerUnexpectedEOF(t *testing.T) {
+	c := qt.New(t)
 	r := strings.NewReader("a")
 	var out bytes.Buffer
 	ioFiller := form.IOFiller{
@@ -740,12 +736,13 @@ func (s *formSuite) TestIOFillerUnexpectedEOF(c *gc.C) {
 			},
 		},
 	})
-	c.Check(out.String(), gc.Equals, "Press return to select a default value, or enter - to omit an entry.\na: ")
-	c.Assert(err, gc.ErrorMatches, `cannot complete form: cannot read input: unexpected EOF`)
-	c.Assert(result, gc.IsNil)
+	c.Check(out.String(), qt.Equals, "Press return to select a default value, or enter - to omit an entry.\na: ")
+	c.Assert(err, qt.ErrorMatches, `cannot complete form: cannot read input: unexpected EOF`)
+	c.Assert(result, qt.IsNil)
 }
 
-func (s *formSuite) TestSortedFields(c *gc.C) {
+func TestSortedFields(t *testing.T) {
+	c := qt.New(t)
 	fields := environschema.Fields{
 		"a1": environschema.Attr{
 			Group:       "A",
@@ -780,7 +777,7 @@ func (s *formSuite) TestSortedFields(c *gc.C) {
 			Secret:      true,
 		},
 	}
-	c.Assert(form.SortedFields(fields), jc.DeepEquals, []form.NamedAttr{{
+	c.Assert(form.SortedFields(fields), qt.DeepEquals, []form.NamedAttr{{
 		Name: "a1",
 		Attr: environschema.Attr{
 			Group:       "A",
@@ -887,29 +884,29 @@ var defaultFromEnvTests = []struct {
 	expectError: `cannot convert \$A: expected number, got string\("B"\)`,
 }}
 
-func (s *formSuite) TestDefaultFromEnv(c *gc.C) {
-	for i, test := range defaultFromEnvTests {
-		c.Logf("%d. %s", i, test.about)
-		func() {
+func TestDefaultFromEnv(t *testing.T) {
+	c := qt.New(t)
+	for _, test := range defaultFromEnvTests {
+		c.Run(test.about, func(c *qt.C) {
 			for k, v := range test.environment {
-				defer testing.PatchEnvironment(k, v)()
+				c.Setenv(k, v)
 			}
 			checker, err := test.attr.Checker()
-			c.Assert(err, gc.IsNil)
+			c.Assert(err, qt.IsNil)
 			result, display, err := form.DefaultFromEnv(form.NamedAttr{
 				Name: "ignored",
 				Attr: test.attr,
 			}, checker)
 			if test.expectError != "" {
-				c.Assert(err, gc.ErrorMatches, test.expectError)
-				c.Assert(display, gc.Equals, "")
-				c.Assert(result, gc.Equals, nil)
+				c.Assert(err, qt.ErrorMatches, test.expectError)
+				c.Assert(display, qt.Equals, "")
+				c.Assert(result, qt.Equals, nil)
 				return
 			}
-			c.Assert(err, gc.IsNil)
-			c.Assert(display, gc.Equals, "")
-			c.Assert(result, gc.Equals, test.expect)
-		}()
+			c.Assert(err, qt.IsNil)
+			c.Assert(display, qt.Equals, "")
+			c.Assert(result, qt.Equals, test.expect)
+		})
 	}
 }
 

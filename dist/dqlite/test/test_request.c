@@ -1,11 +1,10 @@
-#include <stdint.h>
-
-#include "../src/message.h"
 #include "../src/request.h"
 
-#include "leak.h"
-#include "message.h"
-#include "munit.h"
+#include "./lib/heap.h"
+#include "./lib/message.h"
+#include "./lib/runner.h"
+
+TEST_MODULE(request);
 
 /******************************************************************************
  *
@@ -13,25 +12,21 @@
  *
  ******************************************************************************/
 
-static void *setup(const MunitParameter params[], void *user_data) {
-	struct dqlite__request *request;
-
-	(void)params;
-	(void)user_data;
-
+static void *setup(const MunitParameter params[], void *user_data)
+{
+	struct request *request;
+	test_heap_setup(params, user_data);
 	request = munit_malloc(sizeof *request);
-
-	dqlite__request_init(request);
-
+	request_init(request);
 	return request;
 }
 
-static void tear_down(void *data) {
-	struct dqlite__request *request = data;
-
-	dqlite__request_close(request);
-
-	test_assert_no_leaks();
+static void tear_down(void *data)
+{
+	struct request *request = data;
+	request_close(request);
+	free(request);
+	test_heap_tear_down(data);
 }
 
 /******************************************************************************
@@ -40,29 +35,35 @@ static void tear_down(void *data) {
  *
  ******************************************************************************/
 
-static MunitResult test_leader(const MunitParameter params[], void *data) {
-	struct dqlite__request *request = data;
-	int                     err;
+TEST_SUITE(decode);
+TEST_SETUP(decode, setup);
+TEST_TEAR_DOWN(decode, tear_down);
+
+TEST_CASE(decode, leader, NULL)
+{
+	struct request *request = data;
+	int err;
 
 	(void)params;
 
 	test_message_send_leader(0, &request->message);
 
-	err = dqlite__request_decode(request);
+	err = request_decode(request);
 	munit_assert_int(err, ==, 0);
 
 	return MUNIT_OK;
 }
 
-static MunitResult test_client(const MunitParameter params[], void *data) {
-	struct dqlite__request *request = data;
-	int                     err;
+TEST_CASE(decode, client, NULL)
+{
+	struct request *request = data;
+	int err;
 
 	(void)params;
 
 	test_message_send_client(123, &request->message);
 
-	err = dqlite__request_decode(request);
+	err = request_decode(request);
 	munit_assert_int(err, ==, 0);
 
 	munit_assert_int(request->client.id, ==, 123);
@@ -70,15 +71,16 @@ static MunitResult test_client(const MunitParameter params[], void *data) {
 	return MUNIT_OK;
 }
 
-static MunitResult test_heartbeat(const MunitParameter params[], void *data) {
-	struct dqlite__request *request = data;
-	int                     err;
+TEST_CASE(decode, heartbeat, NULL)
+{
+	struct request *request = data;
+	int err;
 
 	(void)params;
 
 	test_message_send_heartbeat(666, &request->message);
 
-	err = dqlite__request_decode(request);
+	err = request_decode(request);
 	munit_assert_int(err, ==, 0);
 
 	munit_assert_int(request->heartbeat.timestamp, ==, 666);
@@ -86,15 +88,16 @@ static MunitResult test_heartbeat(const MunitParameter params[], void *data) {
 	return MUNIT_OK;
 }
 
-static MunitResult test_open(const MunitParameter params[], void *data) {
-	struct dqlite__request *request = data;
-	int                     err;
+TEST_CASE(decode, open, NULL)
+{
+	struct request *request = data;
+	int err;
 
 	(void)params;
 
 	test_message_send_open("test.db", 123, "volatile", &request->message);
 
-	err = dqlite__request_decode(request);
+	err = request_decode(request);
 	munit_assert_int(err, ==, 0);
 
 	munit_assert_string_equal(request->open.name, "test.db");
@@ -103,22 +106,3 @@ static MunitResult test_open(const MunitParameter params[], void *data) {
 
 	return MUNIT_OK;
 }
-
-static MunitTest dqlite__request_decode_tests[] = {
-    {"/leader", test_leader, setup, tear_down, 0, NULL},
-    {"/client", test_client, setup, tear_down, 0, NULL},
-    {"/heartbeat", test_heartbeat, setup, tear_down, 0, NULL},
-    {"/open", test_open, setup, tear_down, 0, NULL},
-    {NULL, NULL, NULL, NULL, 0, NULL},
-};
-
-/******************************************************************************
- *
- * Suite
- *
- ******************************************************************************/
-
-MunitSuite dqlite__request_suites[] = {
-    {"_decode", dqlite__request_decode_tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
-    {NULL, NULL, NULL, 0, 0},
-};

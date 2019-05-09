@@ -1,4 +1,3 @@
-#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -6,20 +5,22 @@
 
 #include "../include/dqlite.h"
 
+#include "./lib/assert.h"
+
 #include "error.h"
 #include "lifecycle.h"
 #include "message.h"
 #include "response.h"
 #include "schema.h"
 
-DQLITE__SCHEMA_IMPLEMENT(dqlite__response_failure, DQLITE__RESPONSE_SCHEMA_FAILURE);
-DQLITE__SCHEMA_IMPLEMENT(dqlite__response_server, DQLITE__RESPONSE_SCHEMA_SERVER);
-DQLITE__SCHEMA_IMPLEMENT(dqlite__response_welcome, DQLITE__RESPONSE_SCHEMA_WELCOME);
-DQLITE__SCHEMA_IMPLEMENT(dqlite__response_servers, DQLITE__RESPONSE_SCHEMA_SERVERS);
-DQLITE__SCHEMA_IMPLEMENT(dqlite__response_db, DQLITE__RESPONSE_SCHEMA_DB);
-DQLITE__SCHEMA_IMPLEMENT(dqlite__response_stmt, DQLITE__RESPONSE_SCHEMA_STMT);
-DQLITE__SCHEMA_IMPLEMENT(dqlite__response_result, DQLITE__RESPONSE_SCHEMA_RESULT);
-DQLITE__SCHEMA_IMPLEMENT(dqlite__response_rows, DQLITE__RESPONSE_SCHEMA_ROWS);
-DQLITE__SCHEMA_IMPLEMENT(dqlite__response_empty, DQLITE__RESPONSE_SCHEMA_EMPTY);
+SCHEMA__IMPLEMENT(response_failure, RESPONSE__SCHEMA_FAILURE);
+SCHEMA__IMPLEMENT(response_server, RESPONSE__SCHEMA_SERVER);
+SCHEMA__IMPLEMENT(response_welcome, RESPONSE__SCHEMA_WELCOME);
+SCHEMA__IMPLEMENT(response_servers, RESPONSE__SCHEMA_SERVERS);
+SCHEMA__IMPLEMENT(response_db, RESPONSE__SCHEMA_DB);
+SCHEMA__IMPLEMENT(response_stmt, RESPONSE__SCHEMA_STMT);
+SCHEMA__IMPLEMENT(response_result, RESPONSE__SCHEMA_RESULT);
+SCHEMA__IMPLEMENT(response_rows, RESPONSE__SCHEMA_ROWS);
+SCHEMA__IMPLEMENT(response_empty, RESPONSE__SCHEMA_EMPTY);
 
-DQLITE__SCHEMA_HANDLER_IMPLEMENT(dqlite__response, DQLITE__RESPONSE_SCHEMA_TYPES);
+SCHEMA__HANDLER_IMPLEMENT(response, RESPONSE__SCHEMA_TYPES);

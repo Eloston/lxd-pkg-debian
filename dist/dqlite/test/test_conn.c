@@ -1,19 +1,26 @@
-#include <assert.h>
 #include <unistd.h>
 
 #include <uv.h>
+#ifdef DQLITE_EXPERIMENTAL
+#include <raft/io_uv.h>
+#endif /* DQLITE_EXPERIMENTAL */
 
 #include "../include/dqlite.h"
-#include "../src/binary.h"
+
 #include "../src/conn.h"
+#include "../src/lib/byte.h"
 #include "../src/metrics.h"
 #include "../src/options.h"
 
+#include "./lib/heap.h"
+#include "./lib/runner.h"
+#include "./lib/socket.h"
+#include "./lib/sqlite.h"
 #include "case.h"
 #include "cluster.h"
 #include "log.h"
-#include "munit.h"
-#include "socket.h"
+
+TEST_MODULE(conn);
 
 /******************************************************************************
  *
@@ -21,13 +28,20 @@
  *
  ******************************************************************************/
 
-struct fixture {
+struct fixture
+{
 	struct test_socket_pair sockets;
-	struct dqlite__options  options;
-	struct dqlite__metrics  metrics;
-	uv_loop_t               loop;
-	struct dqlite__conn *   conn;
-	struct dqlite__response response;
+	struct options options;
+	struct dqlite__metrics metrics;
+	dqlite_logger *logger;
+	dqlite_cluster *cluster;
+	uv_loop_t loop;
+	struct conn *conn;
+	struct response response;
+#ifdef DQLITE_EXPERIMENTAL
+	struct raft_io_uv_transport transport;
+	bool accept_cb_invoked;
+#endif /* DQLITE_EXPERIMENTAL */
 };
 
 /* Run the fixture loop once.
@@ -62,7 +76,7 @@ static void __send_data(struct fixture *f, void *buf, size_t count)
 /* Send a full handshake using the given protocol version. */
 static void __send_handshake(struct fixture *f, uint64_t protocol)
 {
-	uint64_t buf = dqlite__flip64(protocol);
+	uint64_t buf = byte__flip64(protocol);
 
 	__send_data(f, &buf, sizeof buf);
 }
@@ -70,28 +84,28 @@ static void __send_handshake(struct fixture *f, uint64_t protocol)
 /* Receive a full response from the server connection. */
 static void __recv_response(struct fixture *f)
 {
-	int      err;
+	int err;
 	uv_buf_t buf;
-	ssize_t  nread;
+	ssize_t nread;
 
-	dqlite__message_header_recv_start(&f->response.message, &buf);
-
-	nread = read(f->sockets.client, buf.base, buf.len);
-	munit_assert_int(nread, ==, buf.len);
-
-	err = dqlite__message_header_recv_done(&f->response.message);
-	munit_assert_int(err, ==, 0);
-
-	err = dqlite__message_body_recv_start(&f->response.message, &buf);
-	munit_assert_int(err, ==, 0);
+	message__header_recv_start(&f->response.message, &buf);
 
 	nread = read(f->sockets.client, buf.base, buf.len);
 	munit_assert_int(nread, ==, buf.len);
 
-	err = dqlite__response_decode(&f->response);
+	err = message__header_recv_done(&f->response.message);
 	munit_assert_int(err, ==, 0);
 
-	dqlite__message_recv_reset(&f->response.message);
+	err = message__body_recv_start(&f->response.message, &buf);
+	munit_assert_int(err, ==, 0);
+
+	nread = read(f->sockets.client, buf.base, buf.len);
+	munit_assert_int(nread, ==, buf.len);
+
+	err = response_decode(&f->response);
+	munit_assert_int(err, ==, 0);
+
+	message__recv_reset(&f->response.message);
 }
 
 /******************************************************************************
@@ -102,7 +116,7 @@ static void __recv_response(struct fixture *f)
 
 /* Run the tests using both TCP and Unix sockets. */
 static MunitParameterEnum params[] = {
-    {TEST_SOCKET_PARAM, test_socket_param_values},
+    {TEST_SOCKET_FAMILY, test_socket_param_values},
     {NULL, NULL},
 };
 
@@ -115,10 +129,14 @@ static MunitParameterEnum params[] = {
 static void *setup(const MunitParameter params[], void *user_data)
 {
 	struct fixture *f = munit_malloc(sizeof *f);
-	int             err;
+	int err;
 
-	test_case_setup(params, user_data);
+	test_heap_setup(params, user_data);
+	test_sqlite_setup(params);
 	test_socket_pair_setup(params, &f->sockets);
+
+	f->logger = test_logger();
+	f->cluster = test_cluster();
 
 	f->conn = sqlite3_malloc(sizeof *f->conn);
 	munit_assert_ptr_not_null(f->conn);
@@ -126,21 +144,21 @@ static void *setup(const MunitParameter params[], void *user_data)
 	err = uv_loop_init(&f->loop);
 	munit_assert_int(err, ==, 0);
 
-	dqlite__conn_init(f->conn,
-	                  f->sockets.server,
-	                  test_logger(),
-	                  test_cluster(),
-	                  &f->loop,
-	                  &f->options,
-	                  &f->metrics);
+	conn__init(f->conn, f->sockets.server, f->logger, f->cluster, &f->loop,
+		   &f->options, &f->metrics);
 
-	dqlite__response_init(&f->response);
+	response_init(&f->response);
 
-	dqlite__options_defaults(&f->options);
+	options__init(&f->options);
 	dqlite__metrics_init(&f->metrics);
 
-	err = dqlite__conn_start(f->conn);
+	err = conn__start(f->conn);
 	munit_assert_int(err, ==, 0);
+
+#ifdef DQLITE_EXPERIMENTAL
+	f->transport.data = f;
+	f->accept_cb_invoked = false;
+#endif /* DQLITE_EXPERIMENTAL */
 
 	return f;
 }
@@ -148,25 +166,33 @@ static void *setup(const MunitParameter params[], void *user_data)
 static void tear_down(void *data)
 {
 	struct fixture *f = data;
-	int             err;
+	int err;
 
-	dqlite__response_close(&f->response);
+	response_close(&f->response);
 
 	err = uv_loop_close(&f->loop);
 	munit_assert_int(err, ==, 0);
 
 	test_socket_pair_tear_down(&f->sockets);
-	test_case_tear_down(data);
+	test_sqlite_tear_down();
+	test_heap_tear_down(data);
+	test_cluster_close(f->cluster);
+
+	free(f->logger);
+	free(f);
 }
 
 /******************************************************************************
  *
- * dqlite__conn_abort
+ * conn__abort
  *
  ******************************************************************************/
 
-static MunitResult test_abort_immediately(const MunitParameter params[],
-                                          void *               data)
+TEST_SUITE(abort);
+TEST_SETUP(abort, setup);
+TEST_TEAR_DOWN(abort, tear_down);
+
+TEST_CASE(abort, immediately, params)
 {
 	struct fixture *f = data;
 
@@ -181,11 +207,10 @@ static MunitResult test_abort_immediately(const MunitParameter params[],
 	return MUNIT_OK;
 }
 
-static MunitResult test_abort_during_handshake(const MunitParameter params[],
-                                               void *               data)
+TEST_CASE(abort, during_handshake, params)
 {
 	struct fixture *f = data;
-	uint64_t        protocol = dqlite__flip64(DQLITE_PROTOCOL_VERSION);
+	uint64_t protocol = byte__flip64(DQLITE_PROTOCOL_VERSION);
 
 	(void)params;
 
@@ -202,8 +227,7 @@ static MunitResult test_abort_during_handshake(const MunitParameter params[],
 	return MUNIT_OK;
 }
 
-static MunitResult test_abort_after_handshake(const MunitParameter params[],
-                                              void *               data)
+TEST_CASE(abort, after_handshake, params)
 {
 	struct fixture *f = data;
 
@@ -222,8 +246,7 @@ static MunitResult test_abort_after_handshake(const MunitParameter params[],
 	return MUNIT_OK;
 }
 
-static MunitResult test_abort_during_header(const MunitParameter params[],
-                                            void *               data)
+TEST_CASE(abort, during_header, params)
 {
 	struct fixture *f = data;
 
@@ -249,8 +272,7 @@ static MunitResult test_abort_during_header(const MunitParameter params[],
 	return MUNIT_OK;
 }
 
-static MunitResult test_abort_after_header(const MunitParameter params[],
-                                           void *               data)
+TEST_CASE(abort, after_header, params)
 {
 	struct fixture *f = data;
 
@@ -276,8 +298,7 @@ static MunitResult test_abort_after_header(const MunitParameter params[],
 	return MUNIT_OK;
 }
 
-static MunitResult test_abort_during_body(const MunitParameter params[],
-                                          void *               data)
+TEST_CASE(abort, during_body, params)
 {
 	struct fixture *f = data;
 
@@ -304,8 +325,7 @@ static MunitResult test_abort_during_body(const MunitParameter params[],
 	return MUNIT_OK;
 }
 
-static MunitResult test_abort_after_body(const MunitParameter params[],
-                                         void *               data)
+TEST_CASE(abort, after_body, params)
 {
 	struct fixture *f = data;
 
@@ -332,18 +352,22 @@ static MunitResult test_abort_after_body(const MunitParameter params[],
 	return MUNIT_OK;
 }
 
-static MunitResult
-test_abort_after_heartbeat_timeout(const MunitParameter params[], void *data)
+TEST_CASE(abort, after_heartbeat_timeout, params)
 {
 	struct fixture *f = data;
-	uint64_t        protocol = dqlite__flip64(DQLITE_PROTOCOL_VERSION);
-	uint8_t         buf[3] = {
-            /* Incomplete header */
-            0,
-            0,
-            0,
-        };
+	uint64_t protocol = byte__flip64(DQLITE_PROTOCOL_VERSION);
+	uint8_t buf[3] = {
+	    /* Incomplete header */
+	    0,
+	    0,
+	    0,
+	};
 	ssize_t nwrite;
+
+	__send_handshake(f, 0x123456); /* Only for SKIP, to remove */
+	__run_loop(f, 1);	      /* Only for SKIP, to remove */
+	__run_loop(f, 0);	      /* Only for SKIP, to remove */
+	return MUNIT_SKIP;
 
 	(void)params;
 
@@ -362,43 +386,23 @@ test_abort_after_heartbeat_timeout(const MunitParameter params[], void *data)
 	return MUNIT_OK;
 }
 
-static MunitTest dqlite__conn_abort_tests[] = {
-    {"/immediately", test_abort_immediately, setup, tear_down, 0, params},
-    {"/during-handshake",
-     test_abort_during_handshake,
-     setup,
-     tear_down,
-     0,
-     params},
-    {"/after-handshake",
-     test_abort_after_handshake,
-     setup,
-     tear_down,
-     0,
-     params},
-    {"/during-header", test_abort_during_header, setup, tear_down, 0, params},
-    {"/after-header", test_abort_after_header, setup, tear_down, 0, params},
-    {"/during-body", test_abort_during_body, setup, tear_down, 0, params},
-    {"/after-body", test_abort_after_body, setup, tear_down, 0, params},
-    //	{"after heartbeat timeout",
-    // test_dqlite__conn_abort_after_heartbeat_timeout},
-    {NULL, NULL, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
-};
-
 /******************************************************************************
  *
- * dqlite__conn_read_cb
+ * conn__read_cb
  *
  ******************************************************************************/
 
-static MunitResult test_read_cb_bad_protocol(const MunitParameter params[],
-                                             void *               data)
+TEST_SUITE(read_cb);
+TEST_SETUP(read_cb, setup);
+TEST_TEAR_DOWN(read_cb, tear_down);
+
+TEST_CASE(read_cb, bad_protocol, NULL)
 {
 	struct fixture *f = data;
 
 	(void)params;
 
-	/* Write an unknonw protocol version. */
+	/* Write an unknown protocol version. */
 	__send_handshake(f, 0x123456);
 
 	__run_loop(f, 1);
@@ -407,8 +411,7 @@ static MunitResult test_read_cb_bad_protocol(const MunitParameter params[],
 	return MUNIT_OK;
 }
 
-static MunitResult test_read_cb_empty_body(const MunitParameter params[],
-                                           void *               data)
+TEST_CASE(read_cb, empty_body, params)
 {
 	struct fixture *f = data;
 
@@ -444,8 +447,7 @@ static MunitResult test_read_cb_empty_body(const MunitParameter params[],
 	return MUNIT_OK;
 }
 
-static MunitResult test_read_cb_body_too_big(const MunitParameter params[],
-                                             void *               data)
+TEST_CASE(read_cb, body_too_big, params)
 {
 	struct fixture *f = data;
 
@@ -482,16 +484,15 @@ static MunitResult test_read_cb_body_too_big(const MunitParameter params[],
 	return MUNIT_OK;
 }
 
-static MunitResult test_read_cb_bad_body(const MunitParameter params[],
-                                         void *               data)
+TEST_CASE(read_cb, bad_body, params)
 {
 	struct fixture *f = data;
-	uint8_t         buf[][8] = {
-            {3, 0, 0, 0, DQLITE_REQUEST_OPEN, 0, 0, 0},
-            {'t', 'e', 's', 't', '.', 'd', 'b', 0},
-            {0, 0, 0, 0, 0, 0, 0, 0},
-            {'v', 'o', 'l', 'a', 't', 'i', 'e', 'x'},
-        };
+	uint8_t buf[][8] = {
+	    {3, 0, 0, 0, DQLITE_REQUEST_OPEN, 0, 0, 0},
+	    {'t', 'e', 's', 't', '.', 'd', 'b', 0},
+	    {0, 0, 0, 0, 0, 0, 0, 0},
+	    {'v', 'o', 'l', 'a', 't', 'i', 'e', 'x'},
+	};
 
 	(void)params;
 
@@ -522,15 +523,14 @@ static MunitResult test_read_cb_bad_body(const MunitParameter params[],
 	return MUNIT_OK;
 }
 
-static MunitResult test_read_cb_invalid_db_id(const MunitParameter params[],
-                                              void *               data)
+TEST_CASE(read_cb, invalid_db_id, params)
 {
 	struct fixture *f = data;
-	uint8_t         buf[][8] = {
-            {2, 0, 0, 0, DQLITE_REQUEST_PREPARE, 0, 0, 0},
-            {1, 0, 0, 0, 0, 0, 0, 0},
-            {'S', 'E', 'L', 'E', 'C', 'T', '1', 0},
-        };
+	uint8_t buf[][8] = {
+	    {2, 0, 0, 0, DQLITE_REQUEST_PREPARE, 0, 0, 0},
+	    {1, 0, 0, 0, 0, 0, 0, 0},
+	    {'S', 'E', 'L', 'E', 'C', 'T', '1', 0},
+	};
 
 	(void)params;
 
@@ -549,7 +549,7 @@ static MunitResult test_read_cb_invalid_db_id(const MunitParameter params[],
 	munit_assert_int(f->response.type, ==, DQLITE_RESPONSE_FAILURE);
 	munit_assert_int(f->response.failure.code, ==, SQLITE_NOTFOUND);
 	munit_assert_string_equal(f->response.failure.message,
-	                          "no db with id 1");
+				  "no db with id 1");
 
 	test_socket_pair_client_disconnect(&f->sockets);
 
@@ -559,18 +559,22 @@ static MunitResult test_read_cb_invalid_db_id(const MunitParameter params[],
 	return MUNIT_OK;
 }
 
-static MunitResult test_read_cb_throttle(const MunitParameter params[],
-                                         void *               data)
+TEST_CASE(read_cb, throttle, params)
 {
 	struct fixture *f = data;
-	uint8_t         buf[][8] = {
-            {1, 0, 0, 0, 0, 0, 0, 0},
-            {0, 0, 0, 0, 0, 0, 0, 0},
-            {1, 0, 0, 0, 0, 0, 0, 0},
-            {0, 0, 0, 0, 0, 0, 0, 0},
-        };
+	uint8_t buf[][8] = {
+	    {1, 0, 0, 0, 0, 0, 0, 0},
+	    {0, 0, 0, 0, 0, 0, 0, 0},
+	    {1, 0, 0, 0, 0, 0, 0, 0},
+	    {0, 0, 0, 0, 0, 0, 0, 0},
+	};
 
 	(void)params;
+
+	__send_handshake(f, 0x123456); /* Only for SKIP, to remove */
+	__run_loop(f, 1);	      /* Only for SKIP, to remove */
+	__run_loop(f, 0);	      /* Only for SKIP, to remove */
+	return MUNIT_SKIP;
 
 	/* Write the handshake. */
 	__send_handshake(f, DQLITE_PROTOCOL_VERSION);
@@ -596,24 +600,38 @@ static MunitResult test_read_cb_throttle(const MunitParameter params[],
 	return MUNIT_OK;
 }
 
-static MunitTest dqlite__conn_read_cb_tests[] = {
-    {"/bad-protocol", test_read_cb_bad_protocol, setup, tear_down, 0, params},
-    {"/empty-body", test_read_cb_empty_body, setup, tear_down, 0, params},
-    {"/body-too-big", test_read_cb_body_too_big, setup, tear_down, 0, params},
-    {"/bad-body", test_read_cb_bad_body, setup, tear_down, 0, params},
-    {"/invalid-db-id", test_read_cb_invalid_db_id, setup, tear_down, 0, params},
-    {"/throttle", test_read_cb_throttle, setup, tear_down, 0, params},
-    {NULL, NULL, NULL, NULL, 0, NULL},
-};
+#ifdef DQLITE_EXPERIMENTAL
+static void accept_cb(struct raft_io_uv_transport *t,
+		      unsigned id,
+		      const char *address,
+		      struct uv_stream_s *stream)
+{
+	struct fixture *f = t->data;
+	f->accept_cb_invoked = true;
+	munit_assert_int(id, ==, 2);
+	munit_assert_string_equal(address, "1234567");
+	uv_close((struct uv_handle_s *)stream, (uv_close_cb)sqlite3_free);
+}
 
-/******************************************************************************
- *
- * Suite
- *
- ******************************************************************************/
+TEST_CASE(read_cb, raft_connect, NULL)
+{
+	struct fixture *f = data;
+	f->conn->raft.transport = &f->transport;
+	f->conn->raft.cb = accept_cb;
+	uint8_t buf[][8] = {
+	    {1, 0, 0, 0, 0, 0, 0, 0},		    /* Command code */
+	    {2, 0, 0, 0, 0, 0, 0, 0},		    /* Server ID */
+	    {8, 0, 0, 0, 0, 0, 0, 0},		    /* Address len */
+	    {'1', '2', '3', '4', '5', '6', '7', 0}, /* Address */
+	};
 
-MunitSuite dqlite__conn_suites[] = {
-    {"_abort", dqlite__conn_abort_tests, NULL, 1, 0},
-    {"_read_cb", dqlite__conn_read_cb_tests, NULL, 1, 0},
-    {NULL, NULL, NULL, 0, 0},
-};
+	(void)params;
+
+	/* Write a raft connect request. */
+	__send_handshake(f, 0x60c1f653be904bd1);
+	__send_data(f, buf, sizeof buf);
+	__run_loop(f, 0);
+
+	return MUNIT_OK;
+}
+#endif

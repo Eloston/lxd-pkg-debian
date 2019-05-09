@@ -1,4 +1,3 @@
-#include <assert.h>
 #include <pthread.h>
 
 #include <sqlite3.h>
@@ -7,16 +6,23 @@
 
 #include "client.h"
 #include "cluster.h"
-#include "leak.h"
 #include "log.h"
-#include "munit.h"
 #include "server.h"
+#include "./lib/runner.h"
+#include "./lib/sqlite.h"
+#include "./lib/heap.h"
+
+#ifndef DQLITE_EXPERIMENTAL
+
+TEST_MODULE(server);
 
 /******************************************************************************
  *
  * Setup and tear down
  *
  ******************************************************************************/
+
+dqlite_cluster *cluster;
 
 static void *setup(const MunitParameter params[], void *user_data) {
 	dqlite_server *server;
@@ -25,7 +31,12 @@ static void *setup(const MunitParameter params[], void *user_data) {
 	(void)params;
 	(void)user_data;
 
-	err = dqlite_server_create(test_cluster(), &server);
+	test_heap_setup(params, user_data);
+	test_sqlite_setup(params);
+
+	cluster = test_cluster();
+
+	err = dqlite_server_create(cluster, &server);
 	munit_assert_int(err, ==, 0);
 
 	return server;
@@ -35,8 +46,10 @@ static void tear_down(void *data) {
 	dqlite_server *server = data;
 
 	dqlite_server_destroy(server);
+	test_cluster_close(cluster);
 
-	test_assert_no_leaks();
+	test_sqlite_tear_down();
+	test_heap_tear_down(data);
 }
 
 /******************************************************************************
@@ -45,7 +58,12 @@ static void tear_down(void *data) {
  *
  ******************************************************************************/
 
-static MunitResult test_config_logger(const MunitParameter params[], void *data) {
+TEST_SUITE(config);
+TEST_SETUP(config, setup);
+TEST_TEAR_DOWN(config, tear_down);
+
+TEST_CASE(config, logger, NULL)
+{
 	dqlite_server *server = data;
 	dqlite_logger *logger = test_logger();
 	int            err;
@@ -57,11 +75,13 @@ static MunitResult test_config_logger(const MunitParameter params[], void *data)
 
 	munit_assert_ptr_equal(dqlite_server_logger(server), logger);
 
+	free(logger);
+
 	return MUNIT_OK;
 }
 
-static MunitResult test_config_heartbeat_timeout(const MunitParameter params[],
-                                                 void *               data) {
+TEST_CASE(config, heartbeat_timeout, NULL)
+{
 	dqlite_server *server  = data;
 	int            timeout = 1000;
 	int            err;
@@ -75,7 +95,8 @@ static MunitResult test_config_heartbeat_timeout(const MunitParameter params[],
 	return MUNIT_OK;
 }
 
-static MunitResult test_config_page_size(const MunitParameter params[], void *data) {
+TEST_CASE(config, page_size, NULL)
+{
 	dqlite_server *server = data;
 	int            size   = 512;
 	int            err;
@@ -88,8 +109,8 @@ static MunitResult test_config_page_size(const MunitParameter params[], void *da
 	return MUNIT_OK;
 }
 
-static MunitResult test_config_checkpoint_threshold(const MunitParameter params[],
-                                                    void *               data) {
+TEST_CASE(config, checkpoint_threshold, NULL)
+{
 	dqlite_server *server    = data;
 	int            threshold = 1;
 	int            err;
@@ -103,26 +124,4 @@ static MunitResult test_config_checkpoint_threshold(const MunitParameter params[
 	return MUNIT_OK;
 }
 
-static MunitTest dqlite_server_config_tests[] = {
-    {"/logger", test_config_logger, setup, tear_down, 0, NULL},
-    {"/heartbeat-timeout", test_config_heartbeat_timeout, setup, tear_down, 0, NULL},
-    {"/page-size", test_config_page_size, setup, tear_down, 0, NULL},
-    {"/checkpoint-threshold",
-     test_config_checkpoint_threshold,
-     setup,
-     tear_down,
-     0,
-     NULL},
-    {NULL, NULL, NULL, NULL, 0, NULL},
-};
-
-/******************************************************************************
- *
- * Suite
- *
- ******************************************************************************/
-
-MunitSuite dqlite__server_suites[] = {
-    {"_config", dqlite_server_config_tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
-    {NULL, NULL, NULL, 0, 0},
-};
+#endif /* DQLITE_EXPERIMENTAL */

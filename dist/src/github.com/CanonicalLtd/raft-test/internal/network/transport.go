@@ -17,16 +17,16 @@ package network
 import (
 	"fmt"
 	"io"
-	"log"
 
 	"github.com/CanonicalLtd/raft-test/internal/event"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 )
 
 // Wrap a regular raft.Transport, adding support for trigger events at
 // specific times.
 type eventTransport struct {
-	logger *log.Logger
+	logger hclog.Logger
 
 	// ID of of the raft server associated with this transport.
 	id raft.ServerID
@@ -43,7 +43,7 @@ type eventTransport struct {
 }
 
 // Create a new transport wrapper..
-func newEventTransport(logger *log.Logger, id raft.ServerID, trans raft.Transport) *eventTransport {
+func newEventTransport(logger hclog.Logger, id raft.ServerID, trans raft.Transport) *eventTransport {
 	return &eventTransport{
 		logger:   logger,
 		id:       id,
@@ -70,11 +70,11 @@ func (t *eventTransport) AppendEntriesPipeline(
 	id raft.ServerID, target raft.ServerAddress) (raft.AppendPipeline, error) {
 
 	if t.peers.DisconnectedAndNotSyncing(id) {
-		t.logger.Printf("[DEBUG] raft-test: server %s: transport: append to %s: not connected", t.id, id)
+		t.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: server %s: transport: append to %s: not connected", t.id, id))
 		return nil, fmt.Errorf("cannot reach server %s", id)
 	}
 	if !t.peers.Get(id).Connected() {
-		t.logger.Printf("[DEBUG] raft-test: server %s: transport: append to %s: syncing logs", t.id, id)
+		t.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: server %s: transport: append to %s: syncing logs", t.id, id))
 	}
 
 	pipeline, err := t.trans.AppendEntriesPipeline(id, target)
@@ -101,7 +101,7 @@ func (t *eventTransport) AppendEntries(
 	resp *raft.AppendEntriesResponse) error {
 
 	peer := t.peers.Get(id)
-	t.logger.Printf("[DEBUG] raft-test: server %s: transport: append to %s: %s", t.id, id, stringifyLogs(args.Entries))
+	t.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: server %s: transport: append to %s: %s", t.id, id, stringifyLogs(args.Entries)))
 
 	// If a fault is set, check if this batch of entries contains a command
 	// log matching the one configured in the fault.
@@ -110,17 +110,17 @@ func (t *eventTransport) AppendEntries(
 		n := peer.CommandLogsCount()
 		args, faulty = t.schedule.FilterRequest(n, args)
 		if faulty && t.schedule.IsEnqueueFault() {
-			t.logger.Printf(
-				"[DEBUG] raft-test: server %s: transport: append to %s: enqueue fault: command %d", t.id, id, t.schedule.Command())
+			t.logger.Debug(fmt.Sprintf(
+				"[DEBUG] raft-test: server %s: transport: append to %s: enqueue fault: command %d", t.id, id, t.schedule.Command()))
 		}
 	}
 
 	if t.peers.DisconnectedAndNotSyncing(id) {
-		t.logger.Printf("[DEBUG] raft-test: server %s: transport: append to %s: not connected", t.id, id)
+		t.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: server %s: transport: append to %s: not connected", t.id, id))
 		return fmt.Errorf("cannot reach server %s", id)
 	}
 	if !t.peers.Get(id).Connected() {
-		t.logger.Printf("[DEBUG] raft-test: server %s: transport: append to %s: syncing logs", t.id, id)
+		t.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: server %s: transport: append to %s: syncing logs", t.id, id))
 	}
 
 	if err := t.trans.AppendEntries(id, target, args, resp); err != nil {
@@ -129,7 +129,7 @@ func (t *eventTransport) AppendEntries(
 
 	// Check for a newer term, stop running
 	if resp.Term > args.Term {
-		t.logger.Printf("[DEBUG] raft-test: server %s: transport: append to %s: newer term", t.id, id)
+		t.logger.Debug(fmt.Sprintf("[DEBUG] raft-test: server %s: transport: append to %s: newer term", t.id, id))
 	}
 
 	peer.UpdateLogs(args.Entries)

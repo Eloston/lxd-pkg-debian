@@ -92,6 +92,8 @@ func containerValidConfigKey(os *sys.OS, key string, value string) error {
 }
 
 var containerNetworkLimitKeys = []string{"limits.max", "limits.ingress", "limits.egress"}
+var containerNetworkRouteKeys = []string{"ipv4.routes", "ipv6.routes"}
+var containerNetworkKeys = append(containerNetworkLimitKeys, containerNetworkRouteKeys...)
 
 func containerValidDeviceConfigKey(t, k string) bool {
 	if k == "type" {
@@ -145,6 +147,10 @@ func containerValidDeviceConfigKey(t, k string) bool {
 		case "ipv4.address":
 			return true
 		case "ipv6.address":
+			return true
+		case "ipv4.routes":
+			return true
+		case "ipv6.routes":
 			return true
 		case "security.mac_filtering":
 			return true
@@ -363,25 +369,67 @@ func containerValidDevices(cluster *db.Cluster, devices types.Devices, profile b
 				return fmt.Errorf("Missing nic type")
 			}
 
-			if !shared.StringInSlice(m["nictype"], []string{"bridged", "macvlan", "p2p", "physical", "sriov"}) {
+			if !shared.StringInSlice(m["nictype"], []string{"bridged", "macvlan", "ipvlan", "p2p", "physical", "sriov"}) {
 				return fmt.Errorf("Bad nic type: %s", m["nictype"])
 			}
 
-			if shared.StringInSlice(m["nictype"], []string{"bridged", "macvlan", "physical", "sriov"}) && m["parent"] == "" {
+			if shared.StringInSlice(m["nictype"], []string{"bridged", "macvlan", "ipvlan", "physical", "sriov"}) && m["parent"] == "" {
 				return fmt.Errorf("Missing parent for %s type nic", m["nictype"])
 			}
 
 			if m["ipv4.address"] != "" {
-				err := networkValidAddressV4(m["ipv4.address"])
-				if err != nil {
-					return err
+				if m["nictype"] == "ipvlan" {
+					err := networkValidAddressV4List(m["ipv4.address"])
+					if err != nil {
+						return err
+					}
+				} else {
+					err := networkValidAddressV4(m["ipv4.address"])
+					if err != nil {
+						return err
+					}
 				}
 			}
 
 			if m["ipv6.address"] != "" {
-				err := networkValidAddressV6(m["ipv6.address"])
-				if err != nil {
-					return err
+				if m["nictype"] == "ipvlan" {
+					err := networkValidAddressV6List(m["ipv6.address"])
+					if err != nil {
+						return err
+					}
+				} else {
+					err := networkValidAddressV6(m["ipv6.address"])
+					if err != nil {
+						return err
+					}
+				}
+			}
+
+			if m["ipv4.routes"] != "" {
+				if !shared.StringInSlice(m["nictype"], []string{"bridged", "p2p"}) {
+					return fmt.Errorf("Bad nic type for ipv4.routes: %s", m["nictype"])
+				}
+
+				for _, route := range strings.Split(m["ipv4.routes"], ",") {
+					route = strings.TrimSpace(route)
+					err := networkValidNetworkV4(route)
+					if err != nil {
+						return err
+					}
+				}
+			}
+
+			if m["ipv6.routes"] != "" {
+				if !shared.StringInSlice(m["nictype"], []string{"bridged", "p2p"}) {
+					return fmt.Errorf("Bad nic type for ipv6.routes: %s", m["nictype"])
+				}
+
+				for _, route := range strings.Split(m["ipv6.routes"], ",") {
+					route = strings.TrimSpace(route)
+					err := networkValidNetworkV6(route)
+					if err != nil {
+						return err
+					}
 				}
 			}
 		} else if m["type"] == "infiniband" {
@@ -506,12 +554,12 @@ func containerValidDevices(cluster *db.Cluster, devices types.Devices, profile b
 				return fmt.Errorf("Proxy device entry is missing the required \"connect\" property")
 			}
 
-			listenAddr, err := parseAddr(m["listen"])
+			listenAddr, err := proxyParseAddr(m["listen"])
 			if err != nil {
 				return err
 			}
 
-			connectAddr, err := parseAddr(m["connect"])
+			connectAddr, err := proxyParseAddr(m["connect"])
 			if err != nil {
 				return err
 			}
@@ -634,9 +682,11 @@ type container interface {
 	// Hooks
 	OnStart() error
 	OnStop(target string) error
+	OnNetworkUp(deviceName string, hostVeth string) error
 
 	// Properties
 	Id() int
+	Location() string
 	Project() string
 	Name() string
 	Description() string
@@ -672,10 +722,12 @@ type container interface {
 	StorageStart() (bool, error)
 	StorageStop() (bool, error)
 	Storage() storage
-	IdmapSet() (*idmap.IdmapSet, error)
-	LastIdmapSet() (*idmap.IdmapSet, error)
 	TemplateApply(trigger string) error
 	DaemonState() *state.State
+
+	CurrentIdmap() (*idmap.IdmapSet, error)
+	DiskIdmap() (*idmap.IdmapSet, error)
+	NextIdmap() (*idmap.IdmapSet, error)
 }
 
 // Loader functions
@@ -704,7 +756,7 @@ func containerCreateAsEmpty(d *Daemon, args db.ContainerArgs) (container, error)
 }
 
 func containerCreateFromBackup(s *state.State, info backupInfo, data io.ReadSeeker,
-	customPool bool) error {
+	customPool bool) (storage, error) {
 	var pool storage
 	var fixBackupFile = false
 
@@ -712,31 +764,31 @@ func containerCreateFromBackup(s *state.State, info backupInfo, data io.ReadSeek
 	pool, storageErr := storagePoolInit(s, info.Pool)
 	if storageErr != nil && errors.Cause(storageErr) != db.ErrNoSuchObject {
 		// Unexpected error
-		return storageErr
+		return nil, storageErr
 	}
 
 	if errors.Cause(storageErr) == db.ErrNoSuchObject {
 		// The pool doesn't exist, and the backup is in binary format so we
 		// cannot alter the backup.yaml.
 		if info.HasBinaryFormat {
-			return storageErr
+			return nil, storageErr
 		}
 
 		// Get the default profile
 		_, profile, err := s.Cluster.ProfileGet(info.Project, "default")
 		if err != nil {
-			return errors.Wrap(err, "Failed to get default profile")
+			return nil, errors.Wrap(err, "Failed to get default profile")
 		}
 
 		_, v, err := shared.GetRootDiskDevice(profile.Devices)
 		if err != nil {
-			return errors.Wrap(err, "Failed to get root disk device")
+			return nil, errors.Wrap(err, "Failed to get root disk device")
 		}
 
 		// Use the default-profile's root pool
 		pool, err = storagePoolInit(s, v["pool"])
 		if err != nil {
-			return errors.Wrap(err, "Failed to initialize storage pool")
+			return nil, errors.Wrap(err, "Failed to initialize storage pool")
 		}
 
 		fixBackupFile = true
@@ -745,25 +797,25 @@ func containerCreateFromBackup(s *state.State, info backupInfo, data io.ReadSeek
 	// Find the compression algorithm
 	tarArgs, _, _, err := shared.DetectCompressionFile(data)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	data.Seek(0, 0)
 
 	// Unpack tarball
 	err = pool.ContainerBackupLoad(info, data, tarArgs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if fixBackupFile || customPool {
 		// Update the pool
 		err = backupFixStoragePool(s.Cluster, info, !customPool)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
-	return nil
+	return pool, nil
 }
 
 func containerCreateEmptySnapshot(s *state.State, args db.ContainerArgs) (container, error) {
@@ -1084,13 +1136,14 @@ func containerCreateAsSnapshot(s *state.State, args db.ContainerArgs, sourceCont
 		return nil, err
 	}
 
-	ourStart, err := c.StorageStart()
+	// Attempt to update backup.yaml on container
+	ourStart, err := sourceContainer.StorageStart()
 	if err != nil {
 		c.Delete()
 		return nil, err
 	}
 	if ourStart {
-		defer c.StorageStop()
+		defer sourceContainer.StorageStop()
 	}
 
 	err = writeBackupFile(sourceContainer)
@@ -1568,7 +1621,7 @@ func autoCreateContainerSnapshotsTask(d *Daemon) (task.Func, task.Schedule) {
 		// Figure out which need snapshotting (if any)
 		containers := []container{}
 		for _, c := range allContainers {
-			schedule := c.LocalConfig()["snapshots.schedule"]
+			schedule := c.ExpandedConfig()["snapshots.schedule"]
 
 			if schedule == "" {
 				continue
@@ -1593,7 +1646,7 @@ func autoCreateContainerSnapshotsTask(d *Daemon) (task.Func, task.Schedule) {
 			}
 
 			// Check if the container is running
-			if !shared.IsTrue(c.LocalConfig()["snapshots.schedule.stopped"]) && !c.IsRunning() {
+			if !shared.IsTrue(c.ExpandedConfig()["snapshots.schedule.stopped"]) && !c.IsRunning() {
 				continue
 			}
 
@@ -1653,7 +1706,7 @@ func autoCreateContainerSnapshots(ctx context.Context, d *Daemon, containers []c
 
 			snapshotName = fmt.Sprintf("%s%s%s", c.Name(), shared.SnapshotDelimiter, snapshotName)
 
-			expiry, err := shared.GetSnapshotExpiry(time.Now(), c.LocalConfig()["snapshots.expiry"])
+			expiry, err := shared.GetSnapshotExpiry(time.Now(), c.ExpandedConfig()["snapshots.expiry"])
 			if err != nil {
 				logger.Error("Error getting expiry date", log.Ctx{"err": err, "container": c})
 				ch <- nil
@@ -1774,7 +1827,7 @@ func pruneExpiredContainerSnapshots(ctx context.Context, d *Daemon, snapshots []
 func containerDetermineNextSnapshotName(d *Daemon, c container, defaultPattern string) (string, error) {
 	var err error
 
-	pattern := c.LocalConfig()["snapshots.pattern"]
+	pattern := c.ExpandedConfig()["snapshots.pattern"]
 	if pattern == "" {
 		pattern = defaultPattern
 	}
