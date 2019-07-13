@@ -1,3 +1,9 @@
+lxd (3.15-0custom) buster; urgency=medium
+
+  * New upstream release
+
+ -- Eloston <eloston@programmer.net>  Fre, 12 Jun 2019 00:00:00 +0000
+
 lxd (3.13-0custom) buster; urgency=medium
 
   * New upstream release
