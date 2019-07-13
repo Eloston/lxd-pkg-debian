@@ -19,6 +19,7 @@ import (
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/ioprogress"
 	"github.com/lxc/lxd/shared/logger"
+	"github.com/lxc/lxd/shared/units"
 )
 
 type storageLvm struct {
@@ -167,7 +168,7 @@ func (s *storageLvm) StoragePoolCreate() error {
 			return fmt.Errorf("Failed to chmod %s: %s", source, err)
 		}
 
-		size, err := shared.ParseByteSizeString(s.pool.Config["size"])
+		size, err := units.ParseByteSizeString(s.pool.Config["size"])
 		if err != nil {
 			return err
 		}
@@ -520,7 +521,7 @@ func (s *storageLvm) StoragePoolVolumeCreate() error {
 
 	// apply quota
 	if s.volume.Config["size"] != "" {
-		size, err := shared.ParseByteSizeString(s.volume.Config["size"])
+		size, err := units.ParseByteSizeString(s.volume.Config["size"])
 		if err != nil {
 			return err
 		}
@@ -836,7 +837,7 @@ func (s *storageLvm) StoragePoolVolumeUpdate(writable *api.StorageVolumePut,
 			targetVolumeMntPoint := getStoragePoolVolumeMountPoint(poolName, s.volume.Name)
 
 			bwlimit := s.pool.Config["rsync.bwlimit"]
-			output, err := rsyncLocalCopy(sourceVolumeMntPoint, targetVolumeMntPoint, bwlimit)
+			output, err := rsyncLocalCopy(sourceVolumeMntPoint, targetVolumeMntPoint, bwlimit, true)
 			if err != nil {
 				return fmt.Errorf("failed to rsync container: %s: %s", string(output), err)
 			}
@@ -867,7 +868,7 @@ func (s *storageLvm) StoragePoolVolumeUpdate(writable *api.StorageVolumePut,
 		}
 
 		if s.volume.Config["size"] != writable.Config["size"] {
-			size, err := shared.ParseByteSizeString(writable.Config["size"])
+			size, err := units.ParseByteSizeString(writable.Config["size"])
 			if err != nil {
 				return err
 			}
@@ -1508,7 +1509,7 @@ func (s *storageLvm) ContainerRestore(target container, source container) error 
 		defer target.Unfreeze()
 
 		bwlimit := s.pool.Config["rsync.bwlimit"]
-		output, err := rsyncLocalCopy(sourceContainerMntPoint, targetContainerMntPoint, bwlimit)
+		output, err := rsyncLocalCopy(sourceContainerMntPoint, targetContainerMntPoint, bwlimit, true)
 		if err != nil {
 			return fmt.Errorf("failed to rsync container: %s: %s", string(output), err)
 		}
@@ -1700,7 +1701,7 @@ func (s *storageLvm) ContainerBackupCreate(backup backup, source container) erro
 
 	// Prepare for rsync
 	rsync := func(oldPath string, newPath string, bwlimit string) error {
-		output, err := rsyncLocalCopy(oldPath, newPath, bwlimit)
+		output, err := rsyncLocalCopy(oldPath, newPath, bwlimit, true)
 		if err != nil {
 			return fmt.Errorf("Failed to rsync: %s: %s", string(output), err)
 		}
@@ -2123,7 +2124,7 @@ func (s *storageLvm) StorageEntitySetQuota(volumeType int, size int64, data inte
 		mountpoint = getStoragePoolVolumeMountPoint(s.pool.Name, s.volume.Name)
 	}
 
-	oldSize, err := shared.ParseByteSizeString(s.volume.Config["size"])
+	oldSize, err := units.ParseByteSizeString(s.volume.Config["size"])
 	if err != nil {
 		return err
 	}
@@ -2144,7 +2145,7 @@ func (s *storageLvm) StorageEntitySetQuota(volumeType int, size int64, data inte
 	}
 
 	// Update the database
-	s.volume.Config["size"] = shared.GetByteSizeString(size, 0)
+	s.volume.Config["size"] = units.GetByteSizeString(size, 0)
 	err = s.s.Cluster.StoragePoolVolumeUpdate(
 		s.volume.Name,
 		volumeType,
@@ -2160,34 +2161,65 @@ func (s *storageLvm) StorageEntitySetQuota(volumeType int, size int64, data inte
 }
 
 func (s *storageLvm) StoragePoolResources() (*api.ResourcesStoragePool, error) {
-	args := []string{s.pool.Config["lvm.vg_name"], "--noheadings",
-		"--units", "b", "--nosuffix", "-o"}
-
-	totalBuf, err := shared.TryRunCommand("vgs", append(args, "vg_size")...)
-	if err != nil {
-		return nil, err
-	}
-
-	totalStr := string(totalBuf)
-	totalStr = strings.TrimSpace(totalStr)
-	total, err := strconv.ParseUint(totalStr, 10, 64)
-	if err != nil {
-		return nil, err
-	}
-
 	res := api.ResourcesStoragePool{}
-	res.Space.Total = total
 
-	// Thinpools will always report zero free space so no use in calculating
-	// a used count. It'll be useless information for the user.
-	if !s.useThinpool {
-		freeBuf, err := shared.TryRunCommand("vgs", append(args, "vg_free")...)
+	// Thinpools will always report zero free space on the volume group, so calculate approx
+	// used space using the thinpool logical volume allocated (data and meta) percentages.
+	if s.useThinpool {
+		args := []string{fmt.Sprintf("%s/%s", s.vgName, s.thinPoolName), "--noheadings",
+			"--units", "b", "--nosuffix", "--separator", ",", "-o", "lv_size,data_percent,metadata_percent"}
+
+		out, err := shared.TryRunCommand("lvs", args...)
 		if err != nil {
 			return nil, err
 		}
-		freeStr := string(freeBuf)
-		freeStr = strings.TrimSpace(freeStr)
-		free, err := strconv.ParseUint(freeStr, 10, 64)
+
+		parts := strings.Split(strings.TrimSpace(out), ",")
+		if len(parts) < 3 {
+			return nil, fmt.Errorf("Unexpected output from lvs command")
+		}
+
+		total, err := strconv.ParseUint(parts[0], 10, 64)
+		if err != nil {
+			return nil, err
+		}
+
+		res.Space.Total = total
+
+		dataPerc, err := strconv.ParseFloat(parts[1], 64)
+		if err != nil {
+			return nil, err
+		}
+
+		metaPerc, err := strconv.ParseFloat(parts[2], 64)
+		if err != nil {
+			return nil, err
+		}
+
+		res.Space.Used = uint64(float64(total) * ((dataPerc + metaPerc) / 100))
+	} else {
+		// If thinpools are not in use, calculate used space in volume group.
+		args := []string{s.vgName, "--noheadings",
+			"--units", "b", "--nosuffix", "--separator", ",", "-o", "vg_size,vg_free"}
+
+		out, err := shared.TryRunCommand("vgs", args...)
+		if err != nil {
+			return nil, err
+		}
+
+		parts := strings.Split(strings.TrimSpace(out), ",")
+		if len(parts) < 2 {
+			return nil, fmt.Errorf("Unexpected output from vgs command")
+		}
+
+		total, err := strconv.ParseUint(parts[0], 10, 64)
+		if err != nil {
+			return nil, err
+		}
+
+		res.Space.Total = total
+
+		free, err := strconv.ParseUint(parts[1], 10, 64)
 		if err != nil {
 			return nil, err
 		}
@@ -2345,25 +2377,26 @@ func (s *storageLvm) StoragePoolVolumeSnapshotDelete() error {
 }
 
 func (s *storageLvm) StoragePoolVolumeSnapshotRename(newName string) error {
-	logger.Infof("Renaming LVM storage volume on storage pool \"%s\" from \"%s\" to \"%s\"", s.pool.Name, s.volume.Name, newName)
+	sourceName, _, ok := containerGetParentAndSnapshotName(s.volume.Name)
+	fullSnapshotName := fmt.Sprintf("%s%s%s", sourceName, shared.SnapshotDelimiter, newName)
+
+	logger.Infof("Renaming LVM storage volume on storage pool \"%s\" from \"%s\" to \"%s\"", s.pool.Name, s.volume.Name, fullSnapshotName)
 
 	_, err := s.StoragePoolVolumeUmount()
 	if err != nil {
 		return err
 	}
 
-	sourceName, _, ok := containerGetParentAndSnapshotName(s.volume.Name)
 	if !ok {
 		return fmt.Errorf("Not a snapshot name")
 	}
-	fullSnapshotName := fmt.Sprintf("%s%s%s", sourceName, shared.SnapshotDelimiter, newName)
 
 	sourceLVName := containerNameToLVName(s.volume.Name)
 	targetLVName := containerNameToLVName(fullSnapshotName)
 
 	err = s.renameLVByPath("default", sourceLVName, targetLVName, storagePoolVolumeAPIEndpointCustom)
 	if err != nil {
-		return fmt.Errorf("Failed to rename logical volume from \"%s\" to \"%s\": %s", s.volume.Name, newName, err)
+		return fmt.Errorf("Failed to rename logical volume from \"%s\" to \"%s\": %s", s.volume.Name, fullSnapshotName, err)
 	}
 
 	oldPath := getStoragePoolVolumeSnapshotMountPoint(s.pool.Name, s.volume.Name)
@@ -2373,7 +2406,7 @@ func (s *storageLvm) StoragePoolVolumeSnapshotRename(newName string) error {
 		return err
 	}
 
-	logger.Infof("Renamed LVM storage volume on storage pool \"%s\" from \"%s\" to \"%s\"", s.pool.Name, s.volume.Name, newName)
+	logger.Infof("Renamed LVM storage volume on storage pool \"%s\" from \"%s\" to \"%s\"", s.pool.Name, s.volume.Name, fullSnapshotName)
 
-	return s.s.Cluster.StoragePoolVolumeRename("default", s.volume.Name, newName, storagePoolVolumeTypeCustom, s.poolID)
+	return s.s.Cluster.StoragePoolVolumeRename("default", s.volume.Name, fullSnapshotName, storagePoolVolumeTypeCustom, s.poolID)
 }

@@ -2,6 +2,7 @@ package util
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/json"
@@ -14,10 +15,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
-	"golang.org/x/net/context"
+	"golang.org/x/sys/unix"
 
 	log "github.com/lxc/lxd/shared/log15"
 
@@ -249,7 +249,7 @@ func GetListeners(start int) []net.Listener {
 	listeners := []net.Listener{}
 
 	for i := start; i < start+fds; i++ {
-		syscall.CloseOnExec(i)
+		unix.CloseOnExec(i)
 
 		file := os.NewFile(uintptr(i), fmt.Sprintf("inherited-fd%d", i))
 		listener, err := net.FileListener(file)

@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -524,6 +525,55 @@ func (c *ClusterTx) ContainerConfigInsert(id int, config map[string]string) erro
 	return ContainerConfigInsert(c.tx, id, config)
 }
 
+// ContainerConfigUpdate inserts/updates/deletes the provided keys
+func (c *ClusterTx) ContainerConfigUpdate(id int, values map[string]string) error {
+	changes := map[string]string{}
+	deletes := []string{}
+
+	// Figure out which key to set/unset
+	for key, value := range values {
+		if value == "" {
+			deletes = append(deletes, key)
+			continue
+		}
+		changes[key] = value
+	}
+
+	// Insert/update keys
+	if len(changes) > 0 {
+		query := fmt.Sprintf("INSERT OR REPLACE INTO containers_config (container_id, key, value) VALUES")
+		exprs := []string{}
+		params := []interface{}{}
+		for key, value := range changes {
+			exprs = append(exprs, "(?, ?, ?)")
+			params = append(params, []interface{}{id, key, value}...)
+		}
+
+		query += strings.Join(exprs, ",")
+		_, err := c.tx.Exec(query, params...)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Delete keys
+	if len(deletes) > 0 {
+		query := fmt.Sprintf("DELETE FROM containers_config WHERE key IN %s AND container_id=?", query.Params(len(deletes)))
+		params := []interface{}{}
+		for _, key := range deletes {
+			params = append(params, key)
+		}
+
+		params = append(params, id)
+		_, err := c.tx.Exec(query, params...)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // ContainerRemove removes the container with the given name from the database.
 func (c *Cluster) ContainerRemove(project, name string) error {
 	return c.Transaction(func(tx *ClusterTx) error {
@@ -794,20 +844,27 @@ func (c *Cluster) ContainersResetState() error {
 // ContainerSetState sets the the power state of the container with the given ID.
 func (c *Cluster) ContainerSetState(id int, state string) error {
 	err := c.Transaction(func(tx *ClusterTx) error {
-		// Set the new value
-		str := fmt.Sprintf("INSERT OR REPLACE INTO containers_config (container_id, key, value) VALUES (?, 'volatile.last_state.power', ?)")
-		stmt, err := tx.tx.Prepare(str)
-		if err != nil {
-			return err
-		}
-		defer stmt.Close()
-
-		if _, err = stmt.Exec(id, state); err != nil {
-			return err
-		}
-		return nil
+		return tx.ContainerSetState(id, state)
 	})
 	return err
+}
+
+// ContainerSetState sets the the power state of the container with the given ID.
+func (c *ClusterTx) ContainerSetState(id int, state string) error {
+	// Set the new value
+	str := fmt.Sprintf("INSERT OR REPLACE INTO containers_config (container_id, key, value) VALUES (?, 'volatile.last_state.power', ?)")
+	stmt, err := c.tx.Prepare(str)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	_, err = stmt.Exec(id, state)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // ContainerUpdate updates the description, architecture and ephemeral flag of
@@ -848,10 +905,20 @@ func (c *Cluster) ContainerCreationUpdate(id int, date time.Time) error {
 
 // ContainerLastUsedUpdate updates the last_use_date field of the container
 // with the given ID.
-func (c *Cluster) ContainerLastUsedUpdate(id int, date time.Time) error {
-	stmt := `UPDATE containers SET last_use_date=? WHERE id=?`
-	err := exec(c.db, stmt, date, id)
-	return err
+func (c *ClusterTx) ContainerLastUsedUpdate(id int, date time.Time) error {
+	str := `UPDATE containers SET last_use_date=? WHERE id=?`
+	stmt, err := c.tx.Prepare(str)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	_, err = stmt.Exec(date, id)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // ContainerGetSnapshots returns the names of all snapshots of the container
@@ -866,6 +933,7 @@ SELECT containers.name
   FROM containers
   JOIN projects ON projects.id = containers.project_id
 WHERE projects.name=? AND containers.type=? AND SUBSTR(containers.name,1,?)=?
+ORDER BY date(containers.creation_date)
 `
 	inargs := []interface{}{project, CTypeSnapshot, length, regexp}
 	outfmt := []interface{}{name}
@@ -889,7 +957,14 @@ func (c *ClusterTx) ContainerGetSnapshotsFull(project string, name string) ([]Co
 		Type:    int(CTypeSnapshot),
 	}
 
-	return c.ContainerList(filter)
+	snapshots, err := c.ContainerList(filter)
+	if err != nil {
+		return nil, err
+	}
+
+	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].CreationDate.Before(snapshots[j].CreationDate) })
+
+	return snapshots, nil
 }
 
 // ContainerNextSnapshot returns the index the next snapshot of the container

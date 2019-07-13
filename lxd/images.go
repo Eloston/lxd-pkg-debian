@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -21,7 +22,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
+
 	"gopkg.in/yaml.v2"
 
 	lxd "github.com/lxc/lxd/client"
@@ -274,7 +275,7 @@ func imgPostContInfo(d *Daemon, r *http.Request, req api.ImagesPost, op *operati
 		return nil, err
 	}
 	if compressErr != nil {
-		return nil, err
+		return nil, compressErr
 	}
 	imageFile.Close()
 

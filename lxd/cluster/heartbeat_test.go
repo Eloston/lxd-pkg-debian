@@ -1,13 +1,13 @@
 package cluster_test
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
-	"github.com/CanonicalLtd/go-dqlite"
-	"github.com/hashicorp/raft"
+	dqlite "github.com/CanonicalLtd/go-dqlite"
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/state"
@@ -15,7 +15,6 @@ import (
 	"github.com/lxc/lxd/shared/version"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/context"
 )
 
 // After a heartbeat request is completed, the leader updates the heartbeat
@@ -44,7 +43,8 @@ func TestHeartbeat(t *testing.T) {
 	require.NoError(t, err)
 
 	// Perform the heartbeat requests.
-	heartbeat, _ := cluster.Heartbeat(leader, leaderState.Cluster)
+	timeNow := time.Now()
+	heartbeat, _ := cluster.Heartbeat(leader, leaderState.Cluster, nil, &timeNow)
 	ctx := context.Background()
 	heartbeat(ctx)
 
@@ -93,7 +93,8 @@ func DISABLE_TestHeartbeat_MarkAsDown(t *testing.T) {
 
 	// Shutdown the follower node and perform the heartbeat requests.
 	f.Server(follower).Close()
-	heartbeat, _ := cluster.Heartbeat(leader, leaderState.Cluster)
+	timeNow := time.Now()
+	heartbeat, _ := cluster.Heartbeat(leader, leaderState.Cluster, nil, &timeNow)
 	ctx := context.Background()
 	heartbeat(ctx)
 
@@ -160,7 +161,7 @@ func (f *heartbeatFixture) Leader() *cluster.Gateway {
 
 	for {
 		for _, gateway := range f.gateways {
-			if gateway.Raft().State() == raft.Leader {
+			if gateway.IsLeader() {
 				return gateway
 			}
 		}
@@ -184,7 +185,7 @@ func (f *heartbeatFixture) Follower() *cluster.Gateway {
 
 	for {
 		for _, gateway := range f.gateways {
-			if gateway.Raft().State() == raft.Follower {
+			if !gateway.IsLeader() {
 				return gateway
 			}
 		}
@@ -240,7 +241,7 @@ func (f *heartbeatFixture) node() (*state.State, *cluster.Gateway, string) {
 	mux := http.NewServeMux()
 	server := newServer(cert, mux)
 
-	for path, handler := range gateway.HandlerFuncs() {
+	for path, handler := range gateway.HandlerFuncs(nil) {
 		mux.HandleFunc(path, handler)
 	}
 

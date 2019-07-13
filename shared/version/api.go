@@ -154,6 +154,11 @@ var APIExtensions = []string{
 	"seccomp_notify",
 	"lxc_features",
 	"container_nic_ipvlan",
+	"network_vlan_sriov",
+	"storage_cephfs",
+	"container_nic_ipfilter",
+	"resources_v2",
+	"container_exec_user_group_cwd",
 }
 
 // APIExtensionsCount returns the number of available API extensions.

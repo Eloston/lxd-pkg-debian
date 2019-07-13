@@ -9,6 +9,8 @@ import (
 
 	"github.com/pkg/errors"
 	"gopkg.in/robfig/cron.v2"
+
+	"github.com/lxc/lxd/shared/units"
 )
 
 type ContainerAction string
@@ -223,7 +225,7 @@ var KnownContainerConfigKeys = map[string]func(value string) error{
 			return nil
 		}
 
-		_, err := ParseByteSizeString(value)
+		_, err := units.ParseByteSizeString(value)
 		if err != nil {
 			return err
 		}
@@ -329,6 +331,26 @@ func ConfigKeyChecker(key string) (func(value string) error, error) {
 		}
 
 		if strings.HasSuffix(key, ".host_name") {
+			return IsAny, nil
+		}
+
+		if strings.HasSuffix(key, ".mtu") {
+			return IsAny, nil
+		}
+
+		if strings.HasSuffix(key, ".created") {
+			return IsAny, nil
+		}
+
+		if strings.HasSuffix(key, ".id") {
+			return IsAny, nil
+		}
+
+		if strings.HasSuffix(key, ".vlan") {
+			return IsAny, nil
+		}
+
+		if strings.HasSuffix(key, ".spoofcheck") {
 			return IsAny, nil
 		}
 	}

@@ -1,11 +1,14 @@
 test_clustering_enable() {
+  # shellcheck disable=2039
+  local LXD_DIR
+
   LXD_INIT_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
   chmod +x "${LXD_INIT_DIR}"
   spawn_lxd "${LXD_INIT_DIR}" false
 
   (
     set -e
-    # shellcheck disable=SC2034
+    # shellcheck disable=SC2034,SC2030
     LXD_DIR=${LXD_INIT_DIR}
 
     # Launch a container.
@@ -34,6 +37,9 @@ test_clustering_enable() {
 }
 
 test_clustering_membership() {
+  # shellcheck disable=2039
+  local LXD_DIR
+
   setup_clustering_bridge
   prefix="lxd$$"
   bridge="${prefix}"
@@ -180,6 +186,9 @@ test_clustering_membership() {
 }
 
 test_clustering_containers() {
+  # shellcheck disable=2039
+  local LXD_DIR
+
   setup_clustering_bridge
   prefix="lxd$$"
   bridge="${prefix}"
@@ -346,6 +355,9 @@ test_clustering_containers() {
 }
 
 test_clustering_storage() {
+  # shellcheck disable=2039
+  local LXD_DIR
+
   setup_clustering_bridge
   prefix="lxd$$"
   bridge="${prefix}"
@@ -629,6 +641,9 @@ test_clustering_storage() {
 }
 
 test_clustering_network() {
+  # shellcheck disable=2039
+  local LXD_DIR
+
   setup_clustering_bridge
   prefix="lxd$$"
   bridge="${prefix}"
@@ -698,6 +713,9 @@ test_clustering_network() {
 }
 
 test_clustering_upgrade() {
+  # shellcheck disable=2039
+  local LXD_DIR LXD_NETNS
+
   setup_clustering_bridge
   prefix="lxd$$"
   bridge="${prefix}"
@@ -790,6 +808,9 @@ test_clustering_upgrade() {
 }
 
 test_clustering_publish() {
+  # shellcheck disable=2039
+  local LXD_DIR
+
   setup_clustering_bridge
   prefix="lxd$$"
   bridge="${prefix}"
@@ -836,6 +857,9 @@ test_clustering_publish() {
 }
 
 test_clustering_profiles() {
+  # shellcheck disable=2039
+  local LXD_DIR
+
   setup_clustering_bridge
   prefix="lxd$$"
   bridge="${prefix}"
@@ -905,6 +929,9 @@ EOF
 }
 
 test_clustering_join_api() {
+  # shellcheck disable=2039,2034
+  local LXD_DIR LXD_NETNS
+
   setup_clustering_bridge
   prefix="lxd$$"
   bridge="${prefix}"
@@ -942,6 +969,9 @@ test_clustering_join_api() {
 }
 
 test_clustering_shutdown_nodes() {
+  # shellcheck disable=2039
+  local LXD_DIR
+
   setup_clustering_bridge
   prefix="lxd$$"
   bridge="${prefix}"
@@ -969,7 +999,7 @@ test_clustering_shutdown_nodes() {
   ns3="${prefix}3"
   spawn_lxd_and_join_cluster "${ns3}" "${bridge}" "${cert}" 3 1 "${LXD_THREE_DIR}"
 
-  # Init a container on node2, using a client connected to node1
+  # Init a container on node1, using a client connected to node1
   LXD_DIR="${LXD_ONE_DIR}" ensure_import_testimage
   LXD_DIR="${LXD_ONE_DIR}" lxc launch --target node1 testimage foo
 
@@ -1008,6 +1038,9 @@ test_clustering_shutdown_nodes() {
 }
 
 test_clustering_projects() {
+  # shellcheck disable=2039
+  local LXD_DIR
+
   setup_clustering_bridge
   prefix="lxd$$"
   bridge="${prefix}"
@@ -1060,6 +1093,9 @@ test_clustering_projects() {
 }
 
 test_clustering_address() {
+  # shellcheck disable=2039
+  local LXD_DIR
+
   setup_clustering_bridge
   prefix="lxd$$"
   bridge="${prefix}"
@@ -1125,6 +1161,8 @@ test_clustering_address() {
   rm -f "${LXD_TWO_DIR}/unix.socket"
   rm -f "${LXD_ONE_DIR}/unix.socket"
 
+  lxc remote remove cluster
+
   teardown_clustering_netns
   teardown_clustering_bridge
 
@@ -1133,6 +1171,9 @@ test_clustering_address() {
 }
 
 test_clustering_image_replication() {
+  # shellcheck disable=2039
+  local LXD_DIR
+
   setup_clustering_bridge
   prefix="lxd$$"
   bridge="${prefix}"
@@ -1289,4 +1330,82 @@ test_clustering_image_replication() {
   kill_lxd "${LXD_ONE_DIR}"
   kill_lxd "${LXD_TWO_DIR}"
   kill_lxd "${LXD_THREE_DIR}"
+}
+
+test_clustering_dns() {
+  # shellcheck disable=2039
+  local LXD_DIR
+
+  # Because we do not want tests to only run on Ubuntu (due to cluster's fan network dependency)
+  # instead we will just spawn forkdns directly and check DNS resolution.
+
+  # shellcheck disable=SC2031
+  lxdDir="${LXD_DIR}"
+  prefix="lxd$$"
+  ipRand=$(shuf -i 0-9 -n 1)
+
+  # Create first dummy interface for forkdns
+  ip link add "${prefix}1" type dummy
+  ip link set "${prefix}1" up
+  ip a add 127.0.1.1"${ipRand}"/32 dev "${prefix}1"
+
+  # Create forkdns config directory
+  mkdir "${lxdDir}"/networks/lxdtest1/forkdns.servers -p
+
+  # Launch forkdns (we expect syslog error about missing servers.conf file)
+  lxd forkdns "${lxdDir}"/forkdns1.log "${lxdDir}"/forkdns1.pid 127.0.1.1"${ipRand}":1053 lxd lxdtest1
+
+  # Create first dummy interface for forkdns
+  ip link add "${prefix}2" type dummy
+  ip link set "${prefix}2" up
+  ip a add 127.0.1.2"${ipRand}"/32 dev "${prefix}2"
+
+  # Create forkdns config directory
+  mkdir "${lxdDir}"/networks/lxdtest2/forkdns.servers -p
+
+  # Launch forkdns (we expect syslog error about missing servers.conf file)
+  lxd forkdns "${lxdDir}"/forkdns2.log "${lxdDir}"/forkdns2.pid 127.0.1.2"${ipRand}":1053 lxd lxdtest2
+
+  # Let the processes come up
+  sleep 1
+  forkdns_pid1=$(cat "${lxdDir}/forkdns1.pid")
+  forkdns_pid2=$(cat "${lxdDir}/forkdns2.pid")
+
+  # Create servers list file for forkdns1 pointing at forkdns2 (should be live reloaded)
+  echo "127.0.1.2${ipRand}" > "${lxdDir}"/networks/lxdtest1/forkdns.servers/servers.conf
+
+  # Create fake DHCP lease file on forkdns2 network
+  echo "1560188871 00:16:3e:98:05:40 10.140.78.145 test1 ff:2b:a8:0a:df:00:02:00:00:ab:11:36:ea:11:e5:37:e0:85:45" > "${lxdDir}"/networks/lxdtest2/dnsmasq.leases
+
+  # Test querying forkdns1 for A record that is on forkdns2 network
+  if ! dig @127.0.1.1"${ipRand}" -p1053 test1.lxd | grep "10.140.78.145" ; then
+    echo "test1.lxd A DNS resolution failed"
+    false
+  fi
+
+  # Test querying forkdns1 for PTR record that is on forkdns2 network
+  if ! dig @127.0.1.1"${ipRand}" -p1053 -x 10.140.78.145 | grep "test1.lxd" ; then
+    echo "10.140.78.145 PTR DNS resolution failed"
+    false
+  fi
+
+  # Test querying forkdns1 for A record that is on forkdns2 network with recursion disabled to
+  # ensure request isn't relayed
+  if ! dig @127.0.1.1"${ipRand}" -p1053 +norecurse test1.lxd | grep "NXDOMAIN" ; then
+    echo "test1.lxd A norecurse didnt return NXDOMAIN"
+    false
+  fi
+
+  # Test querying forkdns1 for PTR record that is on forkdns2 network with recursion disabled to
+  # ensure request isn't relayed
+  if ! dig @127.0.1.1"${ipRand}" -p1053 +norecurse -x 10.140.78.145 | grep "NXDOMAIN" ; then
+    echo "10.140.78.145 PTR norecurse didnt return NXDOMAIN"
+    false
+  fi
+
+  # Cleanup
+  kill "${forkdns_pid1}"
+  kill "${forkdns_pid2}"
+  ip link delete "${prefix}1"
+  ip link delete "${prefix}2"
 }

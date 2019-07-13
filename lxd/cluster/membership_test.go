@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/CanonicalLtd/go-dqlite"
+	dqlite "github.com/CanonicalLtd/go-dqlite"
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/state"
@@ -121,7 +121,7 @@ func TestBootstrap(t *testing.T) {
 	assert.True(t, shared.PathExists(filepath.Join(state.OS.VarDir, "cluster.crt")))
 
 	// The dqlite driver is now exposed over the network.
-	for path, handler := range gateway.HandlerFuncs() {
+	for path, handler := range gateway.HandlerFuncs(nil) {
 		mux.HandleFunc(path, handler)
 	}
 
@@ -246,7 +246,7 @@ func TestJoin(t *testing.T) {
 	targetGateway := newGateway(t, targetState.Node, targetCert)
 	defer targetGateway.Shutdown()
 
-	for path, handler := range targetGateway.HandlerFuncs() {
+	for path, handler := range targetGateway.HandlerFuncs(nil) {
 		targetMux.HandleFunc(path, handler)
 	}
 
@@ -285,7 +285,7 @@ func TestJoin(t *testing.T) {
 
 	defer gateway.Shutdown()
 
-	for path, handler := range gateway.HandlerFuncs() {
+	for path, handler := range gateway.HandlerFuncs(nil) {
 		mux.HandleFunc(path, handler)
 	}
 
@@ -352,14 +352,9 @@ func TestJoin(t *testing.T) {
 	require.NoError(t, err)
 
 	// The node has gone from the raft cluster.
-	raft := targetGateway.Raft()
-	future := raft.GetConfiguration()
-	require.NoError(t, future.Error())
-	assert.Len(t, future.Configuration().Servers, 1)
-
-	count, err = cluster.Count(state)
+	members, err := targetGateway.RaftNodes()
 	require.NoError(t, err)
-	assert.Equal(t, 1, count)
+	assert.Len(t, members, 1)
 }
 
 func FLAKY_TestPromote(t *testing.T) {
@@ -375,7 +370,7 @@ func FLAKY_TestPromote(t *testing.T) {
 	targetGateway := newGateway(t, targetState.Node, targetCert)
 	defer targetGateway.Shutdown()
 
-	for path, handler := range targetGateway.HandlerFuncs() {
+	for path, handler := range targetGateway.HandlerFuncs(nil) {
 		targetMux.HandleFunc(path, handler)
 	}
 
@@ -410,7 +405,7 @@ func FLAKY_TestPromote(t *testing.T) {
 	gateway := newGateway(t, state.Node, targetCert)
 	defer gateway.Shutdown()
 
-	for path, handler := range gateway.HandlerFuncs() {
+	for path, handler := range gateway.HandlerFuncs(nil) {
 		mux.HandleFunc(path, handler)
 	}
 

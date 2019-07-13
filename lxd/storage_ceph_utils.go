@@ -10,12 +10,14 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/pborman/uuid"
+	"golang.org/x/sys/unix"
+
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
-
-	"github.com/pborman/uuid"
+	"github.com/lxc/lxd/shared/units"
 )
 
 // cephOSDPoolExists checks whether a given OSD pool exists.
@@ -656,14 +658,14 @@ func cephRBDVolumeRestore(clusterName string, poolName string, volumeName string
 // getRBDSize returns the size the RBD storage volume is supposed to be created
 // with
 func (s *storageCeph) getRBDSize() (string, error) {
-	sz, err := shared.ParseByteSizeString(s.volume.Config["size"])
+	sz, err := units.ParseByteSizeString(s.volume.Config["size"])
 	if err != nil {
 		return "", err
 	}
 
 	// Safety net: Set to default value.
 	if sz == 0 {
-		sz, _ = shared.ParseByteSizeString("10GB")
+		sz, _ = units.ParseByteSizeString("10GB")
 	}
 
 	return fmt.Sprintf("%dB", sz), nil
@@ -1574,7 +1576,7 @@ func (s *storageCeph) cephRBDVolumeBackupCreate(tmpPath string, backup backup, s
 
 	// Prepare for rsync
 	rsync := func(oldPath string, newPath string, bwlimit string) error {
-		output, err := rsyncLocalCopy(oldPath, newPath, bwlimit)
+		output, err := rsyncLocalCopy(oldPath, newPath, bwlimit, true)
 		if err != nil {
 			return fmt.Errorf("Failed to rsync: %s: %s", string(output), err)
 		}
@@ -1594,7 +1596,7 @@ func (s *storageCeph) cephRBDVolumeBackupCreate(tmpPath string, backup backup, s
 		// been committed to disk. If we don't then the rbd snapshot of
 		// the underlying filesystem can be inconsistent or - worst case
 		// - empty.
-		syscall.Sync()
+		unix.Sync()
 
 		// create snapshot
 		err := cephRBDSnapshotCreate(s.ClusterName, s.OSDPoolName, sourceContainerOnlyName, storagePoolVolumeTypeNameContainer, snapshotName, s.UserName)
@@ -1654,7 +1656,7 @@ func (s *storageCeph) cephRBDVolumeBackupCreate(tmpPath string, backup backup, s
 		return err
 	}
 	logger.Debugf("Mounted RBD device %s onto %s", RBDDevPath, tmpContainerMntPoint)
-	defer tryUnmount(tmpContainerMntPoint, syscall.MNT_DETACH)
+	defer tryUnmount(tmpContainerMntPoint, unix.MNT_DETACH)
 
 	// Figure out the target name
 	targetName := sourceContainerName
@@ -1916,7 +1918,7 @@ func (s *storageCeph) doCrossPoolVolumeCopy(source *api.StorageVolumeSource) err
 			_, snapOnlyName, _ := containerGetParentAndSnapshotName(snap)
 			srcSnapshotMntPoint := getStoragePoolVolumeSnapshotMountPoint(source.Pool, snap)
 
-			_, err = rsyncLocalCopy(srcSnapshotMntPoint, dstVolumeMntPoint, bwlimit)
+			_, err = rsyncLocalCopy(srcSnapshotMntPoint, dstVolumeMntPoint, bwlimit, true)
 			if err != nil {
 				return err
 			}
@@ -1936,7 +1938,7 @@ func (s *storageCeph) doCrossPoolVolumeCopy(source *api.StorageVolumeSource) err
 		srcVolumeMntPoint = getStoragePoolVolumeMountPoint(source.Pool, source.Name)
 	}
 
-	_, err = rsyncLocalCopy(srcVolumeMntPoint, dstVolumeMntPoint, bwlimit)
+	_, err = rsyncLocalCopy(srcVolumeMntPoint, dstVolumeMntPoint, bwlimit, true)
 	if err != nil {
 		os.RemoveAll(dstVolumeMntPoint)
 		logger.Errorf("Failed to rsync into RBD storage volume \"%s\" on storage pool \"%s\": %s", s.volume.Name, s.pool.Name, err)

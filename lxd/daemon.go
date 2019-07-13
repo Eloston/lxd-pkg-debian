@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
 	"database/sql"
 	"database/sql/driver"
@@ -13,15 +14,15 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/CanonicalLtd/candidclient"
-	"github.com/CanonicalLtd/go-dqlite"
+	dqlite "github.com/CanonicalLtd/go-dqlite"
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
+	"golang.org/x/sys/unix"
 	"gopkg.in/lxc/go-lxc.v2"
+
 	"gopkg.in/macaroon-bakery.v2/bakery"
 	"gopkg.in/macaroon-bakery.v2/bakery/checkers"
 	"gopkg.in/macaroon-bakery.v2/bakery/identchecker"
@@ -74,6 +75,12 @@ type Daemon struct {
 	proxy func(req *http.Request) (*url.URL, error)
 
 	externalAuth *externalAuth
+
+	// Stores the last time this node initiated a leader heartbeat run.
+	lastLeaderHeartbeat time.Time
+
+	// Stores last heartbeat node information to detect node changes.
+	lastNodeList *cluster.APIHeartbeat
 }
 
 type externalAuth struct {
@@ -474,13 +481,13 @@ func setupSharedMounts() error {
 	}
 
 	// Mount a new tmpfs
-	if err := syscall.Mount("tmpfs", path, "tmpfs", 0, "size=100k,mode=0711"); err != nil {
+	if err := unix.Mount("tmpfs", path, "tmpfs", 0, "size=100k,mode=0711"); err != nil {
 		return err
 	}
 
 	// Mark as MS_SHARED and MS_REC
-	var flags uintptr = syscall.MS_SHARED | syscall.MS_REC
-	if err := syscall.Mount(path, path, "none", flags, ""); err != nil {
+	var flags uintptr = unix.MS_SHARED | unix.MS_REC
+	if err := unix.Mount(path, path, "none", flags, ""); err != nil {
 		return err
 	}
 
@@ -585,6 +592,7 @@ func (d *Daemon) init() error {
 		"network_ipvlan",
 		"network_l2proxy",
 		"network_gateway_device_route",
+		"network_phys_macvlan_mtu",
 	}
 	for _, extension := range lxcExtensions {
 		d.os.LXCFeatures[extension] = lxc.HasApiExtension(extension)
@@ -600,34 +608,6 @@ func (d *Daemon) init() error {
 	certInfo, err := util.LoadCert(d.os.VarDir)
 	if err != nil {
 		return err
-	}
-
-	clustered, err := cluster.Enabled(d.db)
-	if err != nil {
-		return err
-	}
-
-	// If not already applied, run the daemon patch that shrinks the boltdb
-	// file. We can't run this daemon patch later on along with the other
-	// ones because it needs to run before we open the cluster database.
-	appliedPatches, err := d.db.Patches()
-	if err != nil {
-		return errors.Wrap(err, "Fetch applied daemon patches")
-	}
-	if !shared.StringInSlice("shrink_logs_db_file", appliedPatches) {
-		if !clustered {
-			// We actually run the patch only if this lxd daemon is
-			// not clustered.
-			err := patchShrinkLogsDBFile("", d)
-			if err != nil {
-				return errors.Wrap(err, "Shrink logs.db file")
-			}
-		}
-
-		err = d.db.PatchesMarkApplied("shrink_logs_db_file")
-		if err != nil {
-			return err
-		}
 	}
 
 	/* Setup dqlite */
@@ -652,7 +632,7 @@ func (d *Daemon) init() error {
 		// Attempt to Mount the devlxd tmpfs
 		devlxd := filepath.Join(d.os.VarDir, "devlxd")
 		if !shared.IsMountPoint(devlxd) {
-			syscall.Mount("tmpfs", devlxd, "tmpfs", 0, "size=100k,mode=0755")
+			unix.Mount("tmpfs", devlxd, "tmpfs", 0, "size=100k,mode=0755")
 		}
 	}
 
@@ -688,10 +668,16 @@ func (d *Daemon) init() error {
 		return err
 	}
 
+	clustered, err := cluster.Enabled(d.db)
+	if err != nil {
+		return err
+	}
+
 	/* Open the cluster database */
 	for {
 		logger.Info("Initializing global database")
 		dir := filepath.Join(d.os.VarDir, "database")
+
 		store := d.gateway.ServerStore()
 
 		contextTimeout := 5 * time.Second
@@ -724,7 +710,7 @@ func (d *Daemon) init() error {
 			// The only thing we want to still do on this node is
 			// to run the heartbeat task, in case we are the raft
 			// leader.
-			stop, _ := task.Start(cluster.Heartbeat(d.gateway, d.cluster))
+			stop, _ := task.Start(cluster.Heartbeat(d.gateway, d.cluster, d.NodeRefreshTask, &d.lastLeaderHeartbeat))
 			d.gateway.WaitUpgradeNotification()
 			stop(time.Second)
 
@@ -763,6 +749,20 @@ func (d *Daemon) init() error {
 
 			return fmt.Errorf("Failed to migrate data to global database: %v", err)
 		}
+	}
+
+	// This logic used to belong to patchUpdateFromV10, but has been moved
+	// here because it needs database access.
+	if shared.PathExists(shared.VarPath("lxc")) {
+		err := os.Rename(shared.VarPath("lxc"), shared.VarPath("containers"))
+		if err != nil {
+			return err
+		}
+
+		logger.Debugf("Restarting all the containers following directory rename")
+		s := d.State()
+		containersShutdown(s)
+		containersRestart(s)
 	}
 
 	// Setup the user-agent
@@ -915,13 +915,10 @@ func (d *Daemon) init() error {
 
 func (d *Daemon) startClusterTasks() {
 	// Heartbeats
-	d.clusterTasks.Add(cluster.Heartbeat(d.gateway, d.cluster))
+	d.clusterTasks.Add(cluster.Heartbeat(d.gateway, d.cluster, d.NodeRefreshTask, &d.lastLeaderHeartbeat))
 
 	// Events
 	d.clusterTasks.Add(cluster.Events(d.endpoints, d.cluster, eventForward))
-
-	// Cluster update trigger
-	d.clusterTasks.Add(cluster.KeepUpdated(d.State()))
 
 	// Auto-sync images across the cluster (daily)
 	d.clusterTasks.Add(autoSyncImagesTask(d))
@@ -1082,8 +1079,8 @@ func (d *Daemon) Stop() error {
 	if shouldUnmount {
 		logger.Infof("Unmounting temporary filesystems")
 
-		syscall.Unmount(shared.VarPath("devlxd"), syscall.MNT_DETACH)
-		syscall.Unmount(shared.VarPath("shmounts"), syscall.MNT_DETACH)
+		unix.Unmount(shared.VarPath("devlxd"), unix.MNT_DETACH)
+		unix.Unmount(shared.VarPath("shmounts"), unix.MNT_DETACH)
 
 		logger.Infof("Done unmounting temporary filesystems")
 	} else {
@@ -1299,22 +1296,10 @@ func initializeDbObject(d *Daemon) (*db.Dump, error) {
 	legacy := map[int]*db.LegacyPatch{}
 	for i, patch := range legacyPatches {
 		legacy[i] = &db.LegacyPatch{
-			Hook: func(node *sql.DB) error {
-				// FIXME: Use the low-level *node* SQL db as backend for both the
-				//        db.Node and db.Cluster objects, since at this point we
-				//        haven't migrated the data to the cluster database yet.
-				cluster := d.cluster
-				defer func() {
-					d.cluster = cluster
-				}()
-				d.db = db.ForLegacyPatches(node)
-				d.cluster = db.ForLocalInspection(node)
-				return patch(d)
+			Hook: func(tx *sql.Tx) error {
+				return patch(tx)
 			},
 		}
-	}
-	for _, i := range legacyPatchesNeedingDB {
-		legacy[i].NeedsDB = true
 	}
 
 	// Hook to run when the local database is created from scratch. It will
@@ -1336,4 +1321,63 @@ func initializeDbObject(d *Daemon) (*db.Dump, error) {
 	}
 
 	return dump, nil
+}
+
+func (d *Daemon) hasNodeListChanged(heartbeatData *cluster.APIHeartbeat) bool {
+	// No previous heartbeat data.
+	if d.lastNodeList == nil {
+		return true
+	}
+
+	// Member count has changed.
+	if len(d.lastNodeList.Members) != len(heartbeatData.Members) {
+		return true
+	}
+
+	// Check for node address changes.
+	for lastMemberID, lastMember := range d.lastNodeList.Members {
+		if heartbeatData.Members[lastMemberID].Address != lastMember.Address {
+			return true
+		}
+	}
+
+	return false
+}
+
+// NodeRefreshTask is run each time a fresh node is generated.
+// This can be used to trigger actions when the node list changes.
+func (d *Daemon) NodeRefreshTask(heartbeatData *cluster.APIHeartbeat) {
+	// If the max version of the cluster has changed, check whether we need to upgrade.
+	if d.lastNodeList == nil || d.lastNodeList.Version.APIExtensions != heartbeatData.Version.APIExtensions || d.lastNodeList.Version.Schema != heartbeatData.Version.Schema {
+		err := cluster.MaybeUpdate(d.State())
+		if err != nil {
+			logger.Errorf("Error updating: %v", err)
+			return
+		}
+	}
+
+	// Only refresh forkdns peers if the full state list has been generated.
+	if heartbeatData.FullStateList {
+		for i, node := range heartbeatData.Members {
+			// Exclude nodes that the leader considers offline.
+			// This is to avoid forkdns delaying results by querying an offline node.
+			if !node.Online {
+				logger.Warnf("Excluding offline node from refresh: %+v", node)
+				delete(heartbeatData.Members, i)
+			}
+		}
+
+		nodeListChanged := d.hasNodeListChanged(heartbeatData)
+		if nodeListChanged {
+			err := networkUpdateForkdnsServersTask(d.State(), heartbeatData)
+			if err != nil {
+				logger.Errorf("Error refreshing forkdns: %v", err)
+				return
+			}
+		}
+	}
+
+	// Only update the node list if the task succeeded.
+	// If it fails then it will get to run again next heartbeat.
+	d.lastNodeList = heartbeatData
 }

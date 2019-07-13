@@ -8,8 +8,9 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
-	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/lxc/lxd/shared"
 )
@@ -149,6 +150,7 @@ int shiftowner(char *basepath, char *path, int uid, int gid)
 }
 */
 // #cgo CFLAGS: -std=gnu11 -Wvla
+// #cgo LDFLAGS: -lcap
 import "C"
 
 // ShiftOwner updates uid and gid for a file when entering/exiting a namespace
@@ -319,7 +321,7 @@ func SupportsVFS3Fscaps(prefix string) bool {
 	err = cmd.Run()
 	if err != nil {
 		errno, isErrno := shared.GetErrno(err)
-		if isErrno && (errno == syscall.ERANGE || errno == syscall.EOVERFLOW) {
+		if isErrno && (errno == unix.ERANGE || errno == unix.EOVERFLOW) {
 			return false
 		}
 

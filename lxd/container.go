@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -10,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
+	"github.com/pkg/errors"
 	"gopkg.in/lxc/go-lxc.v2"
 	"gopkg.in/robfig/cron.v2"
 
@@ -29,7 +30,7 @@ import (
 	log "github.com/lxc/lxd/shared/log15"
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/osarch"
-	"github.com/pkg/errors"
+	"github.com/lxc/lxd/shared/units"
 )
 
 // Helper functions
@@ -91,10 +92,6 @@ func containerValidConfigKey(os *sys.OS, key string, value string) error {
 	return nil
 }
 
-var containerNetworkLimitKeys = []string{"limits.max", "limits.ingress", "limits.egress"}
-var containerNetworkRouteKeys = []string{"ipv4.routes", "ipv6.routes"}
-var containerNetworkKeys = append(containerNetworkLimitKeys, containerNetworkRouteKeys...)
-
 func containerValidDeviceConfigKey(t, k string) bool {
 	if k == "type" {
 		return true
@@ -153,6 +150,10 @@ func containerValidDeviceConfigKey(t, k string) bool {
 		case "ipv6.routes":
 			return true
 		case "security.mac_filtering":
+			return true
+		case "security.ipv4_filtering":
+			return true
+		case "security.ipv6_filtering":
 			return true
 		case "maas.subnet.ipv4":
 			return true
@@ -432,6 +433,24 @@ func containerValidDevices(cluster *db.Cluster, devices types.Devices, profile b
 					}
 				}
 			}
+
+			if shared.IsTrue(m["security.mac_filtering"]) {
+				if !shared.StringInSlice(m["nictype"], []string{"bridged", "sriov"}) {
+					return fmt.Errorf("Bad nic type for security.mac_filtering: %s", m["nictype"])
+				}
+			}
+
+			if shared.IsTrue(m["security.ipv4_filtering"]) {
+				if m["nictype"] != "bridged" {
+					return fmt.Errorf("Bad nic type for security.ipv4_filtering: %s", m["nictype"])
+				}
+			}
+
+			if shared.IsTrue(m["security.ipv6_filtering"]) {
+				if m["nictype"] != "bridged" {
+					return fmt.Errorf("Bad nic type for security.ipv6_filtering: %s", m["nictype"])
+				}
+			}
 		} else if m["type"] == "infiniband" {
 			if m["nictype"] == "" {
 				return fmt.Errorf("Missing nic type")
@@ -637,7 +656,7 @@ type container interface {
 	// Live configuration
 	CGroupGet(key string) (string, error)
 	CGroupSet(key string, value string) error
-	ConfigKeySet(key string, value string) error
+	VolatileSet(changes map[string]string) error
 
 	// File handling
 	FileExists(path string) error
@@ -665,7 +684,7 @@ type container interface {
 	         *      (the PID returned in the first return argument). It can however
 	         *      be used to e.g. forward signals.)
 	*/
-	Exec(command []string, env map[string]string, stdin *os.File, stdout *os.File, stderr *os.File, wait bool) (*exec.Cmd, int, int, error)
+	Exec(command []string, env map[string]string, stdin *os.File, stdout *os.File, stderr *os.File, wait bool, cwd string, uid uint32, gid uint32) (*exec.Cmd, int, int, error)
 
 	// Status
 	Render() (interface{}, interface{}, error)
@@ -681,6 +700,7 @@ type container interface {
 
 	// Hooks
 	OnStart() error
+	OnStopNS(target string, netns string) error
 	OnStop(target string) error
 	OnNetworkUp(deviceName string, hostVeth string) error
 
@@ -724,6 +744,7 @@ type container interface {
 	Storage() storage
 	TemplateApply(trigger string) error
 	DaemonState() *state.State
+	InsertSeccompUnixDevice(prefix string, m types.Device, pid int) error
 
 	CurrentIdmap() (*idmap.IdmapSet, error)
 	DiskIdmap() (*idmap.IdmapSet, error)
@@ -1349,12 +1370,12 @@ func containerConfigureInternal(c container) error {
 	if rootDiskDevice["size"] != "" {
 		storageTypeName := storage.GetStorageTypeName()
 		if (storageTypeName == "lvm" || storageTypeName == "ceph") && c.IsRunning() {
-			err = c.ConfigKeySet("volatile.apply_quota", rootDiskDevice["size"])
+			err = c.VolatileSet(map[string]string{"volatile.apply_quota": rootDiskDevice["size"]})
 			if err != nil {
 				return err
 			}
 		} else {
-			size, err := shared.ParseByteSizeString(rootDiskDevice["size"])
+			size, err := units.ParseByteSizeString(rootDiskDevice["size"])
 			if err != nil {
 				return err
 			}
@@ -1635,10 +1656,18 @@ func autoCreateContainerSnapshotsTask(d *Daemon) (task.Func, task.Schedule) {
 
 			// Check if it's time to snapshot
 			now := time.Now()
+
+			// Truncate the time now back to the start of the minute, before passing to
+			// the cron scheduler, as it will add 1s to the scheduled time and we don't
+			// want the next scheduled time to roll over to the next minute and break
+			// the time comparison below.
+			now = now.Truncate(time.Minute)
+
+			// Calculate the next scheduled time based on the snapshots.schedule
+			// pattern and the time now.
 			next := sched.Next(now)
 
 			// Ignore everything that is more precise than minutes.
-			now = now.Truncate(time.Minute)
 			next = next.Truncate(time.Minute)
 
 			if !now.Equal(next) {

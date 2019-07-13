@@ -9,7 +9,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/gorilla/websocket"
 	"github.com/spf13/cobra"
@@ -30,6 +29,9 @@ type cmdExec struct {
 	flagForceInteractive    bool
 	flagForceNonInteractive bool
 	flagDisableStdin        bool
+	flagUser                uint32
+	flagGroup               uint32
+	flagCwd                 string
 }
 
 func (c *cmdExec) Command() *cobra.Command {
@@ -54,12 +56,15 @@ Mode defaults to non-interactive, interactive mode is selected if both stdin AND
 	cmd.Flags().BoolVarP(&c.flagForceInteractive, "force-interactive", "t", false, i18n.G("Force pseudo-terminal allocation"))
 	cmd.Flags().BoolVarP(&c.flagForceNonInteractive, "force-noninteractive", "T", false, i18n.G("Disable pseudo-terminal allocation"))
 	cmd.Flags().BoolVarP(&c.flagDisableStdin, "disable-stdin", "n", false, i18n.G("Disable stdin (reads from /dev/null)"))
+	cmd.Flags().Uint32Var(&c.flagUser, "user", 0, i18n.G("User ID to run the command as (default 0)")+"``")
+	cmd.Flags().Uint32Var(&c.flagGroup, "group", 0, i18n.G("Group ID to run the command as (default 0)")+"``")
+	cmd.Flags().StringVar(&c.flagCwd, "cwd", "", i18n.G("Group ID to run the command as (default /root)")+"``")
 
 	return cmd
 }
 
 func (c *cmdExec) sendTermSize(control *websocket.Conn) error {
-	width, height, err := termios.GetSize(int(syscall.Stdout))
+	width, height, err := termios.GetSize(getStdoutFd())
 	if err != nil {
 		return err
 	}
@@ -76,28 +81,6 @@ func (c *cmdExec) sendTermSize(control *websocket.Conn) error {
 	msg.Args = make(map[string]string)
 	msg.Args["width"] = strconv.Itoa(width)
 	msg.Args["height"] = strconv.Itoa(height)
-
-	buf, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
-	_, err = w.Write(buf)
-
-	w.Close()
-	return err
-}
-
-func (c *cmdExec) forwardSignal(control *websocket.Conn, sig syscall.Signal) error {
-	logger.Debugf("Forwarding signal: %s", sig)
-
-	w, err := control.NextWriter(websocket.TextMessage)
-	if err != nil {
-		return err
-	}
-
-	msg := api.ContainerExecControl{}
-	msg.Command = "signal"
-	msg.Signal = int(sig)
 
 	buf, err := json.Marshal(msg)
 	if err != nil {
@@ -154,8 +137,8 @@ func (c *cmdExec) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Configure the terminal
-	stdinFd := int(syscall.Stdin)
-	stdoutFd := int(syscall.Stdout)
+	stdinFd := getStdinFd()
+	stdoutFd := getStdoutFd()
 
 	stdinTerminal := termios.IsTerminal(stdinFd)
 	stdoutTerminal := termios.IsTerminal(stdoutFd)
@@ -192,7 +175,7 @@ func (c *cmdExec) Run(cmd *cobra.Command, args []string) error {
 	// Grab current terminal dimensions
 	var width, height int
 	if stdoutTerminal {
-		width, height, err = termios.GetSize(int(syscall.Stdout))
+		width, height, err = termios.GetSize(getStdoutFd())
 		if err != nil {
 			return err
 		}
@@ -204,7 +187,7 @@ func (c *cmdExec) Run(cmd *cobra.Command, args []string) error {
 		stdin = ioutil.NopCloser(bytes.NewReader(nil))
 	}
 
-	stdout := c.getStdout()
+	stdout := getStdout()
 
 	// Prepare the command
 	req := api.ContainerExecPost{
@@ -214,6 +197,9 @@ func (c *cmdExec) Run(cmd *cobra.Command, args []string) error {
 		Environment: env,
 		Width:       width,
 		Height:      height,
+		User:        c.flagUser,
+		Group:       c.flagGroup,
+		Cwd:         c.flagCwd,
 	}
 
 	execArgs := lxd.ContainerExecArgs{

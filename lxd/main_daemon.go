@@ -5,9 +5,9 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"syscall"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
 
 	"github.com/lxc/lxd/lxd/sys"
 	"github.com/lxc/lxd/shared/logger"
@@ -40,6 +40,10 @@ func (c *cmdDaemon) Command() *cobra.Command {
 }
 
 func (c *cmdDaemon) Run(cmd *cobra.Command, args []string) error {
+	if len(args) > 1 || (len(args) == 1 && args[0] != "daemon" && args[0] != "") {
+		return fmt.Errorf("unknown command \"%s\" for \"%s\"", args[0], cmd.CommandPath())
+	}
+
 	// Only root should run this
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("This must be run as root")
@@ -64,15 +68,15 @@ func (c *cmdDaemon) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	ch := make(chan os.Signal)
-	signal.Notify(ch, syscall.SIGPWR)
-	signal.Notify(ch, syscall.SIGINT)
-	signal.Notify(ch, syscall.SIGQUIT)
-	signal.Notify(ch, syscall.SIGTERM)
+	signal.Notify(ch, unix.SIGPWR)
+	signal.Notify(ch, unix.SIGINT)
+	signal.Notify(ch, unix.SIGQUIT)
+	signal.Notify(ch, unix.SIGTERM)
 
 	s := d.State()
 	select {
 	case sig := <-ch:
-		if sig == syscall.SIGPWR {
+		if sig == unix.SIGPWR {
 			logger.Infof("Received '%s signal', shutting down containers", sig)
 			containersShutdown(s)
 			networkShutdown(s)

@@ -9,11 +9,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
 
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/netutils"
@@ -493,7 +493,7 @@ func (c *cmdForkproxy) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	if C.whoami == C.FORKPROXY_CHILD {
-		defer syscall.Close(forkproxyUDSSockFDNum)
+		defer unix.Close(forkproxyUDSSockFDNum)
 
 		if lAddr.connType == "unix" && !lAddr.abstract {
 			err := os.Remove(lAddr.addr[0])
@@ -512,7 +512,7 @@ func (c *cmdForkproxy) Run(cmd *cobra.Command, args []string) error {
 			err = netutils.AbstractUnixSendFd(forkproxyUDSSockFDNum, int(file.Fd()))
 			if err != nil {
 				errno, ok := shared.GetErrno(err)
-				if ok && (errno == syscall.EAGAIN) {
+				if ok && (errno == unix.EAGAIN) {
 					goto sAgain
 				}
 				break
@@ -570,17 +570,17 @@ func (c *cmdForkproxy) Run(cmd *cobra.Command, args []string) error {
 		f, err := netutils.AbstractUnixReceiveFd(forkproxyUDSSockFDNum)
 		if err != nil {
 			errno, ok := shared.GetErrno(err)
-			if ok && (errno == syscall.EAGAIN) {
+			if ok && (errno == unix.EAGAIN) {
 				goto rAgain
 			}
 
 			fmt.Printf("Failed to receive fd from listener process: %v\n", err)
-			syscall.Close(forkproxyUDSSockFDNum)
+			unix.Close(forkproxyUDSSockFDNum)
 			return err
 		}
 		files = append(files, f)
 	}
-	syscall.Close(forkproxyUDSSockFDNum)
+	unix.Close(forkproxyUDSSockFDNum)
 
 	var listenerMap map[int]*lStruct
 
@@ -633,7 +633,7 @@ func (c *cmdForkproxy) Run(cmd *cobra.Command, args []string) error {
 
 	// Handle SIGTERM which is sent when the proxy is to be removed
 	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGTERM)
+	signal.Notify(sigs, unix.SIGTERM)
 
 	if lAddr.connType == "unix" && !lAddr.abstract {
 		defer os.Remove(lAddr.addr[0])
@@ -645,7 +645,7 @@ func (c *cmdForkproxy) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Wait for SIGTERM and close the listener in order to exit the loop below
-	self := syscall.Getpid()
+	self := unix.Getpid()
 	go func() {
 		<-sigs
 
@@ -653,7 +653,7 @@ func (c *cmdForkproxy) Run(cmd *cobra.Command, args []string) error {
 			C.epoll_ctl(epFd, C.EPOLL_CTL_DEL, C.int(f.Fd()), nil)
 			f.Close()
 		}
-		syscall.Close(int(epFd))
+		unix.Close(int(epFd))
 
 		if !isUDPListener {
 			for _, l := range listenerMap {
@@ -662,9 +662,9 @@ func (c *cmdForkproxy) Run(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		syscall.Kill(self, syscall.SIGKILL)
+		unix.Kill(self, unix.SIGKILL)
 	}()
-	defer syscall.Kill(self, syscall.SIGTERM)
+	defer unix.Kill(self, unix.SIGTERM)
 
 	for _, f := range files {
 		var ev C.struct_epoll_event
@@ -767,7 +767,7 @@ func proxyCopy(dst net.Conn, src net.Conn) error {
 
 		// keep retrying on EAGAIN
 		errno, ok := shared.GetErrno(er)
-		if ok && (errno == syscall.EAGAIN) {
+		if ok && (errno == unix.EAGAIN) {
 			goto rAgain
 		}
 
@@ -803,7 +803,7 @@ func proxyCopy(dst net.Conn, src net.Conn) error {
 
 			// keep retrying on EAGAIN
 			errno, ok := shared.GetErrno(ew)
-			if ok && (errno == syscall.EAGAIN) {
+			if ok && (errno == unix.EAGAIN) {
 				goto wAgain
 
 			}
@@ -866,7 +866,7 @@ func genericRelay(dst net.Conn, src net.Conn, timeout bool) {
 	<-chRecv
 }
 
-func unixRelayer(src *net.UnixConn, dst *net.UnixConn, ch chan bool) {
+func unixRelayer(src *net.UnixConn, dst *net.UnixConn, ch chan error) {
 	dataBuf := make([]byte, 4096)
 	oobBuf := make([]byte, 4096)
 
@@ -876,28 +876,25 @@ func unixRelayer(src *net.UnixConn, dst *net.UnixConn, ch chan bool) {
 		sData, sOob, _, _, err := src.ReadMsgUnix(dataBuf, oobBuf)
 		if err != nil {
 			errno, ok := shared.GetErrno(err)
-			if ok && errno == syscall.EAGAIN {
+			if ok && errno == unix.EAGAIN {
 				goto readAgain
 			}
-			fmt.Printf("Disconnected during read: %v\n", err)
-			ch <- true
+			ch <- err
 			return
 		}
 
 		var fds []int
 		if sOob > 0 {
-			entries, err := syscall.ParseSocketControlMessage(oobBuf[:sOob])
+			entries, err := unix.ParseSocketControlMessage(oobBuf[:sOob])
 			if err != nil {
-				fmt.Printf("Failed to parse control message: %v\n", err)
-				ch <- true
+				ch <- err
 				return
 			}
 
 			for _, msg := range entries {
-				fds, err = syscall.ParseUnixRights(&msg)
+				fds, err = unix.ParseUnixRights(&msg)
 				if err != nil {
-					fmt.Printf("Failed to get fd list for control message: %v\n", err)
-					ch <- true
+					ch <- err
 					return
 				}
 			}
@@ -908,27 +905,24 @@ func unixRelayer(src *net.UnixConn, dst *net.UnixConn, ch chan bool) {
 		tData, tOob, err := dst.WriteMsgUnix(dataBuf[:sData], oobBuf[:sOob], nil)
 		if err != nil {
 			errno, ok := shared.GetErrno(err)
-			if ok && errno == syscall.EAGAIN {
+			if ok && errno == unix.EAGAIN {
 				goto writeAgain
 			}
-			fmt.Printf("Disconnected during write: %v\n", err)
-			ch <- true
+			ch <- err
 			return
 		}
 
 		if sData != tData || sOob != tOob {
-			fmt.Printf("Some data got lost during transfer, disconnecting.")
-			ch <- true
+			ch <- fmt.Errorf("Lost oob data during transfer")
 			return
 		}
 
 		// Close those fds we received
 		if fds != nil {
 			for _, fd := range fds {
-				err := syscall.Close(fd)
+				err := unix.Close(fd)
 				if err != nil {
-					fmt.Printf("Failed to close fd %d: %v\n", fd, err)
-					ch <- true
+					ch <- err
 					return
 				}
 			}
@@ -937,17 +931,30 @@ func unixRelayer(src *net.UnixConn, dst *net.UnixConn, ch chan bool) {
 }
 
 func unixRelay(dst io.ReadWriteCloser, src io.ReadWriteCloser) {
-	chSend := make(chan bool)
+	chSend := make(chan error)
 	go unixRelayer(dst.(*net.UnixConn), src.(*net.UnixConn), chSend)
 
-	chRecv := make(chan bool)
+	chRecv := make(chan error)
 	go unixRelayer(src.(*net.UnixConn), dst.(*net.UnixConn), chRecv)
 
-	<-chSend
-	<-chRecv
+	select {
+	case errSnd := <-chSend:
+		if errSnd != nil {
+			fmt.Printf("Error while sending data: %v\n", errSnd)
+		}
+
+	case errRcv := <-chRecv:
+		if errRcv != nil {
+			fmt.Printf("Error while reading data: %v\n", errRcv)
+		}
+	}
 
 	src.Close()
 	dst.Close()
+
+	// Empty the channels
+	<-chSend
+	<-chRecv
 }
 
 func tryListen(protocol string, addr string) (net.Listener, error) {

@@ -8,10 +8,10 @@ import (
 	"io/ioutil"
 	"os"
 	"strings"
-	"syscall"
 
 	"github.com/gorilla/websocket"
 	"github.com/pkg/errors"
+	"golang.org/x/sys/unix"
 
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/state"
@@ -19,6 +19,7 @@ import (
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/ioprogress"
 	"github.com/lxc/lxd/shared/logger"
+	"github.com/lxc/lxd/shared/units"
 )
 
 type storageCeph struct {
@@ -83,7 +84,7 @@ func (s *storageCeph) StoragePoolInit() error {
 
 	// set default placement group number
 	if s.pool.Config["ceph.osd.pg_num"] != "" {
-		_, err = shared.ParseByteSizeString(s.pool.Config["ceph.osd.pg_num"])
+		_, err = units.ParseByteSizeString(s.pool.Config["ceph.osd.pg_num"])
 		if err != nil {
 			return err
 		}
@@ -420,7 +421,7 @@ func (s *storageCeph) StoragePoolVolumeCreate() error {
 
 	// Apply quota
 	if s.volume.Config["size"] != "" {
-		size, err := shared.ParseByteSizeString(s.volume.Config["size"])
+		size, err := units.ParseByteSizeString(s.volume.Config["size"])
 		if err != nil {
 			return err
 		}
@@ -458,7 +459,7 @@ func (s *storageCeph) StoragePoolVolumeDelete() error {
 
 	volumeMntPoint := getStoragePoolVolumeMountPoint(s.pool.Name, s.volume.Name)
 	if shared.IsMountPoint(volumeMntPoint) {
-		err := tryUnmount(volumeMntPoint, syscall.MNT_DETACH)
+		err := tryUnmount(volumeMntPoint, unix.MNT_DETACH)
 		if err != nil {
 			logger.Errorf(`Failed to unmount RBD storage volume "%s" on storage pool "%s": %s`, s.volume.Name, s.pool.Name, err)
 		}
@@ -594,7 +595,7 @@ func (s *storageCeph) StoragePoolVolumeUmount() (bool, error) {
 	var customerr error
 	ourUmount := false
 	if shared.IsMountPoint(volumeMntPoint) {
-		customerr = tryUnmount(volumeMntPoint, syscall.MNT_DETACH)
+		customerr = tryUnmount(volumeMntPoint, unix.MNT_DETACH)
 		ourUmount = true
 	}
 
@@ -672,7 +673,7 @@ func (s *storageCeph) StoragePoolVolumeUpdate(writable *api.StorageVolumePut, ch
 		}
 
 		if s.volume.Config["size"] != writable.Config["size"] {
-			size, err := shared.ParseByteSizeString(writable.Config["size"])
+			size, err := units.ParseByteSizeString(writable.Config["size"])
 			if err != nil {
 				return err
 			}
@@ -937,7 +938,7 @@ func (s *storageCeph) ContainerCreateFromImage(container container, fingerprint 
 	}
 
 	if s.volume.Config["size"] != "" && imageVol.Config["size"] != s.volume.Config["size"] {
-		size, err := shared.ParseByteSizeString(s.volume.Config["size"])
+		size, err := units.ParseByteSizeString(s.volume.Config["size"])
 		if err != nil {
 			return err
 		}
@@ -1082,7 +1083,7 @@ func (s *storageCeph) doCrossPoolContainerCopy(target container, source containe
 	if !containerOnly {
 		for _, snap := range snapshots {
 			srcSnapshotMntPoint := getSnapshotMountPoint(snap.Project(), sourcePool, snap.Name())
-			_, err = rsyncLocalCopy(srcSnapshotMntPoint, destContainerMntPoint, bwlimit)
+			_, err = rsyncLocalCopy(srcSnapshotMntPoint, destContainerMntPoint, bwlimit, true)
 			if err != nil {
 				return err
 			}
@@ -1091,7 +1092,7 @@ func (s *storageCeph) doCrossPoolContainerCopy(target container, source containe
 			// been committed to disk. If we don't then the rbd snapshot of
 			// the underlying filesystem can be inconsistent or - worst case
 			// - empty.
-			syscall.Sync()
+			unix.Sync()
 
 			msg, fsFreezeErr := shared.TryRunCommand("fsfreeze", "--freeze", destContainerMntPoint)
 			logger.Debugf("Trying to freeze the filesystem: %s: %s", msg, fsFreezeErr)
@@ -1110,7 +1111,7 @@ func (s *storageCeph) doCrossPoolContainerCopy(target container, source containe
 	}
 
 	srcContainerMntPoint := getContainerMountPoint(source.Project(), sourcePool, source.Name())
-	_, err = rsyncLocalCopy(srcContainerMntPoint, destContainerMntPoint, bwlimit)
+	_, err = rsyncLocalCopy(srcContainerMntPoint, destContainerMntPoint, bwlimit, true)
 	if err != nil {
 		if !refresh {
 			s.StoragePoolVolumeDelete()
@@ -1629,7 +1630,7 @@ func (s *storageCeph) ContainerSnapshotCreate(snapshotContainer container, sourc
 		// been committed to disk. If we don't then the rbd snapshot of
 		// the underlying filesystem can be inconsistent or - worst case
 		// - empty.
-		syscall.Sync()
+		unix.Sync()
 
 		msg, fsFreezeErr := shared.TryRunCommand("fsfreeze", "--freeze", containerMntPoint)
 		logger.Debugf("Trying to freeze the filesystem: %s: %s", msg, fsFreezeErr)
@@ -1883,7 +1884,7 @@ func (s *storageCeph) ContainerSnapshotStop(c container) (bool, error) {
 	}
 
 	// Unmount
-	err := tryUnmount(containerMntPoint, syscall.MNT_DETACH)
+	err := tryUnmount(containerMntPoint, unix.MNT_DETACH)
 	if err != nil {
 		logger.Errorf("Failed to unmount %s: %s", containerMntPoint, err)
 		return false, err
@@ -2016,7 +2017,7 @@ func (s *storageCeph) ContainerBackupLoad(info backupInfo, data io.ReadSeeker, t
 		// been committed to disk. If we don't then the rbd snapshot of
 		// the underlying filesystem can be inconsistent or - worst case
 		// - empty.
-		syscall.Sync()
+		unix.Sync()
 
 		msg, fsFreezeErr := shared.TryRunCommand("fsfreeze", "--freeze", containerMntPoint)
 		logger.Debugf("Trying to freeze the filesystem: %s: %s", msg, fsFreezeErr)
@@ -2455,7 +2456,7 @@ func (s *storageCeph) StorageEntitySetQuota(volumeType int, size int64, data int
 		return fmt.Errorf("Failed to get mapped RBD path")
 	}
 
-	oldSize, err := shared.ParseByteSizeString(s.volume.Config["size"])
+	oldSize, err := units.ParseByteSizeString(s.volume.Config["size"])
 	if err != nil {
 		return err
 	}
@@ -2478,7 +2479,7 @@ func (s *storageCeph) StorageEntitySetQuota(volumeType int, size int64, data int
 	}
 
 	// Update the database
-	s.volume.Config["size"] = shared.GetByteSizeString(size, 0)
+	s.volume.Config["size"] = units.GetByteSizeString(size, 0)
 	err = s.s.Cluster.StoragePoolVolumeUpdate(
 		s.volume.Name,
 		volumeType,
@@ -2750,7 +2751,7 @@ func (s *storageCeph) StoragePoolVolumeSnapshotCreate(target *api.StorageVolumeS
 		// been committed to disk. If we don't then the rbd snapshot of
 		// the underlying filesystem can be inconsistent or - worst case
 		// - empty.
-		syscall.Sync()
+		unix.Sync()
 
 		msg, fsFreezeErr := shared.TryRunCommand("fsfreeze", "--freeze", sourcePath)
 		logger.Debugf("Trying to freeze the filesystem: %s: %s", msg, fsFreezeErr)
@@ -2795,7 +2796,7 @@ func (s *storageCeph) doPoolVolumeSnapshotDelete(name string) error {
 		}
 	}
 
-	storageVolumeSnapshotPath := getStoragePoolVolumeSnapshotMountPoint(s.pool.Name, sourceName)
+	storageVolumeSnapshotPath := getStoragePoolVolumeSnapshotMountPoint(s.pool.Name, name)
 	empty, err := shared.PathIsEmpty(storageVolumeSnapshotPath)
 	if err == nil && empty {
 		os.RemoveAll(storageVolumeSnapshotPath)
@@ -2829,27 +2830,19 @@ func (s *storageCeph) StoragePoolVolumeSnapshotDelete() error {
 func (s *storageCeph) StoragePoolVolumeSnapshotRename(newName string) error {
 	logger.Infof("Renaming CEPH storage volume on OSD storage pool \"%s\" from \"%s\" to \"%s\"", s.pool.Name, s.volume.Name, newName)
 
-	// unmap
-	err := cephRBDVolumeUnmap(s.ClusterName, s.OSDPoolName, s.volume.Name, storagePoolVolumeTypeNameCustom, s.UserName, true)
-	if err != nil {
-		logger.Errorf("Failed to unmap RBD storage volume for container \"%s\" on storage pool \"%s\": %s", s.volume.Name, s.pool.Name, err)
-		return err
-	}
-	logger.Debugf("Unmapped RBD storage volume for container \"%s\" on storage pool \"%s\"", s.volume.Name, s.pool.Name)
-
-	sourceName, _, ok := containerGetParentAndSnapshotName(s.volume.Name)
+	sourceName, oldSnapOnlyName, ok := containerGetParentAndSnapshotName(s.volume.Name)
 	if !ok {
 		return fmt.Errorf("Not a snapshot name")
 	}
 
-	fullSnapshotName := fmt.Sprintf("%s%s%s", sourceName, shared.SnapshotDelimiter, newName)
-	err = cephRBDVolumeRename(s.ClusterName, s.OSDPoolName, storagePoolVolumeTypeNameCustom, s.volume.Name, fullSnapshotName, s.UserName)
+	err := cephRBDVolumeSnapshotRename(s.ClusterName, s.OSDPoolName, sourceName, storagePoolVolumeTypeNameCustom, fmt.Sprintf("snapshot_%s", oldSnapOnlyName), fmt.Sprintf("snapshot_%s", newName), s.UserName)
 	if err != nil {
 		logger.Errorf("Failed to rename RBD storage volume for container \"%s\" on storage pool \"%s\": %s", s.volume.Name, s.pool.Name, err)
 		return err
 	}
 	logger.Debugf("Renamed RBD storage volume for container \"%s\" on storage pool \"%s\"", s.volume.Name, s.pool.Name)
 
+	fullSnapshotName := fmt.Sprintf("%s%s%s", sourceName, shared.SnapshotDelimiter, newName)
 	oldPath := getStoragePoolVolumeSnapshotMountPoint(s.pool.Name, s.volume.Name)
 	newPath := getStoragePoolVolumeSnapshotMountPoint(s.pool.Name, fullSnapshotName)
 	err = os.Rename(oldPath, newPath)
@@ -2857,7 +2850,7 @@ func (s *storageCeph) StoragePoolVolumeSnapshotRename(newName string) error {
 		return err
 	}
 
-	logger.Infof("Renamed CEPH storage volume on OSD storage pool \"%s\" from \"%s\" to \"%s\"", s.pool.Name, s.volume.Name, newName)
+	logger.Infof("Renamed CEPH storage volume on OSD storage pool \"%s\" from \"%s\" to \"%s\"", s.pool.Name, s.volume.Name, fullSnapshotName)
 
 	return s.s.Cluster.StoragePoolVolumeRename("default", s.volume.Name, fullSnapshotName, storagePoolVolumeTypeCustom, s.poolID)
 }

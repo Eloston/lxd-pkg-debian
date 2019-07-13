@@ -7,9 +7,9 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
-	"syscall"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
 
 	"github.com/lxc/lxd/lxc/utils"
 	"github.com/lxc/lxd/shared/api"
@@ -19,13 +19,14 @@ import (
 type cmdMigrate struct {
 	global *cmdGlobal
 
-	flagConfig     []string
-	flagNetwork    string
-	flagProfile    []string
-	flagStorage    string
-	flagType       string
-	flagRsyncArgs  string
-	flagNoProfiles bool
+	flagConfig      []string
+	flagNetwork     string
+	flagProfile     []string
+	flagStorage     string
+	flagStorageSize string
+	flagType        string
+	flagRsyncArgs   string
+	flagNoProfiles  bool
 }
 
 func (c *cmdMigrate) Command() *cobra.Command {
@@ -49,6 +50,7 @@ func (c *cmdMigrate) Command() *cobra.Command {
 	cmd.Flags().StringVarP(&c.flagNetwork, "network", "n", "", "Network to use for the container"+"``")
 	cmd.Flags().StringArrayVarP(&c.flagProfile, "profile", "p", nil, "Profile to apply to the container"+"``")
 	cmd.Flags().StringVarP(&c.flagStorage, "storage", "s", "", "Storage pool to use for the container"+"``")
+	cmd.Flags().StringVar(&c.flagStorageSize, "storage-size", "", "Size of the storage volume (requires --storage)"+"``")
 	cmd.Flags().StringVarP(&c.flagType, "type", "t", "", "Instance type to use for the container"+"``")
 	cmd.Flags().StringVar(&c.flagRsyncArgs, "rsync-args", "", "Extra arguments to pass to rsync"+"``")
 	cmd.Flags().BoolVar(&c.flagNoProfiles, "no-profiles", false, "Create the container with no profiles applied")
@@ -76,6 +78,10 @@ func (c *cmdMigrate) Run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no-profiles can't be specified alongside profiles")
 	}
 
+	if c.flagStorageSize != "" && c.flagStorage == "" {
+		return fmt.Errorf("--storage-size requires --storage be passed")
+	}
+
 	// Handle mandatory arguments
 	if len(args) < 3 {
 		cmd.Help()
@@ -94,7 +100,7 @@ func (c *cmdMigrate) Run(cmd *cobra.Command, args []string) error {
 
 	// Automatically clean-up the temporary path on exit
 	defer func(path string) {
-		syscall.Unmount(path, syscall.MNT_DETACH)
+		unix.Unmount(path, unix.MNT_DETACH)
 		os.Remove(path)
 	}(path)
 
@@ -179,6 +185,11 @@ func (c *cmdMigrate) Run(cmd *cobra.Command, args []string) error {
 			"type": "disk",
 			"pool": storage,
 			"path": "/",
+		}
+
+		storageSize := c.flagStorageSize
+		if storageSize != "" {
+			apiArgs.Devices["root"]["size"] = storageSize
 		}
 	}
 
